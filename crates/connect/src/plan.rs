@@ -213,13 +213,16 @@ impl Plan {
             "activation": activation.to_json(),
             "transport_params": params,
         });
-        // Only a file with both its data and type can be staged again.
-        if let Some(file) = active.get("transport_file")
-            && file.get("data").is_some_and(Value::is_string)
-            && file.get("type").is_some_and(Value::is_string)
-        {
-            request["transport_file"] = json!({"data": file["data"], "type": file["type"]});
-        }
+        // The file goes back too, or none when it had none: a file left staged would
+        // still apply its media parameters.
+        request["transport_file"] = match active.get("transport_file") {
+            Some(file)
+                if file.get("data").is_some_and(Value::is_string) && file.get("type").is_some_and(Value::is_string) =>
+            {
+                json!({"data": file["data"], "type": file["type"]})
+            }
+            _ => json!({"data": null, "type": null}),
+        };
         let expect = Expect { sender_id: sender_id.map(str::to_string), master_enable, legs: Vec::new() };
         Ok(Self { request, expect, notes: Vec::new(), problems: Vec::new() })
     }
@@ -468,10 +471,12 @@ mod tests {
                                   "destination_port": 5004, "rtp_enabled": true}]
         });
         let plan = Plan::restore(&active, Activation::Immediate).unwrap();
+        // No file, so the one a failed salvo staged is taken away.
         assert_eq!(
             plan.request,
             json!({"sender_id": null, "master_enable": true,
                    "activation": {"mode": "activate_immediate", "requested_time": null},
+                   "transport_file": {"data": null, "type": null},
                    "transport_params": active["transport_params"]})
         );
         let mut with_file = active.clone();

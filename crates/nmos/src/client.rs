@@ -265,9 +265,20 @@ impl QueryClient {
     }
 
     /// Reads one resource by its `id`, or `None` when the registry does not hold it.
+    /// A resource registered at an older IS-04 version is read too, where the registry
+    /// supports downgrade queries; without one, IS-04 answers 409 for it.
     pub fn resource(&self, kind: Kind, id: &str) -> Result<Option<Value>, Error> {
-        let url = format!("{}{}/{id}", self.base, kind.plural());
-        let response = self.get(&url, "application/json", BODY_LIMIT)?;
+        let plain = format!("{}{}/{id}", self.base, kind.plural());
+        let mut url = plain.clone();
+        if self.version != "v1.0" {
+            url.push_str("?query.downgrade=v1.0");
+        }
+        let mut response = self.get(&url, "application/json", BODY_LIMIT)?;
+        // A registry without downgrade queries answers 501, or 400.
+        if url != plain && matches!(response.status, 400 | 501) {
+            url = plain;
+            response = self.get(&url, "application/json", BODY_LIMIT)?;
+        }
         match response.status {
             200 => serde_json::from_str(&response.body)
                 .map(Some)

@@ -113,9 +113,9 @@ const plan = planConnection({
   sdp: fresh().manifests[videoSender].sdp,
   constraints: [leg, leg],
   senderId: videoSender,
-  at: "1790510439:0",
+  at: "2000000000:0",
 });
-assert.deepEqual(plan.request.activation, { mode: "activate_scheduled_absolute", requested_time: "1790510439:0" });
+assert.deepEqual(plan.request.activation, { mode: "activate_scheduled_absolute", requested_time: "2000000000:0" });
 assert.deepEqual(plan.request.transport_params[1], {
   multicast_ip: "239.20.10.1",
   source_ip: "192.168.20.21",
@@ -145,6 +145,10 @@ assert.deepEqual(planConnection({ in: 1.5 }).request, {
 assert.throws(() => planConnection({ sdp: "v=0" }), /constraints: the Receiver's are needed/);
 assert.throws(() => planConnection({ sdp: "v=0", constraints: [leg] }), /sdp: the SDP file has no media section/);
 assert.throws(() => planConnection({ at: "now", in: 2 }), /give at or in, not both/);
+assert.deepEqual(planConnection({ at: "NOW" }).request.activation, { mode: "activate_immediate", requested_time: null });
+assert.throws(() => planConnection({ at: "1790510439:0" }), /at: 1790510439:0 has passed/);
+assert.throws(() => planConnection({ in: NaN }), /in: not a number of seconds \(NaN and Infinity are not\)/);
+assert.throws(() => planConnection({ in: -1 }), /in: -1 is not a number of seconds/);
 assert.throws(() => planConnection({ sender: videoSender }), /unknown field `sender`/);
 
 // PTP messages from the grandmaster fixture, one per line in hex.

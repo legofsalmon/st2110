@@ -18,7 +18,7 @@ use st2110_ptp::PtpTime;
 use st2110_ptp::timing::read_time;
 
 use crate::timing::now;
-use crate::{Format, Style, plural, read};
+use crate::{Format, Style, plural, read, seconds};
 
 /// The command's arguments, as given.
 pub(crate) struct Args {
@@ -42,7 +42,21 @@ pub(crate) struct Args {
 pub(crate) fn run(args: &Args, format: Format) -> io::Result<ExitCode> {
     let result = match (&args.salvo, &args.receiver, &args.sender, &args.sdp, args.disconnect) {
         (None, Some(receiver), ..) if args.cancel => cancel(args, receiver, format),
-        (None, _, None, None, false) => list(args, format),
+        (None, _, None, None, false) => {
+            let making = [
+                ("--dry-run", args.dry_run),
+                ("--force", args.force),
+                ("--at", args.at.is_some()),
+                ("--in", args.after.is_some()),
+            ];
+            match making.iter().find(|(_, given)| *given) {
+                Some((option, _)) => Err(Failure::Usage(format!(
+                    "{option} is for making connections: give --receiver with --sender, --sdp or --disconnect, \
+                     or --salvo"
+                ))),
+                None => list(args, format),
+            }
+        }
         _ => make(args, format),
     };
     match result {
@@ -80,12 +94,13 @@ impl From<serde_json::Error> for Failure {
     }
 }
 
-/// Reads the registry, or a snapshot saved with `st2110 nmos --save`. A snapshot has no
-/// registry to check connections in afterwards.
-fn load(target: &str, timeout: Duration) -> Result<(Snapshot, Option<QueryClient>), String> {
+/// Reads the registry, with each Sender's SDP file when `fetch_sdp` is set, or a
+/// snapshot saved with `st2110 nmos --save`. A snapshot has no registry to check
+/// connections in afterwards.
+fn load(target: &str, timeout: Duration, fetch_sdp: bool) -> Result<(Snapshot, Option<QueryClient>), String> {
     let lower = target.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        let options = Options { timeout, fetch_sdp: false, ..Options::default() };
+        let options = Options { timeout, fetch_sdp, ..Options::default() };
         let registry = QueryClient::connect(target, &options).map_err(|e| e.to_string())?;
         let snapshot = registry.snapshot().map_err(|e| e.to_string())?;
         return Ok((snapshot, Some(registry)));
@@ -95,14 +110,11 @@ fn load(target: &str, timeout: Duration) -> Result<(Snapshot, Option<QueryClient
     Ok((snapshot, None))
 }
 
-fn seconds(option: &str, value: f64) -> Result<Duration, String> {
-    Duration::try_from_secs_f64(value).map_err(|_| format!("{option} {value} is not a number of seconds"))
-}
-
-/// Lists which Senders each Receiver can take, or the one Receiver named.
+/// Lists which Senders each Receiver can take, or the one Receiver named. The SDP files
+/// are read too, for the capabilities that are judged on them.
 fn list(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     let timeout = seconds("--timeout", args.timeout)?;
-    let (snapshot, _) = load(&args.target, timeout)?;
+    let (snapshot, _) = load(&args.target, timeout, true)?;
     let mut matrix = routing::matrix(&snapshot);
     if let Some(name) = &args.receiver {
         let receiver = routing::find(&snapshot, Kind::Receiver, name)?;
@@ -139,7 +151,7 @@ fn write_matrix(out: &mut impl Write, matrix: &Matrix, style: Style) -> io::Resu
 /// Cancels the activation scheduled on a Receiver.
 fn cancel(args: &Args, receiver: &str, format: Format) -> Result<ExitCode, Failure> {
     let timeout = seconds("--timeout", args.timeout)?;
-    let (snapshot, _) = load(&args.target, timeout)?;
+    let (snapshot, _) = load(&args.target, timeout, false)?;
     let client = ConnectionClient::new(&client::Options { timeout, ..client::Options::default() });
     let cancelled = controller::cancel(&snapshot, receiver, &client)?;
     let mut out = io::stdout().lock();
@@ -233,7 +245,8 @@ fn activation(args: &Args) -> Result<Option<Activation>, String> {
             Ok(Some(Activation::At(at)))
         }
         (None, Some(after)) => {
-            let after = seconds("--in", after)?;
+            let after =
+                Duration::try_from_secs_f64(after).map_err(|_| format!("--in {after} is not a number of seconds"))?;
             let nanos =
                 u64::try_from(after.as_nanos()).map_err(|_| format!("--in {} is too far off", after.as_secs()))?;
             Ok(Some(Activation::After(nanos)))
@@ -257,7 +270,7 @@ fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     if timeout.is_zero() {
         return Err(Failure::Usage("--timeout 0 is not a number of seconds above 0".into()));
     }
-    let (snapshot, registry) = load(&args.target, timeout)?;
+    let (snapshot, registry) = load(&args.target, timeout, false)?;
     let client = ConnectionClient::new(&client::Options { timeout, ..client::Options::default() });
     let outcome = controller::connect(&snapshot, &routes, &client, registry.as_ref(), &settings)?;
     let mut out = io::stdout().lock();

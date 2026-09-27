@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use st2110_nmos::Kind;
-use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::typestate::WithBody;
+use ureq::{Agent, RequestBuilder};
 
 /// The most a response may hold: a Receiver's resources, a bulk response, or an SDP file.
 const BODY_LIMIT: u64 = 16 << 20;
@@ -112,6 +113,7 @@ impl Reply {
 #[derive(Clone, Debug)]
 pub struct ConnectionClient {
     agent: Agent,
+    timeout: Duration,
 }
 
 impl ConnectionClient {
@@ -126,7 +128,7 @@ impl ConnectionClient {
             .user_agent(concat!("st2110-connect/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent }
+        Self { agent, timeout: options.timeout }
     }
 
     /// Reads a resource, such as a Receiver's `/constraints` or `/active`, following
@@ -140,18 +142,35 @@ impl ConnectionClient {
     /// followed: IS-05 has none for anything but a `GET`, and following it would lose
     /// the request (IS-05 v1.2 APIs: Client Side Implementation Notes).
     pub fn patch(&self, url: &str, body: &Value) -> Result<Reply, Error> {
-        let request = self.agent.patch(url).config().max_redirects(0).build();
-        let response = request
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .send(body.to_string());
-        read(url, response)
+        self.patch_within(url, body, self.timeout)
+    }
+
+    /// Changes a resource as [`ConnectionClient::patch`] does, giving up after `limit`
+    /// when that is sooner than the client's timeout.
+    pub fn patch_within(&self, url: &str, body: &Value, limit: Duration) -> Result<Reply, Error> {
+        self.send(self.agent.patch(url), url, body, limit)
     }
 
     /// Sends a request, such as a `/bulk/receivers` one. A redirect is returned, not
     /// followed, as for [`ConnectionClient::patch`].
     pub fn post(&self, url: &str, body: &Value) -> Result<Reply, Error> {
-        let request = self.agent.post(url).config().max_redirects(0).build();
+        self.post_within(url, body, self.timeout)
+    }
+
+    /// Sends a request as [`ConnectionClient::post`] does, giving up after `limit` when
+    /// that is sooner than the client's timeout.
+    pub fn post_within(&self, url: &str, body: &Value, limit: Duration) -> Result<Reply, Error> {
+        self.send(self.agent.post(url), url, body, limit)
+    }
+
+    fn send(
+        &self,
+        request: RequestBuilder<WithBody>,
+        url: &str,
+        body: &Value,
+        limit: Duration,
+    ) -> Result<Reply, Error> {
+        let request = request.config().max_redirects(0).timeout_global(Some(limit.min(self.timeout))).build();
         let response = request
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")

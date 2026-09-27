@@ -111,6 +111,9 @@ impl Registry {
             return (404, String::new(), String::new());
         };
         if let Some((collection, id)) = collection.split_once('/') {
+            if collection == "receivers" && param("query.downgrade").is_some() {
+                return (501, String::new(), String::new());
+            }
             let items = facility[collection].as_array().cloned().unwrap_or_default();
             return match items.into_iter().find(|item| item["id"] == id) {
                 Some(item) => (200, String::new(), item.to_string()),
@@ -206,6 +209,19 @@ fn reads_a_registry() {
     let receiver = client.resource(Kind::Receiver, "7ecf0001-0000-4000-8000-000000000001").unwrap();
     assert_eq!(receiver.as_ref(), registry.facility["receivers"].get(0));
     assert_eq!(client.resource(Kind::Receiver, "0badbeef-0000-4000-8000-000000000000").unwrap(), None);
+    // Downgrade first, as for a Receiver registered at an older version, then without.
+    let requests = registry.requests();
+    let tail = &requests[requests.len() - 4..requests.len() - 2];
+    assert_eq!(
+        tail,
+        [
+            "/x-nmos/query/v1.3/receivers/7ecf0001-0000-4000-8000-000000000001?query.downgrade=v1.0",
+            "/x-nmos/query/v1.3/receivers/7ecf0001-0000-4000-8000-000000000001"
+        ]
+    );
+    let device = client.resource(Kind::Device, registry.facility["devices"][0]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(device.as_ref(), registry.facility["devices"].get(0));
+    assert!(registry.requests().last().unwrap().ends_with("?query.downgrade=v1.0"), "taken with the downgrade");
 }
 
 #[test]

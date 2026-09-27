@@ -3,11 +3,11 @@
 //! constraints, sends it to the Receiver's Connection API, and checks that it took, on
 //! the Connection API and in the registry.
 //!
-//! Connections asked for together are made together, as a salvo: when one cannot be
-//! made, none is. By default they take effect at one PTP time a little after they are
+//! Connections asked for together are made together, as a salvo: when one is refused,
+//! none is sent. By default they take effect at one PTP time a little after they are
 //! sent, so that every Receiver switches at once, and when a Connection API rejects its
-//! part the others are cancelled or put back as their `/active` endpoints showed them
-//! (IS-05 v1.2 Behaviour: Scheduled Activations).
+//! part or does not answer, the others are cancelled, or put back as their `/active`
+//! endpoints showed them (IS-05 v1.2 Behaviour: Scheduled Activations).
 //!
 //! ```no_run
 //! use st2110_connect::client::{ConnectionClient, Options};
@@ -43,8 +43,12 @@ use st2110_ptp::{PtpTime, TAI_UTC_2017};
 use crate::client::{ConnectionClient, Reply, bulk, single};
 use crate::{Activation, Constraints, Plan, tai};
 
-/// Requests to make at once.
+/// Receivers to read at once while connections are prepared.
 const AT_ONCE: usize = 16;
+
+/// The least time a request is given to be answered, however close its salvo is to
+/// being due.
+const LEAST: Duration = Duration::from_millis(100);
 
 /// How often a Receiver's `/active` endpoint, and the registry, are read again while a
 /// change is awaited.
@@ -226,12 +230,13 @@ struct Job {
 #[derive(Clone, Debug)]
 enum Sent {
     /// Accepted: 200 for an immediate activation, 202 for a scheduled one. A single
-    /// `PATCH` returns what was staged.
-    Accepted { status: u16, staged: Option<Value> },
-    /// Answered with an error.
+    /// `PATCH` returns what was staged. `answered` is when the answer came.
+    Accepted { status: u16, staged: Option<Value>, answered: PtpTime },
+    /// Refused, with nothing changed: a redirect or a client error.
     Rejected(String),
-    /// Not answered: it may or may not have been acted on.
-    Lost(String),
+    /// Not answered, or answered with a server error or without saying: it may or may
+    /// not have been acted on.
+    Uncertain(String),
 }
 
 /// Makes connections, all together: when one cannot be made, none is.
@@ -246,10 +251,13 @@ enum Sent {
 /// When every connection can be made, or [`Settings::force`] is set, they are sent, one
 /// request per Connection API: a `PATCH` to `/staged`, or for several Receivers of one
 /// API a `POST` to `/bulk/receivers`, falling back to one `PATCH` each when the API
-/// has no bulk interface. When a Connection API rejects its part or does not answer,
-/// the accepted ones are rolled back. Otherwise each is checked on the Receiver's
-/// `/active` endpoint once due, and when `registry` is given, on its IS-04
-/// `subscription` and `version`, which the Node must update on every activation.
+/// has no bulk interface. A salvo scheduled at a time has half the time until then for
+/// its requests to be answered. When a Connection API rejects its part, fails or does
+/// not answer, the others are rolled back: their activations cancelled, and a Receiver
+/// that switched all the same put back, unless another controller has changed it
+/// since. Otherwise each is checked on the Receiver's `/active` endpoint once due, and
+/// when `registry` is given, on its IS-04 `subscription` and `version`, which the Node
+/// must update on every activation.
 ///
 /// Fails, sending nothing, when no route is given, a name finds no Sender or Receiver
 /// or more than one, or a Receiver is named twice.
@@ -296,7 +304,7 @@ pub fn connect(
         });
     }
 
-    let prepared = each(&jobs, |job| prepare(snapshot, client, job));
+    let prepared = each(&jobs, AT_ONCE, |job| prepare(snapshot, client, job));
     for (job, prepared) in jobs.iter_mut().zip(prepared) {
         match prepared {
             Ok(prepared) => {
@@ -359,9 +367,18 @@ pub fn connect(
         }
     }
     let sent_at = now(settings.tai_utc);
-    let replies = each(&groups, |(api, members)| {
+    // A salvo's requests have half the time before it is due to be answered, leaving the
+    // other half to cancel the rest should one be refused or go unanswered.
+    let deadline = match activation {
+        Activation::At(due) => {
+            let half = u64::try_from((due.nanos() - sent_at.nanos()) / 2).unwrap_or(0);
+            Instant::now().checked_add(Duration::from_nanos(half))
+        }
+        _ => None,
+    };
+    let replies = each(&groups, usize::MAX, |(api, members)| {
         let members: Vec<&Job> = members.iter().map(|&i| &jobs[i]).collect();
-        send(client, api, &members)
+        send(client, api, &members, deadline, settings.tai_utc)
     });
     let mut sent: Vec<Option<Sent>> = vec![None; jobs.len()];
     for ((_, members), replies) in groups.iter().zip(replies) {
@@ -374,12 +391,12 @@ pub fn connect(
     let failed = sent.iter().any(|s| !matches!(s, Sent::Accepted { .. }));
     if failed {
         let work: Vec<(&Job, &Sent)> = jobs.iter().zip(&sent).collect();
-        let undone = each(&work, |(job, sent)| roll_back(client, job, sent, activation.is_scheduled()));
+        let undone = each(&work, usize::MAX, |(job, sent)| roll_back(client, job, sent, activation.is_scheduled()));
         for ((job, sent), (state, warnings)) in jobs.iter_mut().zip(&sent).zip(undone) {
             job.report.warnings.extend(warnings);
             job.report.state = match sent {
                 Sent::Accepted { .. } => state,
-                Sent::Rejected(problem) | Sent::Lost(problem) => {
+                Sent::Rejected(problem) | Sent::Uncertain(problem) => {
                     job.report.problems.push(problem.clone());
                     State::Failed
                 }
@@ -392,7 +409,7 @@ pub fn connect(
     }
 
     let work: Vec<(&Job, &Sent)> = jobs.iter().zip(&sent).collect();
-    let settled = each(&work, |(job, sent)| {
+    let settled = each(&work, usize::MAX, |(job, sent)| {
         // Judged on this clock, not the Device's, which may be wrong.
         let due = match activation {
             Activation::Immediate => now(settings.tai_utc),
@@ -405,11 +422,19 @@ pub fn connect(
         };
         settle(client, registry, job, due, staged, settings)
     });
-    for (job, settled) in jobs.iter_mut().zip(settled) {
+    for ((job, sent), settled) in jobs.iter_mut().zip(&sent).zip(settled) {
         job.report.state = settled.state;
         job.report.activation_time = settled.activation_time;
         job.report.problems.extend(settled.problems);
         job.report.warnings.extend(settled.warnings);
+        // An answer after the time may mean the request came after it too.
+        if let (Activation::At(due), Sent::Accepted { answered, .. }) = (activation, sent)
+            && *answered > due
+        {
+            job.report
+                .warnings
+                .push("its Connection API answered after the time it was due, so it may have switched late".into());
+        }
     }
     Ok(Outcome { activation: activation.to_json(), connections: jobs.into_iter().map(|j| j.report).collect() })
 }
@@ -540,20 +565,23 @@ fn read_json(client: &ConnectionClient, url: &str) -> Result<Value, String> {
     }
 }
 
-/// Sends the requests for the Receivers of one Connection API.
-fn send(client: &ConnectionClient, api: &str, jobs: &[&Job]) -> Vec<Sent> {
+/// Sends the requests for the Receivers of one Connection API, to be answered by
+/// `deadline` when there is one.
+fn send(client: &ConnectionClient, api: &str, jobs: &[&Job], deadline: Option<Instant>, tai_utc: i32) -> Vec<Sent> {
     if let [job] = jobs {
-        return vec![patch(client, api, job)];
+        return vec![patch(client, api, job, deadline, tai_utc)];
     }
     let url = bulk(api, Kind::Receiver);
     let body: Vec<Value> = jobs
         .iter()
         .map(|job| json!({"id": job.report.receiver.id, "params": job.plan.as_ref().map(|p| &p.request)}))
         .collect();
-    match client.post(&url, &Value::Array(body)) {
+    let reply = client.post_within(&url, &Value::Array(body), time_left(deadline));
+    let answered = now(tai_utc);
+    match reply {
         // No bulk interface: one request each.
         Ok(reply) if matches!(reply.status, 404 | 405 | 501) => {
-            jobs.iter().map(|job| patch(client, api, job)).collect()
+            each(jobs, usize::MAX, |job| patch(client, api, job, deadline, tai_utc))
         }
         Ok(Reply { status: 200, body: Value::Array(items), .. }) => jobs
             .iter()
@@ -563,35 +591,52 @@ fn send(client: &ConnectionClient, api: &str, jobs: &[&Job]) -> Vec<Sent> {
                         .and_then(Value::as_str)
                         .is_some_and(|id| id.eq_ignore_ascii_case(&job.report.receiver.id))
                 });
+                // Without its result, what became of it is not known.
                 let Some(item) = item else {
-                    return Sent::Rejected(format!("the response to {url} says nothing of it"));
+                    return Sent::Uncertain(format!("the response to {url} says nothing of it"));
                 };
-                let code = item.get("code").and_then(Value::as_u64).and_then(|c| u16::try_from(c).ok()).unwrap_or(0);
-                let reply = Reply { status: code, body: item.clone(), location: None };
-                if reply.is_success() {
-                    Sent::Accepted { status: code, staged: None }
-                } else {
-                    Sent::Rejected(refusal(&reply))
-                }
+                let Some(code) = item.get("code").and_then(Value::as_u64).and_then(|c| u16::try_from(c).ok()) else {
+                    return Sent::Uncertain(format!("the response to {url} gives it no code"));
+                };
+                judge(Reply { status: code, body: item.clone(), location: None }, false, answered)
             })
             .collect(),
-        Ok(reply) if reply.status == 200 => {
-            jobs.iter().map(|_| Sent::Rejected(format!("{url} returned no list of results"))).collect()
+        Ok(reply) if reply.is_success() => {
+            jobs.iter().map(|_| Sent::Uncertain(format!("{url} returned no list of results"))).collect()
         }
-        Ok(reply) => jobs.iter().map(|_| Sent::Rejected(refusal(&reply))).collect(),
-        Err(e) => jobs.iter().map(|_| Sent::Lost(format!("no answer: {e}"))).collect(),
+        Ok(reply) => {
+            let sent = judge(reply, false, answered);
+            jobs.iter().map(|_| sent.clone()).collect()
+        }
+        Err(e) => jobs.iter().map(|_| Sent::Uncertain(format!("no answer: {e}"))).collect(),
     }
 }
 
-/// Sends one Receiver's request to its `/staged` endpoint.
-fn patch(client: &ConnectionClient, api: &str, job: &Job) -> Sent {
+/// Sends one Receiver's request to its `/staged` endpoint, to be answered by `deadline`
+/// when there is one.
+fn patch(client: &ConnectionClient, api: &str, job: &Job, deadline: Option<Instant>, tai_utc: i32) -> Sent {
     let url = single(api, Kind::Receiver, &job.report.receiver.id, "staged");
     let request = &job.plan.as_ref().expect("a job that is sent has a plan").request;
-    match client.patch(&url, request) {
-        Ok(reply) if reply.is_success() => Sent::Accepted { status: reply.status, staged: Some(reply.body) },
-        Ok(reply) => Sent::Rejected(refusal(&reply)),
-        Err(e) => Sent::Lost(format!("no answer: {e}")),
+    match client.patch_within(&url, request, time_left(deadline)) {
+        Ok(reply) => judge(reply, true, now(tai_utc)),
+        Err(e) => Sent::Uncertain(format!("no answer: {e}")),
     }
+}
+
+/// What a Connection API's answer says became of a request; `staged` when its body is
+/// what was staged.
+fn judge(reply: Reply, staged: bool, answered: PtpTime) -> Sent {
+    match reply.status {
+        200..=299 => Sent::Accepted { status: reply.status, staged: staged.then_some(reply.body), answered },
+        300..=499 => Sent::Rejected(refusal(&reply)),
+        // A server error may come after the request was acted on.
+        _ => Sent::Uncertain(format!("the Connection API failed: {}", reply.error())),
+    }
+}
+
+/// How long a request may take to be answered by `deadline`.
+fn time_left(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(Duration::MAX, |deadline| deadline.saturating_duration_since(Instant::now())).max(LEAST)
 }
 
 /// Why a Connection API refused a request.
@@ -610,22 +655,28 @@ fn activation_time(resource: &Value) -> Option<PtpTime> {
     PtpTime::parse(resource.get("activation")?.get("activation_time")?.as_str()?)
 }
 
-/// Undoes a connection after another in the salvo failed: cancels what is scheduled, and
-/// puts the Receiver back when its `/active` endpoint shows it changed.
+/// Undoes a connection after another in the salvo failed. It cancels what is scheduled,
+/// and when the Receiver's `/active` endpoint shows the connection took effect, puts it
+/// back as it was; otherwise it stages again what the Receiver had, so that no later
+/// activation, from any controller, makes the connection after all. A Receiver that has
+/// changed to something else since it was read is left as it is.
 fn roll_back(client: &ConnectionClient, job: &Job, sent: &Sent, scheduled: bool) -> (State, Vec<String>) {
     let staged = single(&job.api, Kind::Receiver, &job.report.receiver.id, "staged");
+    let plan = job.plan.as_ref().expect("a job that is sent has a plan");
     let mut warnings = Vec::new();
     // Whether an activation may still be pending, to take effect later.
     let mut pending = false;
+    // Whether the request may be left staged, for a later activation to make.
+    let mut left_staged = false;
     match sent {
         Sent::Rejected(_) => return (State::Failed, warnings),
         // Nothing is pending after an immediate activation.
         Sent::Accepted { status: 200, .. } if !scheduled => {}
         // A scheduled activation, or one that may have been sent.
-        Sent::Accepted { .. } | Sent::Lost(_) => {
+        Sent::Accepted { .. } | Sent::Uncertain(_) => {
             let cancel = json!({"activation": {"mode": null, "requested_time": null}});
             match client.patch(&staged, &cancel) {
-                Ok(reply) if reply.is_success() => {}
+                Ok(reply) if reply.is_success() => left_staged = true,
                 Ok(reply) => {
                     pending = true;
                     warnings.push(format!("cancelling its activation was refused: {}", reply.error()));
@@ -647,6 +698,31 @@ fn roll_back(client: &ConnectionClient, job: &Job, sent: &Sent, scheduled: bool)
     let connection =
         |v: &Value| [v.get("sender_id"), v.get("master_enable"), v.get("transport_params")].map(|f| f.cloned());
     if connection(&active) == connection(&job.previous) {
+        if pending {
+            // The activation may yet take effect.
+            return (State::RollbackFailed, warnings);
+        }
+        if left_staged {
+            let request = Plan::restore(&job.previous, Activation::Immediate).map(|mut restore| {
+                restore.request.as_object_mut().map(|request| request.remove("activation"));
+                restore.request
+            });
+            let problem = match request.map(|request| client.patch(&staged, &request)) {
+                Ok(Ok(reply)) if reply.is_success() => None,
+                Ok(Ok(reply)) => Some(format!("staging what it had again was refused: {}", reply.error())),
+                Ok(Err(e)) => Some(format!("staging what it had again got no answer: {e}")),
+                Err(e) => Some(e),
+            };
+            if let Some(problem) = problem {
+                warnings.push(format!(
+                    "its /staged endpoint may still hold the connection, for a later activation to make: {problem}"
+                ));
+            }
+        }
+        return (State::RolledBack, warnings);
+    }
+    if !plan.verify(&active).is_empty() {
+        warnings.push("it has changed since it was read, but not to this connection, so it was left as it is".into());
         return (if pending { State::RollbackFailed } else { State::RolledBack }, warnings);
     }
     let restore = match Plan::restore(&job.previous, Activation::Immediate) {
@@ -720,7 +796,9 @@ fn settle(
         }
         thread::sleep(POLL);
     };
-    let activation_time = active.as_ref().and_then(activation_time).unwrap_or(due);
+    // What /active shows is the last activation, which is not this one when it differs.
+    let shown = if problems.is_empty() { active.as_ref().and_then(activation_time) } else { None };
+    let activation_time = shown.unwrap_or(due);
     let mut settled = Settled {
         state: if problems.is_empty() { State::Done } else { State::Differs },
         activation_time: Some(tai(activation_time)),
@@ -809,12 +887,12 @@ fn is_http(href: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-/// Runs `work` on each item, several at once, and returns the results in order.
-fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// Runs `work` on each item, up to `width` at once, and returns the results in order.
+fn each<T: Sync, R: Send>(items: &[T], width: usize, work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     if items.len() < 2 {
         return items.iter().map(work).collect();
     }
-    let chunk = items.len().div_ceil(AT_ONCE);
+    let chunk = items.len().div_ceil(width.max(1));
     let work = &work;
     thread::scope(|scope| {
         let running: Vec<_> =

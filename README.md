@@ -113,7 +113,7 @@ receiver "MON 1 video" (7ecf0001) ← sender "CAM 1 audio" (5e0d0002): refused
 1 connection: 1 refused
 ```
 
-- `st2110 connect URL` lists which Senders each Receiver can take, by transport, format and BCP-004-01 capabilities, and marks the one it takes now; `--receiver` shows one Receiver, and `--format json` gives the whole crosspoint matrix.
+- `st2110 connect URL` lists which Senders each Receiver can take, by transport, format and BCP-004-01 capabilities (reading each Sender's SDP file for those judged on it), and marks the one it takes now; `--receiver` shows one Receiver, and `--format json` gives the whole crosspoint matrix.
 - `--receiver` with `--sender` connects a Receiver to a Sender's stream, `--sdp FILE` to the stream an SDP file describes (such as one from outside NMOS), and `--disconnect` turns it off. A Sender or Receiver is named by its id, its label or the start of its id.
 - `--salvo FILE` makes several connections together, from a JSON list like the one above; an entry takes `"sender"`, `"sdp"` or `"disconnect": true`.
 - Each connection follows IS-05 v1.2 as a controller should:
@@ -121,7 +121,7 @@ receiver "MON 1 video" (7ecf0001) ← sender "CAM 1 audio" (5e0d0002): refused
   - it stages the SDP file with every leg's `transport_params` spelled out (group, source, port and `rtp_enabled`), `master_enable` and `sender_id`. A two-leg ST 2022-7 Receiver given a one-leg stream has leg 2 turned off; a one-leg Receiver given a pair joins path 1;
   - it sends nothing the Receiver's constraints or capabilities would reject, unless `--force` is given. `--dry-run` shows what it would send.
 - One connection takes effect at once. Several are scheduled for one PTP time `--lead` seconds ahead (2 by default), so that every Receiver switches together. `--at` sets the time (`now`, a PTP time or a UTC time), and `--in` a delay each Device counts from when it has the request.
-- Receivers that share a Connection API get one `/bulk/receivers` request, or one `PATCH` each when the API has no bulk interface. When a Connection API refuses its part or does not answer, the rest of the salvo is cancelled, or put back as its `/active` endpoints showed it.
+- Receivers that share a Connection API get one `/bulk/receivers` request, or one `PATCH` each when the API has no bulk interface. A salvo's requests have half the lead to be answered, so that when a Connection API refuses its part, fails or does not answer, the rest can be cancelled before they are due. A Receiver that switched all the same is put back as its `/active` endpoint showed it, and one that another controller has changed since is left alone.
 - After, it waits for each connection to come due, checks the Receiver's `/active` endpoint shows it, and checks the registry for the Receiver's new subscription and version, which IS-05 requires the Node to update; a registry that lags is a warning. `--wait` sets how long each check may take (5 s), and a connection due later than that is reported as scheduled. `--cancel` cancels an activation scheduled on a Receiver.
 - TARGET may also be a snapshot saved with `st2110 nmos --save`, when the registry is out of reach; the registry check is then skipped.
 - It exits with 0 when every connection was made, scheduled or planned, 1 when one was refused, failed or differs, and 2 when the registry or a file cannot be read, or a name finds no Sender or Receiver or more than one.

@@ -22,6 +22,8 @@ const VIDEO_SENDER: &str = "5e0d0001-0000-4000-8000-000000000001";
 const AUDIO_SENDER: &str = "5e0d0002-0000-4000-8000-000000000002";
 const VIDEO_RECEIVER: &str = "7ecf0001-0000-4000-8000-000000000001";
 const AUDIO_RECEIVER: &str = "7ecf0002-0000-4000-8000-000000000002";
+/// A Sender outside the facility, for another controller to connect.
+const CAMERA_2_VIDEO: &str = "5e0d0003-0000-4000-8000-000000000003";
 
 /// The time now, as the mock and the controller both read it.
 fn now() -> PtpTime {
@@ -57,6 +59,15 @@ struct Faults {
     registry_lags: bool,
     /// Requests that cancel an activation are refused.
     refuse_cancel: bool,
+    /// Receivers whose next activation is acted on, then answered with a server error.
+    fail_after: Vec<String>,
+    /// Receivers that bulk responses leave out, though they were staged.
+    bulk_omit: Vec<String>,
+    /// When a request is refused, another controller has just taken the video Receiver
+    /// to Camera 2.
+    third_party: bool,
+    /// Receivers whose activations are accepted but never take effect.
+    stuck: Vec<String>,
 }
 
 /// The Connection API of Monitor 1 and Camera 1, and the registry's copy of each Receiver.
@@ -137,6 +148,7 @@ impl Facility {
 
     fn route(&mut self, method: &str, path: &str, body: &Value) -> (u16, Value) {
         if let Some(id) = path.strip_prefix("/x-nmos/query/v1.3/receivers/") {
+            let id = id.split('?').next().unwrap_or_default();
             return match self.registry.get(id) {
                 Some(receiver) => (200, receiver.clone()),
                 None => error(404, "not found", ""),
@@ -159,15 +171,18 @@ impl Facility {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|item| {
+                .filter_map(|item| {
                     let id = item["id"].as_str().unwrap();
                     let (code, response) = self.stage(id, &item["params"]);
+                    if self.faults.bulk_omit.iter().any(|omit| omit == id) {
+                        return None;
+                    }
                     let mut result = json!({"id": id, "code": code});
                     if code >= 400 {
                         result["error"] = response["error"].clone();
                         result["debug"] = response["debug"].clone();
                     }
-                    result
+                    Some(result)
                 })
                 .collect();
             return (200, Value::Array(items));
@@ -189,6 +204,11 @@ impl Facility {
                 (200, self.receivers[&id].active.clone())
             }
             ("PATCH", "staged") if self.faults.redirect_patch => (301, Value::Null),
+            ("PATCH", "staged") if self.faults.fail_after.contains(&id) && body["activation"]["mode"].is_string() => {
+                self.faults.fail_after.retain(|fail| *fail != id);
+                self.stage(&id, body);
+                error(500, "Internal Server Error", "acted on, then failed")
+            }
             ("PATCH", "staged") => self.stage(&id, body),
             _ => error(405, "Method Not Allowed", ""),
         }
@@ -208,6 +228,11 @@ impl Facility {
     fn stage(&mut self, id: &str, body: &Value) -> (u16, Value) {
         self.settle(id);
         if let Some(&status) = self.faults.refuse.get(id) {
+            if self.faults.third_party {
+                let video = &mut self.receivers.get_mut(VIDEO_RECEIVER).unwrap().active;
+                video["sender_id"] = json!(CAMERA_2_VIDEO);
+                video["master_enable"] = json!(true);
+            }
             return error(status, "Refused", "as ordered");
         }
         let receiver = self.receivers.get_mut(id).unwrap();
@@ -282,6 +307,11 @@ impl Facility {
 
     fn activate(&mut self, id: &str, at: PtpTime) {
         let receiver = self.receivers.get_mut(id).unwrap();
+        if self.faults.stuck.iter().any(|stuck| stuck == id) {
+            receiver.pending = None;
+            receiver.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
+            return;
+        }
         let mut active = receiver.staged.clone();
         for (leg, constraints) in
             active["transport_params"].as_array_mut().unwrap().iter_mut().zip(receiver.constraints.as_array().unwrap())
@@ -379,6 +409,10 @@ impl Mock {
 
     fn registered(&self, id: &str) -> Value {
         self.facility.lock().unwrap().registry[id].clone()
+    }
+
+    fn staged(&self, id: &str) -> Value {
+        self.facility.lock().unwrap().receivers[id].staged.clone()
     }
 }
 
@@ -510,8 +544,11 @@ fn without_bulk_it_sends_one_request_each() {
         &settings(),
     );
     assert_eq!(states(&outcome), [State::Done, State::Done], "{outcome:#?}");
+    // Sent side by side, in no particular order.
+    let mut changes = mock.changes();
+    changes[1..].sort();
     assert_eq!(
-        mock.changes(),
+        changes,
         [
             "POST /x-nmos/connection/v1.1/bulk/receivers".to_string(),
             format!("PATCH /x-nmos/connection/v1.1/single/receivers/{VIDEO_RECEIVER}/staged"),
@@ -532,9 +569,17 @@ fn a_refusal_cancels_the_rest_of_the_salvo() {
     assert_eq!(states(&outcome), [State::RolledBack, State::Failed], "{outcome:#?}");
     assert_eq!(outcome.connections[1].problems, ["the Connection API refused it: HTTP 400: Refused (as ordered)"]);
     assert!(outcome.connections[0].warnings.is_empty(), "cancelled before it took effect");
-    // The video Receiver's scheduled activation was cancelled.
-    let cancel = mock.bodies("PATCH");
-    assert_eq!(cancel, [json!({"activation": {"mode": null, "requested_time": null}})]);
+    // The video Receiver's scheduled activation was cancelled, and what it had staged
+    // again, with no activation, so that none can make the connection later.
+    let idle = idle(&["192.168.10.31", "192.168.20.31"]);
+    let [cancel, staged] = mock.bodies("PATCH").try_into().unwrap();
+    assert_eq!(cancel, json!({"activation": {"mode": null, "requested_time": null}}));
+    assert_eq!(
+        staged,
+        json!({"sender_id": null, "master_enable": false, "transport_file": idle["transport_file"],
+               "transport_params": idle["transport_params"]})
+    );
+    assert_eq!(mock.staged(VIDEO_RECEIVER), idle, "as it was");
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(mock.active(VIDEO_RECEIVER)["master_enable"], false, "it never switched");
     assert!(!outcome.succeeded());
@@ -556,6 +601,99 @@ fn an_activation_left_scheduled_fails_the_rollback() {
         outcome.connections[0].warnings,
         ["cancelling its activation was refused: HTTP 500: Internal Server Error (cannot cancel)"]
     );
+}
+
+#[test]
+fn an_unanswered_part_of_a_salvo_is_cancelled_in_time() {
+    let mock = Mock::start(|f| {
+        f.faults.no_bulk = true;
+        f.faults.lose.push(AUDIO_RECEIVER.into());
+    });
+    let started = std::time::Instant::now();
+    // Less than the client's timeout, 800 ms.
+    let settings = Settings { lead: Duration::from_millis(600), ..settings() };
+    let outcome = mock.connect(
+        &[route("MON 1 video", sender("CAM 1 video")), route("MON 1 audio", sender("CAM 1 audio"))],
+        &settings,
+    );
+    // The audio request is given half the lead, so the video one is cancelled before
+    // it is due, rather than put back after it took effect.
+    assert_eq!(states(&outcome), [State::RolledBack, State::Failed], "{outcome:#?}");
+    assert!(outcome.connections[0].warnings.is_empty(), "{outcome:#?}");
+    assert!(outcome.connections[1].problems[0].starts_with("no answer: "), "{outcome:#?}");
+    std::thread::sleep(Duration::from_millis(900).saturating_sub(started.elapsed()));
+    for id in [VIDEO_RECEIVER, AUDIO_RECEIVER] {
+        assert_eq!(mock.active(id)["master_enable"], false, "{id} never switched");
+    }
+}
+
+#[test]
+fn a_result_left_out_of_a_bulk_response_is_cancelled() {
+    let mock = Mock::start(|f| f.faults.bulk_omit.push(AUDIO_RECEIVER.into()));
+    let outcome = mock.connect(
+        &[route("MON 1 video", sender("CAM 1 video")), route("MON 1 audio", sender("CAM 1 audio"))],
+        &settings(),
+    );
+    assert_eq!(states(&outcome), [State::RolledBack, State::Failed], "{outcome:#?}");
+    let bulk = format!("http://127.0.0.1:{}/x-nmos/connection/v1.1/bulk/receivers", mock.port);
+    assert_eq!(outcome.connections[1].problems, [format!("the response to {bulk} says nothing of it")]);
+    // It was staged all the same, so it was cancelled with the rest.
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(mock.active(AUDIO_RECEIVER)["master_enable"], false, "it never switched");
+    assert_eq!(mock.staged(AUDIO_RECEIVER)["sender_id"], Value::Null);
+}
+
+#[test]
+fn a_server_error_is_checked_and_put_back() {
+    let mock = Mock::start(|f| {
+        f.faults.no_bulk = true;
+        f.faults.fail_after.push(AUDIO_RECEIVER.into());
+    });
+    let settings = Settings { activation: Some(Activation::Immediate), ..settings() };
+    let outcome = mock.connect(
+        &[route("MON 1 video", sender("CAM 1 video")), route("MON 1 audio", sender("CAM 1 audio"))],
+        &settings,
+    );
+    assert_eq!(states(&outcome), [State::RolledBack, State::Failed], "{outcome:#?}");
+    let audio = &outcome.connections[1];
+    assert_eq!(audio.problems, ["the Connection API failed: HTTP 500: Internal Server Error (acted on, then failed)"]);
+    assert_eq!(audio.warnings, ["it had taken effect, and was put back as it was"]);
+    assert_eq!(mock.active(AUDIO_RECEIVER)["master_enable"], false);
+}
+
+#[test]
+fn a_rollback_leaves_another_controllers_change() {
+    let mock = Mock::start(|f| {
+        f.faults.no_bulk = true;
+        f.faults.refuse.insert(AUDIO_RECEIVER.into(), 400);
+        f.faults.third_party = true;
+    });
+    let outcome = mock.connect(
+        &[route("MON 1 video", sender("CAM 1 video")), route("MON 1 audio", sender("CAM 1 audio"))],
+        &settings(),
+    );
+    assert_eq!(states(&outcome), [State::RolledBack, State::Failed], "{outcome:#?}");
+    assert_eq!(
+        outcome.connections[0].warnings,
+        ["it has changed since it was read, but not to this connection, so it was left as it is"]
+    );
+    assert_eq!(mock.active(VIDEO_RECEIVER)["sender_id"], CAMERA_2_VIDEO);
+}
+
+#[test]
+fn an_activation_that_does_not_take_is_reported() {
+    let mock = Mock::start(|f| {
+        f.faults.stuck.push(AUDIO_RECEIVER.into());
+        f.receivers.get_mut(AUDIO_RECEIVER).unwrap().active["activation"]["activation_time"] = json!("1790510000:0");
+    });
+    let settings = Settings { wait: Duration::from_millis(400), ..settings() };
+    let outcome = mock.connect(&[route("MON 1 audio", sender("CAM 1 audio"))], &settings);
+    let connection = &outcome.connections[0];
+    assert_eq!(connection.state, State::Differs, "{connection:#?}");
+    assert_eq!(connection.problems[0], "its /active endpoint shows master_enable is false, not true");
+    // When it was to take effect, not the last activation /active shows.
+    let at = PtpTime::parse(connection.activation_time.as_deref().unwrap()).unwrap();
+    assert!((now().nanos() - at.nanos()).abs() < 5_000_000_000, "{at}");
 }
 
 #[test]

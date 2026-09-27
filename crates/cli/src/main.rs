@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -529,6 +530,14 @@ fn write_diagnostic(out: &mut impl Write, file: &str, d: &Diagnostic, style: Sty
         None => file.to_string(),
     };
     writeln!(out, "{location}: {}[{}]: {} ({})", style.severity(d.severity), d.rule, d.message, d.reference)
+}
+
+/// A number of seconds given for `option`: a timeout, a wait or a lead, up to a day.
+pub(crate) fn seconds(option: &str, value: f64) -> Result<Duration, String> {
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .filter(|duration| duration.as_secs() < 86_400)
+        .ok_or_else(|| format!("{option} {value} is not a number of seconds from 0 to a day"))
 }
 
 pub(crate) fn plural(count: usize, noun: &str) -> String {

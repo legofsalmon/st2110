@@ -265,6 +265,17 @@ fn connect_refuses_what_it_cannot_read() {
         stderr(&["connect", FACILITY, "--receiver", "MON 1 video", "--disconnect", "--at", "soon"])
             .contains("--at soon: not now")
     );
+    assert!(
+        stderr(&["connect", FACILITY, "--receiver", "MON 1 video", "--dry-run"])
+            .contains("--dry-run is for making connections: give --receiver with --sender")
+    );
+    for command in ["connect", "nmos"] {
+        assert!(
+            stderr(&[command, "http://127.0.0.1:1", "--timeout", "1e19"])
+                .contains("--timeout 10000000000000000000 is not a number of seconds from 0 to a day"),
+            "{command}"
+        );
+    }
     let salvo = std::env::temp_dir().join(format!("st2110-salvo-{}.json", std::process::id()));
     std::fs::write(&salvo, r#"[{"receiver": "MON 1 video", "sender": "CAM 1 video", "disconnect": true}]"#).unwrap();
     let both = stderr(&["connect", FACILITY, "--salvo", salvo.to_str().unwrap()]);

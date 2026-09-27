@@ -130,6 +130,8 @@ export interface Snapshot {
   senders?: object[];
   receivers?: object[];
   manifests?: Record<string, Manifest>;
+  /** What each Sender's Connection API serves at /transportfile, where manifest_href names another URL. */
+  transport_files?: Record<string, Manifest>;
 }
 
 export type ResourceKind = "node" | "device" | "source" | "flow" | "sender" | "receiver";
@@ -236,9 +238,9 @@ export interface ConnectionOptions {
   constraints?: Record<string, Constraint>[];
   /** The Sender whose stream it is; null or left out for one from outside NMOS. */
   senderId?: string | null;
-  /** When it takes effect: "now" (the default), a PTP time such as "1790510437:0", or UTC such as "2026-09-27T12:00:00Z". */
+  /** When it takes effect: "now" (the default), or a PTP time such as "1790510437:0" or UTC time such as "2026-09-27T12:00:00Z" still to come. */
   at?: string;
-  /** Seconds after the Connection API has the request, in place of `at`. */
+  /** Seconds after the Connection API has the request, in place of `at`. NaN and Infinity are refused. */
   in?: number;
   taiUtc?: number;
 }
@@ -720,9 +722,15 @@ struct ConnectionOptions {
     constraints: Option<serde_json::Value>,
     sender_id: Option<String>,
     at: Option<String>,
-    #[serde(rename = "in")]
-    after: Option<f64>,
+    /// `null` when it was given but has no JSON form, as NaN and Infinity have none.
+    #[serde(rename = "in", deserialize_with = "given")]
+    after: Option<Option<f64>>,
     tai_utc: Option<i32>,
+}
+
+/// A value that was given, even as `null`.
+fn given<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<f64>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// Plans connecting a Receiver to the stream an SDP file describes, as IS-05 asks of a
@@ -738,16 +746,26 @@ pub fn plan_connection(
     let tai_utc = o.tai_utc.unwrap_or(TAI_UTC_2017);
     let activation = match (o.at.as_deref().map(str::trim), o.after) {
         (Some(_), Some(_)) => return Err(JsError::new("give at or in, not both")),
-        (None | Some("now"), None) => Activation::Immediate,
-        (Some(text), None) => Activation::At(
-            timing::read_time(text, tai_utc)
-                .ok_or_else(|| JsError::new(&format!("at: {text} is not now, a PTP time or a UTC time")))?,
-        ),
+        (None, None) => Activation::Immediate,
+        (Some(text), None) if text.eq_ignore_ascii_case("now") => Activation::Immediate,
+        (Some(text), None) => {
+            let at = timing::read_time(text, tai_utc)
+                .ok_or_else(|| JsError::new(&format!("at: {text} is not now, a PTP time or a UTC time")))?;
+            let current = PtpTime::from_utc(now() as i128 * 1_000_000, tai_utc)
+                .ok_or_else(|| JsError::new("the clock is out of PTP's range"))?;
+            if at <= current {
+                return Err(JsError::new(&format!("at: {text} has passed")));
+            }
+            Activation::At(at)
+        }
         (None, Some(seconds)) => Activation::After(
-            std::time::Duration::try_from_secs_f64(seconds)
-                .ok()
+            seconds
+                .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
                 .and_then(|d| u64::try_from(d.as_nanos()).ok())
-                .ok_or_else(|| JsError::new(&format!("in: {seconds} is not a number of seconds")))?,
+                .ok_or_else(|| match seconds {
+                    Some(seconds) => JsError::new(&format!("in: {seconds} is not a number of seconds")),
+                    None => JsError::new("in: not a number of seconds (NaN and Infinity are not)"),
+                })?,
         ),
     };
     let plan = match o.sdp {
