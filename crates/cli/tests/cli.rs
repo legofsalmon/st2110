@@ -396,3 +396,133 @@ fn time_refuses_what_it_cannot_work_out() {
         "the next frame or block would begin after the last PTP time",
     );
 }
+
+/// 2026-09-27 12:00:00 UTC in PTP seconds.
+const NOON: u64 = 1_790_510_437;
+
+/// An Ethernet frame of 1 ms of 8-channel L24 audio from 192.168.10.22:5006 to
+/// 239.10.10.2:5006, the stream in audio-pcm.sdp.
+fn audio_frame(payload_type: u8, ssrc: u32, seq: u16, timestamp: u32) -> Vec<u8> {
+    let mut rtp = vec![0x80, payload_type];
+    rtp.extend(seq.to_be_bytes());
+    rtp.extend(timestamp.to_be_bytes());
+    rtp.extend(ssrc.to_be_bytes());
+    rtp.extend([0x11; 48 * 3 * 8]);
+    let mut frame = vec![0x01, 0x00, 0x5E, 0x0A, 0x0A, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00];
+    frame.extend([0x45, 0xB8]);
+    frame.extend(((20 + 8 + rtp.len()) as u16).to_be_bytes());
+    frame.extend([0, 1, 0x40, 0, 64, 17, 0, 0, 192, 168, 10, 22, 239, 10, 10, 2]);
+    frame.extend(5006_u16.to_be_bytes());
+    frame.extend(5006_u16.to_be_bytes());
+    frame.extend(((8 + rtp.len()) as u16).to_be_bytes());
+    frame.extend([0, 0]);
+    frame.extend(rtp);
+    frame
+}
+
+/// A pcap file of 200 ms of that audio from noon, PTP time, each packet arriving 150 µs
+/// after its last sample. `packet` makes packet `i` from its first sample's timestamp.
+fn audio_capture(packet: impl Fn(u16, u32) -> Vec<u8>) -> Vec<u8> {
+    let mut out = vec![0x4d, 0x3c, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0];
+    for i in 0..200 {
+        let millisecond = NOON * 1000 + i;
+        let arrival = (millisecond + 1) * 1_000_000 + 150_000;
+        let frame = packet(i as u16, (millisecond * 48) as u32);
+        out.extend(((arrival / 1_000_000_000) as u32).to_le_bytes());
+        out.extend(((arrival % 1_000_000_000) as u32).to_le_bytes());
+        out.extend((frame.len() as u32).to_le_bytes());
+        out.extend((frame.len() as u32).to_le_bytes());
+        out.extend(frame);
+    }
+    out
+}
+
+fn clean_audio() -> Vec<u8> {
+    audio_capture(|i, timestamp| audio_frame(97, 0x2222_0002, i, timestamp))
+}
+
+#[test]
+fn pcap_measures_a_capture_against_its_sdp_file() {
+    let sdp = fixture("audio-pcm.sdp");
+    let output = with_stdin_bytes(&["pcap", "-", "--sdp", &sdp], &clean_audio());
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    let expected = [
+        "-: pcap (nanosecond), 200 frames in 0.199 s: 200 RTP packets in 1 flow, 0 PTP messages".to_string(),
+        "  clock: PTP time: with no PTP Sync messages to go by, the timestamps of 1 of 1 RTP flow sit within half a second of PTP time".to_string(),
+        format!("  flow 1: 192.168.10.22:5006 to 239.10.10.2:5006, ST 2110-30, {sdp} stream 0"),
+        "    200 packets (payload type 97, SSRC 22220002) at 9.5 Mb/s".to_string(),
+        "    audio: L24, 48000 Hz, 8 channels, 48 samples a packet (1000.0 µs)".to_string(),
+        "    latency 1150.0 µs (1150.0 to 1150.0), packet interval 1000.0 µs (1000.0 to 1000.0), TS-DF at most 0.0 µs".to_string(),
+        "-: 1 flow, no problems found".to_string(),
+    ];
+    assert_eq!(text, format!("{}\n\n", expected.join("\n")));
+}
+
+#[test]
+fn pcap_reports_findings_with_where_and_when() {
+    let sdp = fixture("audio-pcm.sdp");
+    let wrong_type = audio_capture(|i, timestamp| audio_frame(98, 0x2222_0002, i, timestamp));
+    let output = with_stdin_bytes(&["pcap", "--quiet", "-", "--sdp", &sdp], &wrong_type);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout(&output),
+        "-: flow 1 at 0.000 s: error[payload-type-mismatch]: 200 packets carried payload type 98, not the 97 of \
+         the SDP file's m= line (RFC 3550 §5.1 · RFC 8866 §5.14)\n\
+         -: 1 flow, 1 error, 0 warnings, 0 notes\n"
+    );
+    // A new SSRC is a warning, which fails only when warnings are denied.
+    let new_ssrc =
+        audio_capture(|i, timestamp| audio_frame(97, if i < 100 { 0x2222_0002 } else { 0x2222_0099 }, i, timestamp));
+    assert_eq!(with_stdin_bytes(&["pcap", "-", "--sdp", &sdp], &new_ssrc).status.code(), Some(0));
+    let denied = with_stdin_bytes(&["pcap", "--deny-warnings", "-", "--sdp", &sdp], &new_ssrc);
+    assert_eq!(denied.status.code(), Some(1));
+    let text = stdout(&denied);
+    assert!(text.contains("-: flow 1 at 0.100 s: warning[ssrc-change]: the SSRC changed 1 time"), "{text}");
+}
+
+#[test]
+fn pcap_recognises_flows_and_writes_json() {
+    let output = with_stdin_bytes(&["pcap", "--format", "json", "-"], &clean_audio());
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report = &json[0];
+    assert_eq!((report["file"].as_str(), report["capture"]["format"].as_str()), (Some("-"), Some("pcap (nanosecond)")));
+    assert_eq!(report["timescale"]["clock"], "ptp");
+    let flow = &report["flows"][0];
+    assert_eq!((flow["essence"].as_str(), flow["guessed"].as_bool()), (Some("audio"), Some(true)));
+    assert_eq!((flow["audio"]["encoding"].as_str(), flow["audio"]["channels"].as_u64()), (Some("L24"), Some(8)));
+    assert_eq!(report["findings"], serde_json::json!([]));
+}
+
+#[test]
+fn pcap_timescale_can_be_chosen() {
+    let text = stdout(&with_stdin_bytes(&["pcap", "--timescale", "utc", "--tai-utc", "36", "-"], &clean_audio()));
+    assert!(
+        text.contains("  clock: UTC, moved 36 s onto PTP time: chosen, not worked out from the capture\n"),
+        "{text}"
+    );
+    assert!(text.contains("latency 36001150.0 µs"), "{text}");
+}
+
+#[test]
+fn pcap_exit_codes_for_files_it_cannot_read_to_the_end() {
+    let not_a_capture = with_stdin_bytes(&["pcap", "-"], b"v=0\r\n");
+    assert_eq!(not_a_capture.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&not_a_capture.stderr);
+    assert!(stderr.contains("st2110: -: not a pcap or pcapng file"), "{stderr}");
+    let missing = st2110(&["pcap", "no-such-file.pcap"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("st2110: no-such-file.pcap: "));
+    // Without its SDP file, a capture is not analysed at all.
+    let missing_sdp = st2110(&["pcap", "no-such-file.pcap", "--sdp", "no-such-file.sdp"]);
+    assert_eq!(missing_sdp.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_sdp.stderr).contains("st2110: no-such-file.sdp: "));
+    let mut truncated = clean_audio();
+    truncated.truncate(truncated.len() - 10);
+    let output = with_stdin_bytes(&["pcap", "-"], &truncated);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(text.contains("-: error: the file ends partway through a packet; the analysis stops there\n"), "{text}");
+    assert!(text.ends_with("-: 1 flow, 1 error, 0 warnings, 0 notes\n\n"), "{text}");
+}

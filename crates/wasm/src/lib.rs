@@ -1,10 +1,10 @@
-//! WebAssembly bindings for the ST 2110 SDP linter, the NMOS registry checks and the
-//! PTP tools, for browsers and Node.
+//! WebAssembly bindings for the ST 2110 SDP linter, the NMOS registry checks, the PTP
+//! tools and the capture analyser, for browsers and Node.
 //!
 //! Build with `wasm-pack build crates/wasm --target web` (or `--target nodejs`), then:
 //!
 //! ```js
-//! import init, { lint, checkRegistry, decodePtp, timing } from "./pkg/st2110_wasm.js";
+//! import init, { lint, checkRegistry, decodePtp, timing, analyseCapture } from "./pkg/st2110_wasm.js";
 //!
 //! await init();
 //! const report = lint(sdpText);
@@ -15,15 +15,23 @@
 //! console.log(ptp.summary.join("\n"), ptp.findings);
 //! const now = timing({ video: ["60000/1001"], audio: [48000], localOffset: 3563 });
 //! console.log(now.video[0].next_frame, now.video[0].next_rtp, now.video[0].timecode?.address);
+//! const capture = analyseCapture(new Uint8Array(await file.arrayBuffer()), {
+//!   sdp: [{ name: "camera1.sdp", text: sdpText }],
+//! });
+//! for (const f of capture.findings) console.log(f.flow, f.at, f.severity, f.rule, f.message);
 //! ```
 //!
 //! Results are plain objects shaped like the Rust types; the TypeScript declarations
 //! below describe them. The registry checks read a snapshot the caller assembles from
 //! the Query API (or one saved by `st2110 nmos --save`); fetching is left to the page.
+//! A capture is analysed from memory, so the largest a page can take is what it can
+//! hold; `st2110 pcap` reads files of any size as it goes.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::Serializer;
 use st2110_nmos::Snapshot;
+use st2110_pcap::{SdpFile, Timescale};
 use st2110_ptp::timing::{self, Options};
 use st2110_ptp::{Message, PtpTime, TAI_UTC_2017};
 use wasm_bindgen::prelude::*;
@@ -373,6 +381,215 @@ export interface Timing {
   video: VideoTiming[];
   audio: AudioTiming[];
 }
+
+export interface CaptureOptions {
+  /** SDP files of streams in the capture; each flow is checked against the stream it
+   *  matches, and flows without one are recognised from their packets. */
+  sdp?: { name: string; text: string }[];
+  /** The clock the capture's timestamps count: "auto" works it out from PTP Sync
+   *  messages, or else the RTP timestamps; "auto" when omitted. */
+  timescale?: "auto" | "ptp" | "utc";
+  /** TAI − UTC in seconds, for a capture on UTC, at most a day either way; 37 when omitted. */
+  taiUtc?: number;
+}
+
+/** The minimum, maximum and mean of a measurement. */
+export interface Stats {
+  count: number;
+  min: number;
+  max: number;
+  mean: number;
+}
+
+export interface CaptureFile {
+  /** "pcap", "pcap (nanosecond)" or "pcapng". */
+  format: string;
+  frames: number;
+  /** When the first frame was captured, by the capturing clock: "seconds.nanoseconds" since 1970. */
+  start: string | null;
+  /** Seconds from the first frame to the last. */
+  duration: number;
+  bytes: number;
+  udp: number;
+  rtp: number;
+  /** RTP packets in flows past the first 10,000, counted in rtp but not measured. */
+  rtp_untracked: number;
+  ptp: number;
+  /** IP fragments after the first, which carry no UDP header. */
+  fragments: number;
+  other: number;
+  /** Why the file could not be read to the end, when it could not. */
+  error: string | null;
+}
+
+export interface CaptureTimescale {
+  clock: "ptp" | "utc" | "unknown";
+  /** What decided it. */
+  basis: string;
+  /** Nanoseconds added to the capture's timestamps to give PTP time. */
+  shift: number;
+  /** Anything that limits the measurements that need PTP time. */
+  note: string | null;
+}
+
+/** The network compatibility model (ST 2110-21 §6.6.1). */
+export interface CinstReport {
+  peak: number;
+  sender_type: string | null;
+  cmax: number | null;
+  signalled_cmax: number | null;
+  cmax_narrow: number;
+  cmax_narrow_linear: number;
+  cmax_wide: number | null;
+  /** The sender types whose CMAX the peak fits. */
+  fits: string[];
+  drain_us: number;
+}
+
+/** The virtual receiver buffer (ST 2110-21 §6.6.2). */
+export interface VrxReport {
+  schedule: "gapped" | "linear";
+  troffset_us: number;
+  troffset_signalled: boolean;
+  vrxfull: number;
+  peak: number;
+  underflows: number;
+  overflows: number;
+  /** From each packet's arrival to its read time. */
+  margin_us: Stats | null;
+  method: string;
+}
+
+/** One second of a video stream: PTP seconds when the capture's clock is known. */
+export interface VideoWindow {
+  second: number;
+  fpt: Stats | null;
+  rtp_offset: Stats | null;
+  latency: Stats | null;
+  gap: Stats | null;
+  cinst: number | null;
+  vrx: number | null;
+}
+
+/** RP 2110-25 measurements of video and ancillary data. Times are in microseconds, RTP
+ *  offsets in 90 kHz ticks. */
+export interface VideoReport {
+  frame_rate: string | null;
+  height: number | null;
+  interlaced: boolean;
+  segmented: boolean;
+  /** Frames, or fields of interlaced video. */
+  units: number;
+  packets_per_frame: Stats | null;
+  npackets: number | null;
+  /** First packet time, from each frame's reference time. */
+  fpt: Stats | null;
+  rtp_offset: Stats | null;
+  latency: Stats | null;
+  gap: Stats | null;
+  cinst: CinstReport | null;
+  vrx: VrxReport | null;
+  models_skipped: string | null;
+  vrx_skipped: string | null;
+  windows: VideoWindow[];
+}
+
+export interface AudioWindow {
+  second: number;
+  latency: Stats | null;
+  interval: Stats | null;
+  ts_df: number | null;
+}
+
+/** Audio measurements. Times are in microseconds. */
+export interface AudioReport {
+  encoding: string;
+  sample_rate: number;
+  channels: number | null;
+  samples_per_packet: number | null;
+  packet_time_us: number | null;
+  latency: Stats | null;
+  interval: Stats | null;
+  /** The timestamped delay factor of each 200 ms (EBU Tech 3337). */
+  ts_df: Stats | null;
+  windows: AudioWindow[];
+}
+
+/** One RTP flow. `first` and `last` are seconds since the capture began. */
+export interface FlowReport {
+  index: number;
+  source: string;
+  destination: string;
+  essence: Essence;
+  /** The SDP stream it matched, such as "camera1.sdp stream 0". */
+  sdp: string | null;
+  /** True when the essence was worked out from the packets. */
+  guessed: boolean;
+  payload_type: number;
+  ssrc: string;
+  packets: number;
+  bytes: number;
+  first: number;
+  last: number;
+  mbps: number | null;
+  lost: number;
+  out_of_order: number;
+  duplicates: number;
+  video: VideoReport | null;
+  audio: AudioReport | null;
+}
+
+export interface MessageCount {
+  kind: string;
+  count: number;
+  log_interval: number | null;
+  interval_ms: Stats | null;
+}
+
+export interface PtpPortReport {
+  port: string;
+  address: string;
+  messages: MessageCount[];
+}
+
+export interface PtpDomainReport {
+  domain: number;
+  /** The grandmasters that Announce messages named, in order, up to 16. */
+  grandmasters: string[];
+  ports: PtpPortReport[];
+  /** From a Sync leaving the grandmaster to its arrival, in microseconds. */
+  sync_offset_us: Stats | null;
+}
+
+export interface CapturePtp {
+  messages: number;
+  undecodable: number;
+  /** Messages from ports past the first 10,000, counted in messages but not followed. */
+  untracked: number;
+  domains: PtpDomainReport[];
+}
+
+/** One capture finding. `flow` is a FlowReport index; `at` is seconds since the capture began. */
+export interface CaptureFinding {
+  rule: string;
+  severity: Severity;
+  message: string;
+  reference: string;
+  flow: number | null;
+  domain: number | null;
+  at: number | null;
+  count: number;
+}
+
+export interface CaptureReport {
+  capture: CaptureFile;
+  timescale: CaptureTimescale;
+  flows: FlowReport[];
+  ptp: CapturePtp;
+  /** Streams in the SDP files that no flow matched. */
+  missing: string[];
+  findings: CaptureFinding[];
+}
 "#;
 
 fn to_js(value: &impl Serialize) -> Result<JsValue, JsError> {
@@ -389,6 +606,9 @@ pub fn lint(sdp: &str) -> Result<JsValue, JsError> {
 extern "C" {
     #[wasm_bindgen(js_namespace = JSON, js_name = stringify, catch)]
     fn json_stringify(value: &JsValue) -> Result<Option<String>, JsValue>;
+
+    #[wasm_bindgen(js_namespace = JSON, js_name = parse, catch)]
+    fn json_parse(text: &str) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(js_name = String)]
     fn js_string(value: &JsValue) -> String;
@@ -444,6 +664,27 @@ extern "C" {
     fn now() -> f64;
 }
 
+/// Options passed as an object or JSON text. Read through JSON, as `checkRegistry` reads
+/// a snapshot, and through a Value, so that errors do not give a line and column in text
+/// the caller never wrote.
+fn read_options<T: DeserializeOwned + Default>(name: &str, options: Option<JsValue>) -> Result<T, JsError> {
+    match options.filter(|o| !o.is_null() && !o.is_undefined()) {
+        Some(options) => json_text(&options)
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()))
+            .map_err(|e| JsError::new(&format!("{name}: {e}"))),
+        None => Ok(T::default()),
+    }
+}
+
+/// Refuses an offset of more than a day either way, beyond any real one.
+fn within_a_day(name: &str, offset: Option<i32>) -> Result<(), JsError> {
+    match offset.filter(|offset| !(-86_400..=86_400).contains(offset)) {
+        Some(offset) => Err(JsError::new(&format!("{name}: {offset} s is more than a day"))),
+        None => Ok(()),
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct TimingOptions {
@@ -464,21 +705,11 @@ struct TimingOptions {
 pub fn timing(
     #[wasm_bindgen(unchecked_optional_param_type = "TimingOptions")] options: Option<JsValue>,
 ) -> Result<JsValue, JsError> {
-    let o: TimingOptions = match options.filter(|o| !o.is_null() && !o.is_undefined()) {
-        // Read through JSON, as checkRegistry reads a snapshot, and through a Value, so
-        // that errors do not give a line and column in text the caller never wrote.
-        Some(options) => json_text(&options)
-            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
-            .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()))
-            .map_err(|e| JsError::new(&format!("timing options: {e}")))?,
-        None => TimingOptions::default(),
-    };
+    let o: TimingOptions = read_options("timing options", options)?;
     for (name, offset) in
         [("taiUtc", o.tai_utc), ("localOffset", o.local_offset), ("jamLocalOffset", o.jam_local_offset)]
     {
-        if let Some(offset) = offset.filter(|offset| !(-86_400..=86_400).contains(offset)) {
-            return Err(JsError::new(&format!("{name}: {offset} s is more than a day")));
-        }
+        within_a_day(name, offset)?;
     }
     let tai_utc = o.tai_utc.unwrap_or(TAI_UTC_2017);
     let time = |name: &str, text: &str| {
@@ -527,10 +758,66 @@ pub fn timing(
     to_js(&timing::at(t, &options).map_err(|e| JsError::new(&e.to_string()))?)
 }
 
-/// Every rule: the SDP file rules, then the registry rules, then the PTP message rules.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureOptions {
+    sdp: Option<Vec<SdpInput>>,
+    timescale: Option<Clock>,
+    tai_utc: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SdpInput {
+    name: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Clock {
+    Auto,
+    Ptp,
+    Utc,
+}
+
+/// Analyses a packet capture, a pcap or pcapng file: measures each RTP flow and the PTP
+/// messages as RP 2110-25 describes, and checks them against the standards. Throws when
+/// the octets are not a capture; one that ends partway through is analysed as far as it
+/// goes, and `capture.error` says why it stopped.
+#[wasm_bindgen(js_name = analyseCapture, unchecked_return_type = "CaptureReport")]
+pub fn analyse_capture(
+    capture: &[u8],
+    #[wasm_bindgen(unchecked_optional_param_type = "CaptureOptions")] options: Option<JsValue>,
+) -> Result<JsValue, JsError> {
+    let o: CaptureOptions = read_options("capture options", options)?;
+    within_a_day("taiUtc", o.tai_utc)?;
+    let options = st2110_pcap::Options {
+        sdp: o.sdp.unwrap_or_default().into_iter().map(|f| SdpFile { name: f.name, text: f.text }).collect(),
+        timescale: match o.timescale {
+            None | Some(Clock::Auto) => Timescale::Auto,
+            Some(Clock::Ptp) => Timescale::Ptp,
+            Some(Clock::Utc) => Timescale::Utc,
+        },
+        tai_utc: o.tai_utc.unwrap_or(TAI_UTC_2017),
+    };
+    let report = st2110_pcap::analyse(capture, &options).map_err(|e| JsError::new(&e.to_string()))?;
+    // Through JSON text, so that a count past 2⁵³, which a hostile capture can reach,
+    // becomes the nearest number rather than an error.
+    let text = serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))?;
+    json_parse(&text).map_err(|e| JsError::new(&js_string(&e)))
+}
+
+/// Every rule: the SDP file rules, then the registry rules, the PTP message rules and
+/// the capture rules.
 #[wasm_bindgen(unchecked_return_type = "Rule[]")]
 pub fn rules() -> Result<JsValue, JsError> {
-    let all: Vec<&st2110_sdp::Rule> =
-        st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).chain(st2110_ptp::rules::ALL).copied().collect();
+    let all: Vec<&st2110_sdp::Rule> = st2110_sdp::rules::ALL
+        .iter()
+        .chain(st2110_nmos::rules::ALL)
+        .chain(st2110_ptp::rules::ALL)
+        .chain(st2110_pcap::rules::ALL)
+        .copied()
+        .collect();
     to_js(&all)
 }

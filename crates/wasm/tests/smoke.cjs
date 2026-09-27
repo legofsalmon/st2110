@@ -4,7 +4,7 @@
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
-const { lint, rules, checkRegistry, decodePtp, timing } = require("../pkg/st2110_wasm.js");
+const { lint, rules, checkRegistry, decodePtp, timing, analyseCapture } = require("../pkg/st2110_wasm.js");
 
 const fixture = (name) => readFileSync(path.join(__dirname, "../../sdp/tests/fixtures", name), "utf8");
 
@@ -38,6 +38,7 @@ assert.ok(all.length > 110);
 assert.equal(all.find((r) => r.id === "mediaclk-offset").reference, "ST 2110-10:2022 §7.3");
 assert.equal(all.find((r) => r.id === "receiver-caps").severity, "warning");
 assert.equal(all.find((r) => r.id === "sm-jam-time").reference, "ST 2059-2:2021 Annex A");
+assert.equal(all.find((r) => r.id === "vrx-underflow").reference, "ST 2110-21:2022 §6.6.2");
 
 // The registry checks, from an object and from JSON text.
 const facilityText = readFileSync(path.join(__dirname, "../../nmos/tests/fixtures/facility.json"), "utf8");
@@ -141,4 +142,73 @@ assert.deepEqual(
   [spring.local, spring.video[0].timecode.address, spring.video[0].timecode.jam_local],
   ["2027-03-28 13:00:00.000000000", "12:00:00:00", "2027-03-28 00:00:00.000000000"],
 );
-console.log(`ok: ${all.length} rules, ${registry.summary.senders} senders, ${messages.length} PTP messages`);
+// A pcap file of 200 ms of the audio in audio-pcm.sdp from noon, PTP time, with
+// nanosecond timestamps: 1 ms packets arriving 150 µs after their last sample.
+function audioCapture(payloadType) {
+  const frameLength = 14 + 20 + 8 + 12 + 48 * 3 * 8;
+  const bytes = new Uint8Array(24 + 200 * (16 + frameLength));
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x4d, 0x3c, 0xb2, 0xa1, 2, 0, 4, 0]);
+  view.setUint32(16, 65535, true);
+  view.setUint32(20, 1, true);
+  let at = 24;
+  for (let i = 0; i < 200; i++) {
+    const millisecond = 1790510437000n + BigInt(i);
+    const arrival = (millisecond + 1n) * 1000000n + 150000n;
+    view.setUint32(at, Number(arrival / 1000000000n), true);
+    view.setUint32(at + 4, Number(arrival % 1000000000n), true);
+    view.setUint32(at + 8, frameLength, true);
+    view.setUint32(at + 12, frameLength, true);
+    at += 16;
+    bytes.set([0x01, 0x00, 0x5e, 0x0a, 0x0a, 0x02, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00, 0x45, 0xb8], at);
+    view.setUint16(at + 16, frameLength - 14);
+    bytes.set([0, 1, 0x40, 0, 64, 17, 0, 0, 192, 168, 10, 22, 239, 10, 10, 2], at + 18);
+    view.setUint16(at + 34, 5006);
+    view.setUint16(at + 36, 5006);
+    view.setUint16(at + 38, frameLength - 34);
+    bytes.set([0x80, payloadType], at + 42);
+    view.setUint16(at + 44, i);
+    view.setUint32(at + 46, Number((millisecond * 48n) % 2n ** 32n));
+    view.setUint32(at + 50, 0x22220002);
+    bytes.fill(0x11, at + 54, at + frameLength);
+    at += frameLength;
+  }
+  return bytes;
+}
+const sdp = [{ name: "audio-pcm.sdp", text: fixture("audio-pcm.sdp") }];
+const capture = analyseCapture(audioCapture(97), { sdp });
+assert.equal(capture.capture.frames, 200);
+assert.equal(capture.timescale.clock, "ptp");
+assert.deepEqual(
+  capture.flows.map((f) => [f.essence, f.sdp, f.audio.channels, f.audio.latency.mean]),
+  [["audio", "audio-pcm.sdp stream 0", 8, 1150]],
+);
+assert.deepEqual(capture.findings, []);
+const mistyped = analyseCapture(audioCapture(98), { sdp, timescale: "ptp" });
+assert.deepEqual(
+  mistyped.findings.map((f) => [f.rule, f.severity, f.flow, f.count]),
+  [["payload-type-mismatch", "error", 1, 200]],
+);
+const onUtc = analyseCapture(audioCapture(97), { timescale: "utc", taiUtc: 36, sdp: undefined });
+assert.deepEqual([onUtc.timescale.shift, onUtc.flows[0].guessed], [36e9, true]);
+const cut = analyseCapture(audioCapture(97).slice(0, -10));
+assert.deepEqual([cut.capture.error, cut.flows[0].packets], ["the file ends partway through a packet", 199]);
+assert.deepEqual([capture.capture.rtp_untracked, capture.ptp.untracked], [0, 0]);
+// Empty frames that each claim 4 GiB on the wire: more octets than a number holds exactly.
+const claims = 2 ** 21 + 1;
+const huge = new Uint8Array(24 + claims * 16);
+huge.set([0x4d, 0x3c, 0xb2, 0xa1, 2, 0, 4, 0]);
+const hugeView = new DataView(huge.buffer);
+hugeView.setUint32(16, 65535, true);
+hugeView.setUint32(20, 1, true);
+for (let at = 24; at < huge.length; at += 16) hugeView.setUint32(at + 12, 0xffffffff, true);
+const claimed = analyseCapture(huge).capture;
+assert.deepEqual([claimed.frames, claimed.bytes > Number.MAX_SAFE_INTEGER], [claims, true]);
+assert.throws(() => analyseCapture(new Uint8Array(30)), /not a pcap or pcapng file/);
+assert.throws(() => analyseCapture(audioCapture(97), { timescale: "tai" }), /capture options: unknown variant `tai`/);
+assert.throws(() => analyseCapture(audioCapture(97), { taiUtc: 90000 }), /taiUtc: 90000 s is more than a day/);
+
+console.log(
+  `ok: ${all.length} rules, ${registry.summary.senders} senders, ${messages.length} PTP messages, ` +
+    `${capture.flows.length} capture flow`,
+);
