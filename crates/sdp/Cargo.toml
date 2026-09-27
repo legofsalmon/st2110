@@ -1,0 +1,17 @@
+[package]
+name = "st2110-sdp"
+description = "SDP model and linter for SMPTE ST 2110 streams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

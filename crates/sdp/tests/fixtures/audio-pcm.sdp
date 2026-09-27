@@ -1,0 +1,12 @@
+v=0
+o=- 1790510438 1790510438 IN IP4 192.168.10.22
+s=CAM 1 audio
+t=0 0
+m=audio 5006 RTP/AVP 97
+c=IN IP4 239.10.10.2/32
+a=source-filter: incl IN IP4 239.10.10.2 192.168.10.22
+a=rtpmap:97 L24/48000/8
+a=fmtp:97 channel-order=SMPTE2110.(51,ST); TSMODE=SAMP
+a=ptime:1
+a=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127
+a=mediaclk:direct=0

@@ -1,0 +1,39 @@
+// Runs the Node build against the fixtures. Build it first:
+//   cargo build -p st2110-wasm --target wasm32-unknown-unknown --release
+//   wasm-bindgen --target nodejs --out-dir crates/wasm/pkg target/wasm32-unknown-unknown/release/st2110_wasm.wasm
+const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
+const { lint, rules } = require("../pkg/st2110_wasm.js");
+
+const fixture = (name) => readFileSync(path.join(__dirname, "../../sdp/tests/fixtures", name), "utf8");
+
+const clean = lint(fixture("video-dup.sdp"));
+assert.deepEqual(clean.diagnostics, []);
+assert.equal(clean.streams.length, 2);
+assert.equal(clean.streams[1].mid, "secondary");
+assert.equal(clean.streams[0].essence, "video");
+assert.equal(clean.streams[0].payload_bitrate, 2073600000);
+assert.deepEqual(clean.streams[0].reference_clock, {
+  type: "ptp",
+  version: "IEEE1588-2008",
+  grandmaster: "08-00-11-FF-FE-21-E1-B0",
+  domain: 127,
+  traceable: false,
+});
+assert.deepEqual(clean.streams[0].media_clock, { type: "direct", offset: 0 });
+
+const broken = lint(fixture("aes67-offset.sdp"));
+assert.deepEqual(
+  broken.diagnostics.map((d) => [d.rule, d.severity, d.line, d.stream]),
+  [
+    ["source-filter-missing", "warning", 7, 0],
+    ["tsmode-absent", "info", 7, 0],
+    ["mediaclk-offset", "error", 13, 0],
+  ],
+);
+
+const all = rules();
+assert.ok(all.length > 90);
+assert.equal(all.find((r) => r.id === "mediaclk-offset").reference, "ST 2110-10:2022 §7.3");
+console.log(`ok: ${all.length} rules`);

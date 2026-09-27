@@ -1,0 +1,9 @@
+v=0
+o=- 123 456 IN IP4 10.0.0.5
+s=Legacy RFC 4175 sender
+t=0 0
+m=video 50000 RTP/AVP 96
+c=IN IP4 239.0.0.5
+a=rtpmap:96 raw/90000
+a=fmtp:96 sampling=YCbCr-4:2:2; width=1920; height=1080; depth=10; colorimetry=BT709-2; interlace
+a=framerate:29.97

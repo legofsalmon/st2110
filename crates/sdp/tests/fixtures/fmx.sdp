@@ -1,0 +1,11 @@
+v=0
+o=- 1790510441 1790510441 IN IP4 192.168.10.22
+s=CAM 1 audio metadata
+t=0 0
+m=application 5012 RTP/AVP 117
+c=IN IP4 239.10.10.5/32
+a=source-filter: incl IN IP4 239.10.10.5 192.168.10.22
+a=rtpmap:117 ST2110-41/48000
+a=fmtp:117 SSN=ST2110-41:2024; DIT=100; TSMODE=SAMP
+a=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127
+a=mediaclk:direct=0
