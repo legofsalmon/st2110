@@ -1,0 +1,19 @@
+[package]
+name = "st2110-pcap"
+description = "RP 2110-25 measurements of ST 2110 streams and PTP in packet captures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+serde = ["dep:serde", "st2110-sdp/serde", "st2110-ptp/serde"]
+
+[dependencies]
+st2110-sdp.workspace = true
+st2110-ptp.workspace = true
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

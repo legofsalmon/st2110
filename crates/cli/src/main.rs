@@ -1,7 +1,8 @@
-//! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries and PTP messages from the
-//! command line, and work out ST 2059-1 timing.
+//! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet
+//! captures from the command line, and work out ST 2059-1 timing.
 
 mod nmos;
+mod pcap;
 mod ptp;
 mod timing;
 
@@ -18,7 +19,7 @@ use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 #[command(
     name = "st2110",
     version,
-    about = "Check SMPTE ST 2110 SDP files, NMOS registries and PTP messages against the standards"
+    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -93,6 +94,46 @@ enum Command {
         #[arg(long)]
         deny_warnings: bool,
     },
+    /// Measure the ST 2110 streams and PTP messages in packet captures, as RP 2110-25
+    /// describes, and check them against the standards.
+    ///
+    /// Reads pcap and pcapng files, as tcpdump, dumpcap and Wireshark write them. Give
+    /// the streams' SDP files with --sdp to check each flow against its stream and run
+    /// the ST 2110-21 models on its schedule; flows without one are recognised from their
+    /// packets. Timing measurements need the capture's clock on PTP time, or on UTC to
+    /// move onto it; --timescale auto works out which from PTP Sync messages, or else
+    /// the RTP timestamps. Exits with 0 when nothing is an error, 1 when something is (or
+    /// is a warning, with --deny-warnings), or a file ends partway through, and 2 when a
+    /// file cannot be read or is not a capture.
+    Pcap {
+        /// Capture files; `-` reads standard input.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// An SDP file of streams in the captures; give it more than once for several.
+        #[arg(long, value_name = "FILE")]
+        sdp: Vec<PathBuf>,
+        /// The clock that the capture's timestamps count.
+        #[arg(long, value_enum, default_value_t = CaptureClock::Auto)]
+        timescale: CaptureClock,
+        /// TAI − UTC in seconds: how far a capture on UTC is behind PTP time.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = st2110_ptp::TAI_UTC_2017,
+            allow_negative_numbers = true,
+            value_parser = offset()
+        )]
+        tai_utc: i32,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        /// Print only warnings and errors, without the flows, PTP ports or notes (text output).
+        #[arg(short, long)]
+        quiet: bool,
+        /// Exit with status 1 on warnings too.
+        #[arg(long)]
+        deny_warnings: bool,
+    },
     /// Work out where a PTP time falls, by ST 2059-1: each video frame rate's frame,
     /// RTP timestamps and time code, and each audio rate's RTP timestamp and AES3 block.
     ///
@@ -160,6 +201,27 @@ enum Format {
     Json,
 }
 
+/// The clock that a capture's timestamps count.
+#[derive(Clone, Copy, ValueEnum)]
+enum CaptureClock {
+    /// Work it out from PTP Sync messages, or else the RTP timestamps.
+    Auto,
+    /// PTP time.
+    Ptp,
+    /// UTC, TAI − UTC behind PTP time.
+    Utc,
+}
+
+impl From<CaptureClock> for st2110_pcap::Timescale {
+    fn from(clock: CaptureClock) -> Self {
+        match clock {
+            CaptureClock::Auto => Self::Auto,
+            CaptureClock::Ptp => Self::Ptp,
+            CaptureClock::Utc => Self::Utc,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum RulesFormat {
     Text,
@@ -176,6 +238,10 @@ fn main() -> ExitCode {
             nmos::run(&target, &fetch, format, quiet, deny_warnings)
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
+        Command::Pcap { files, sdp, timescale, tai_utc, format, quiet, deny_warnings } => {
+            let args = pcap::Args { files, sdp, timescale: timescale.into(), tai_utc };
+            pcap::run(&args, format, quiet, deny_warnings)
+        }
         Command::Time { at, video, audio, local_offset, tai_utc, jam, jam_local_offset, non_drop, format } => {
             let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
             timing::run(&args, format)
@@ -351,9 +417,14 @@ pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
 }
 
-/// Every rule: the SDP, NMOS and PTP catalogues in turn.
+/// Every rule: the SDP, NMOS, PTP message and capture catalogues in turn.
 fn all_rules() -> impl Iterator<Item = &'static Rule> {
-    st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).chain(st2110_ptp::rules::ALL).copied()
+    st2110_sdp::rules::ALL
+        .iter()
+        .chain(st2110_nmos::rules::ALL)
+        .chain(st2110_ptp::rules::ALL)
+        .chain(st2110_pcap::rules::ALL)
+        .copied()
 }
 
 /// Looks a rule up in any catalogue.
@@ -373,10 +444,15 @@ fn rules_markdown() -> String {
          ## NMOS registries\n\n\
          `st2110 nmos` checks these across a registry's resources and against each Sender's SDP file.\n\n{}\n\
          ## PTP messages\n\n\
-         `st2110 ptp` checks these in each message against the ST 2059-2 profile.\n\n{}",
+         `st2110 ptp` checks these in each message against the ST 2059-2 profile, and \
+         `st2110 pcap` in each port's messages in a capture.\n\n{}\n\
+         ## Captures\n\n\
+         `st2110 pcap` checks these across a capture's RTP flows and PTP messages, measuring \
+         them as RP 2110-25 describes.\n\n{}",
         st2110_sdp::rules::markdown_table(st2110_sdp::rules::ALL),
         st2110_sdp::rules::markdown_table(st2110_nmos::rules::ALL),
-        st2110_sdp::rules::markdown_table(st2110_ptp::rules::ALL)
+        st2110_sdp::rules::markdown_table(st2110_ptp::rules::ALL),
+        st2110_sdp::rules::markdown_table(st2110_pcap::rules::ALL)
     )
 }
 

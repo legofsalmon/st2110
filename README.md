@@ -1,6 +1,6 @@
 # st2110
 
-Tools for SMPTE ST 2110 media over IP, written in Rust. There are three so far:
+Tools for SMPTE ST 2110 media over IP, written in Rust. There are four so far:
 
 - an SDP linter, which reads the session description a sender publishes, describes
   each stream in it and checks it against ST 2110 and the documents it builds on;
@@ -8,7 +8,10 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are three so far:
   resources, PTP clocks and connections, and every Sender's SDP file;
 - PTP tools, which decode IEEE 1588 messages and check them against the ST 2059-2
   profile, and work out from PTP time where frames, RTP timestamps and time code fall
-  by ST 2059-1.
+  by ST 2059-1;
+- a capture analyser, which reads pcap and pcapng files and measures each flow as
+  RP 2110-25 describes: loss, timing against PTP time, the ST 2110-21 sender models,
+  audio packet timing, and the PTP messages across the capture.
 
 Every finding cites the clause behind it.
 
@@ -17,7 +20,8 @@ Every finding cites the clause behind it.
 | [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
 | [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching and the registry checker's 20 rules. The Query API client is the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 ptp` and `st2110 time`. |
+| [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 ptp`, `st2110 pcap` and `st2110 time`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -99,8 +103,44 @@ gm.hex: 3 messages, 2 errors, 2 warnings, 0 notes
 
 - `st2110 ptp FILE...` reads one message per line in hex, with or without colons between octets, or a file that holds one message in binary. `#` starts a comment, and `-` reads standard input.
 - It decodes every IEEE 1588-2008 and -2019 message type, and the TLVs after them: the ST 2059-2 synchronization metadata, path traces, and the organization and management TLVs by name.
-- It checks each message on its own: the domain and message rates the profile allows, the grandmaster's quality and time source, and the synchronization metadata's frame rate, jam times and time jumps. Checks across messages, such as whether every Announce names the same grandmaster, wait for the pcap analyser.
+- It checks each message on its own: the domain and message rates the profile allows, the grandmaster's quality and time source, and the synchronization metadata's frame rate, jam times and time jumps. `st2110 pcap` makes the checks across messages, such as whether every Announce names the same grandmaster.
 - `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`. A line that is not a message counts as an error.
+
+## Analyse a packet capture
+
+```console
+$ tcpdump -i ens1f0 -j adapter_unsynced --time-stamp-precision nano -w studio.pcap
+$ st2110 pcap studio.pcap --sdp camera1.sdp --sdp camera1-audio.sdp
+studio.pcap: pcap (nanosecond), 108515 frames in 0.499 s: 108497 RTP packets in 2 flows, 18 PTP messages
+  clock: PTP time: by the capture's clock, 4 Sync messages arrived a median 5.0 µs after leaving the grandmaster
+  flow 1: 192.168.10.21:5004 to 239.10.10.1:5004, ST 2110-20, camera1.sdp stream 0
+    107998 packets (payload type 96, SSRC 11110001) at 2160.0 Mb/s, 2 lost
+    video: 1080 lines, progressive, 50 frames a second, 25 frames, 4320 packets a frame
+    first packet time 746.0 µs (744.7 to 747.3), RTP offset 0.0 ticks (0.0 to 0.0), latency 746.0 µs (744.7 to 747.3)
+    CINST peaked at 2, CMAX 5 for 2110TPN; fits 2110TPN, 2110TPNL, 2110TPW
+    virtual receiver buffer peaked at 5 of VRXFULL 8, gapped reads from TROFFSET 764.4 µs; packets arrived 17.0 µs or more before their reads
+  flow 2: 192.168.10.22:5006 to 239.10.10.2:5006, ST 2110-30, camera1-audio.sdp stream 0
+    499 packets (payload type 97, SSRC 22220002) at 9.5 Mb/s
+    audio: L24, 48000 Hz, 8 channels, 48 samples a packet (1000.0 µs)
+    latency 1150.0 µs (1150.0 to 1150.0), packet interval 1000.0 µs (1000.0 to 1000.0), TS-DF at most 0.0 µs
+  PTP domain 127: grandmaster 08-00-11-FF-FE-21-E1-B0
+    00-1B-21-FF-FE-8A-2C-10 port 1 at 192.168.1.50: 4 Delay_Req every 125.0 ms
+    08-00-11-FF-FE-21-E1-B0 port 1 at 192.168.1.1: 4 Sync every 125.0 ms, 4 Follow_Up every 125.0 ms, 4 Delay_Resp every 125.0 ms, 2 Announce every 250.0 ms
+    Sync arrival less departure 5.0 µs (5.0 to 5.0)
+  not in the capture: camera1.sdp stream 1, to 239.20.10.1:5004
+studio.pcap: flow 1 at 0.244 s: error[packet-loss]: 2 packets of 108000 never arrived (0.002%), in 1 gap (RFC 3550 §5.1)
+studio.pcap: 2 flows, 1 error, 0 warnings, 0 notes
+```
+
+- `st2110 pcap FILE...` reads pcap and pcapng files as it goes, so a capture of any size will do; `-` reads standard input. It reads Ethernet with VLAN tags, Linux cooked captures and raw IP, over IPv4 or IPv6, and PTP over UDP or Ethernet.
+- `--sdp FILE` gives a stream's SDP file, as often as needed. Each flow is matched to a stream by its destination and, where the stream has a source filter, its sender. It is checked against that stream and modelled on the schedule its `TP` and `TROFF` give. A flow without an SDP file is recognised from its packets, with its frame rate, image height or channels.
+- For video and ancillary data it measures, frame by frame, the first packet time from each frame's reference time counted from the SMPTE Epoch, the RTP offset and the latency, as RP 2110-25 does. It runs the ST 2110-21 network compatibility model (CINST against each sender type's CMAX) and the virtual receiver buffer (against VRXFULL, with underflows). For audio it measures latency, packet intervals and the timestamped delay factor (TS-DF) of each 200 ms. `--format json` gives the video and audio measurements for each second of the capture as well as overall.
+- It follows each PTP domain: grandmasters, ports, message rates, Sync messages without a Follow_Up, Delay_Req messages without a Delay_Resp, and two ports announcing at once. Every message also gets the checks `st2110 ptp` makes, each reported once for its port.
+- The timing measurements need the capture's timestamps on PTP time. A capture timestamped by a NIC whose clock ptp4l disciplines, as `tcpdump -j adapter_unsynced` does, counts PTP time; one timestamped by the system clock counts UTC, which it moves 37 s onto PTP time (`--tai-utc` changes that). It works out which from the capture's PTP Sync messages, or else from the RTP timestamps, and says why; `--timescale ptp` or `utc` says so outright. When it cannot tell, it skips what needs PTP time and measures the rest.
+- `--quiet` and `--deny-warnings` work as they do for `lint`.
+- It exits with 0 when nothing is an error, 1 when something is or a file ends partway through, and 2 when a file cannot be read or is not a capture.
+
+It measures what arrived where the capture was made, so a capture from a switch's mirror port also shows that switch's queuing. It does not reassemble IP fragments, which ST 2110-10 forbids; it reports them. SMPTE ST 2022-7 legs are separate flows, each checked on its own. It measures the first 10,000 flows and follows the first 10,000 PTP ports, and counts the packets and messages of any more.
 
 ## Work out ST 2059-1 timing
 
@@ -150,7 +190,7 @@ Severities follow the standards' own words. An **error** breaks a "shall" (or an
 
 It follows the editions current on pub.smpte.org in September 2026: ST 2110-10:2022, -20:2022, -21:2022, -22:2022, -30:2025, -31:2022, -40:2023, -41:2024 (whose SSN the 2026 edition keeps), -43:2021, RP 2110-23:2019, RP 2110-24:2023 and ST 2022-7:2019.
 
-It reads SDP only. It never looks at packets, so it cannot confirm that a sender does what its SDP says; that is the job of the planned RP 2110-25 analyser. It also leaves out the interlaced `TROFF` defaults, which ST 2110-21:2022 Table 1 misprints for 525 and 625 lines, and the ST 2110-31 levels at 44.1 and 96 kHz.
+It reads SDP only, so it cannot confirm that a sender does what its SDP says; `st2110 pcap` checks that in a capture. It also leaves out the interlaced `TROFF` defaults, which ST 2110-21:2022 Table 1 misprints for 525 and 625 lines, and the ST 2110-31 levels at 44.1 and 96 kHz.
 
 ### NMOS registries
 
@@ -174,6 +214,20 @@ It reads resources registered at any IS-04 version from v1.0 to v1.3, and report
 | TLVs | Even lengths that end within the message, and PATH_TRACE lengths of whole clock identities |
 
 It follows ST 2059-1:2021 and ST 2059-2:2021, with IEEE 1588-2008 and -2019.
+
+### Captures
+
+| Area | Checks |
+|---|---|
+| RTP | Lost packets, with 32-bit sequence numbers where ST 2110-20 and -40 extend them; packets out of order or repeated; SSRC changes; the SDP file's payload type |
+| ST 2110-10 | IP fragments, and datagrams over 1460 octets or the `MAXUDP` signalled |
+| Video and ancillary data | Marker bits on the last packet of each frame or field, timestamps on the frame grid, packets that arrive before the time their timestamp names, and latency over JT-NM's 1 ms (35 ms for ancillary data) as a note |
+| ST 2110-21 | CINST over CMAX for the sender type in `TP`, or the `CMAX` signalled, and the virtual receiver buffer's overflows and underflows |
+| ST 2110-22 | The same number of packets in every frame |
+| ST 2110-30, -31 | Packets holding the samples `ptime` gives and the channels `a=rtpmap` gives, and TS-DF within a packet time |
+| PTP | One grandmaster through the capture, one port announcing at a time, Announce and Sync rates to match `logMessageInterval`, and a Follow_Up for every two-step Sync and a Delay_Resp for every Delay_Req |
+
+It follows RP 2110-25:2023 for what it measures, with ST 2110-21:2022 for the models and EBU Tech 3337 for TS-DF.
 
 ## Use the library
 
@@ -227,6 +281,24 @@ println!("frame {frame} starts at {at}, RTP {:?}", epoch::frame_rtp_timestamp(fr
 
 `st2110_ptp::timing::at` gathers everything `st2110 time` prints, and `timecode::timecode_at` gives the time code for any rate and daily jam.
 
+For a capture, give the SDP files and read the file as it goes:
+
+```rust
+use st2110_pcap::{Options, SdpFile};
+
+let options = Options { sdp: vec![SdpFile { name: "camera1.sdp".into(), text: sdp }], ..Options::default() };
+let report = st2110_pcap::analyse(std::io::BufReader::new(std::fs::File::open("studio.pcap")?), &options)?;
+for flow in &report.flows {
+    let fpt = flow.video.as_ref().and_then(|v| v.fpt);
+    println!("{} {}: {} packets, {} lost, first packet time {:?}", flow.destination, flow.essence.standard(), flow.packets, flow.lost, fpt);
+}
+for f in &report.findings {
+    println!("{:?} {} {}: {}", f.flow, f.severity, f.rule, f.message);
+}
+```
+
+`st2110_pcap::Analyser` takes one frame at a time instead, for captures that arrive some other way.
+
 ## Use it from JavaScript
 
 ```console
@@ -235,10 +307,10 @@ $ cargo build -p st2110-wasm --target wasm32-unknown-unknown --release
 $ wasm-bindgen --target web --out-dir crates/wasm/pkg target/wasm32-unknown-unknown/release/st2110_wasm.wasm
 ```
 
-`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)`, `decodePtp(bytes)`, `timing(options)` and `rules()`, and ships TypeScript types for what they return:
+`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)`, `decodePtp(bytes)`, `timing(options)`, `analyseCapture(bytes, options)` and `rules()`, and ships TypeScript types for what they return:
 
 ```js
-import init, { lint, checkRegistry, decodePtp, timing } from "./pkg/st2110_wasm.js";
+import init, { lint, checkRegistry, decodePtp, timing, analyseCapture } from "./pkg/st2110_wasm.js";
 
 await init();
 const report = lint(sdpText);
@@ -252,9 +324,12 @@ for (const f of ptp.findings) console.log(f.severity, f.rule, f.message);
 
 const now = timing({ video: ["60000/1001"], audio: [48000], localOffset: 3563 });
 console.log(now.video[0].next_frame, now.video[0].next_rtp, now.video[0].timecode?.address);
+
+const capture = analyseCapture(new Uint8Array(await file.arrayBuffer()), { sdp: [{ name: "camera1.sdp", text: sdpText }] });
+for (const f of capture.findings) console.log(f.flow, f.at, f.severity, f.rule, f.message);
 ```
 
-`checkRegistry` takes a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself. `decodePtp` takes a `Uint8Array` and throws when it is not a PTP message. `timing` takes the options `st2110 time` does, with `at` as PTP time or a UTC time such as `new Date().toISOString()` gives; without `at` it uses the page's clock.
+`checkRegistry` takes a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself. `decodePtp` takes a `Uint8Array` and throws when it is not a PTP message. `timing` takes the options `st2110 time` does, with `at` as PTP time or a UTC time such as `new Date().toISOString()` gives; without `at` it uses the page's clock. `analyseCapture` takes a capture's bytes, with the options `st2110 pcap` takes as `sdp`, `timescale` and `taiUtc`; it analyses from memory, so a page can take a capture as large as it can hold.
 
 ## Development
 
@@ -264,7 +339,7 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo test --workspace
 ```
 
-To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A PTP rule goes in `crates/ptp/src/rules.rs`, is raised from `crates/ptp/src/check.rs`, and needs a case in `crates/ptp/tests/decode.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
+To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A PTP rule goes in `crates/ptp/src/rules.rs`, is raised from `crates/ptp/src/check.rs`, and needs a case in `crates/ptp/tests/decode.rs`. A capture rule goes in `crates/pcap/src/rules.rs`, is raised from the flow, video, audio or PTP modules beside it, and needs a capture that raises it in `crates/pcap/tests/captures.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
 
 ```console
 $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
@@ -272,4 +347,4 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 ## Roadmap
 
-These are the first three steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, and PTP decoders with ST 2059-1 arithmetic. Next come an RP 2110-25 pcap analyser, which will also follow PTP across a capture, an IS-05 controller, and senders and receivers on Intel MTL.
+These are the first four steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, and the RP 2110-25 capture analyser. Next come an IS-05 controller, and senders and receivers on Intel MTL.
