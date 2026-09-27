@@ -27,11 +27,15 @@ rules! {
     PTP_DOMAIN = "ptp-domain", Error, "ST 2059-2:2021 §6.5.2",
         "`domainNumber` is 0 to 127, the range the profile allows; the default is 127.";
     ANNOUNCE_INTERVAL = "announce-interval", Error, "ST 2059-2:2021 §6.5.2",
-        "An Announce message's `logMessageInterval` is −3 (8 a second) to 1 (one every 2 s); the default is 0, one a second.";
+        "An Announce message's `logMessageInterval` is −3 (8 a second) to 1 (one every 2 s); the default is −2, 4 a second.";
     SYNC_INTERVAL = "sync-interval", Error, "ST 2059-2:2021 §6.5.2",
         "A Sync or Follow_Up message's `logMessageInterval` is −7 (128 a second) to −1 (2 a second); the default is −3, 8 a second.";
     DELAY_REQ_INTERVAL = "delay-req-interval", Error, "ST 2059-2:2021 §6.5.3",
         "A Delay_Resp message's `logMessageInterval`, the leader's `logMinDelayReqInterval`, is at most 5 more than `logSyncInterval`: −7 to 4.";
+
+    // Timestamps.
+    TIMESTAMP_NANOSECONDS = "timestamp-nanoseconds", Error, "IEEE 1588-2008 §5.3.3",
+        "A timestamp's `nanosecondsField` is below 10⁹: a second or more is no time at all.";
 
     // The grandmaster, from Announce messages.
     CLOCK_ACCURACY = "clock-accuracy", Warning, "ST 2059-2:2021 §6.5.4",
@@ -40,6 +44,8 @@ rules! {
         "`timeSource` is a value IEEE 1588 defines, or F0h or F1h, which ST 2059-2 adds for a grandmaster locked to a video reference.";
     GM_CLOCK_CLASS = "gm-clock-class", Warning, "IEEE 1588-2008 §7.6.2.4",
         "The grandmaster is locked to its reference: `clockClass` 6, or 13 on an arbitrary timescale, rather than in holdover, degraded or free-running.";
+    CLOCK_CLASS_TIMESCALE = "clock-class-timescale", Warning, "IEEE 1588-2008 §7.6.2.4",
+        "`clockClass` agrees with `ptpTimescale`: classes 6 and 7 distribute PTP time, so the flag is set, and 13 and 14 an arbitrary timescale, so it is clear.";
     UTC_OFFSET = "utc-offset", Warning, "IEEE 1588-2008 §8.2.4.2 · IERS Bulletin C",
         "A `currentUtcOffset` marked valid is at least 37 s, TAI − UTC since 1 January 2017.";
     ARB_TIMESCALE = "arb-timescale", Info, "IEEE 1588-2008 §7.2.1 · ST 2059-1:2021 §6.1",
@@ -64,8 +70,8 @@ rules! {
         "`currentLocalOffset` and `previousJamLocalOffset` are time-zone offsets: from UTC−12 h to UTC+14 h, less TAI − UTC.";
 
     // TLVs.
-    TLV_LENGTH = "tlv-length", Error, "IEEE 1588-2008 §14.1",
-        "Each TLV's `lengthField` is even and ends within `messageLength`.";
+    TLV_LENGTH = "tlv-length", Error, "IEEE 1588-2008 §14.1, §16.2",
+        "Each TLV's `lengthField` is even and ends within `messageLength`, and a PATH_TRACE TLV's is a whole number of 8-octet clock identities.";
 }
 
 /// Looks a rule up by its identifier.

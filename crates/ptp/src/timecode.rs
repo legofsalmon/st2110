@@ -127,7 +127,8 @@ impl TimecodeRate {
 /// A daily jam (ST 2059-1 §9.3): the instant time code was last set to Local Time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Jam {
-    /// When it happened. A grandmaster sends this as `timeOfPreviousJam`.
+    /// When it happened: a whole second, as a grandmaster sends it in
+    /// `timeOfPreviousJam`.
     pub time: PtpTime,
     /// The `currentLocalOffset` then, in seconds; the grandmaster's
     /// `previousJamLocalOffset`.
@@ -149,12 +150,20 @@ impl Jam {
 /// codewords: the first codeword at or after the jam carries the jam's time of day,
 /// and each one after adds a frame. At 1000/1001 rates the count drifts from Local Time
 /// until the next jam sets it again; a change to the local offset also waits for it.
-/// `t` should be at or after that first codeword: one in progress at the jam began
-/// under the jam before.
+///
+/// `None` when the codeword in progress at `t` began before that first codeword, so
+/// that the jam before set it, as for up to a frame after a jam at 1000/1001 rates, or
+/// when the jam is not on a whole second.
 pub fn timecode_at(t: PtpTime, rate: TimecodeRate, jam: Jam) -> Option<TimeAddress> {
+    if jam.time.subsec_nanos() != 0 {
+        return None;
+    }
     let codewords = rate.rate();
     let now = period_index(t, codewords)?;
     let jam_index = ceil_index(jam.time, codewords)?;
+    if now < jam_index {
+        return None;
+    }
     let local = (i128::from(jam.time.seconds()) + i128::from(jam.local_offset)).rem_euclid(86_400);
     let (hours, minutes, seconds) = ((local / 3600) as u8, (local / 60 % 60) as u8, (local % 60) as u8);
     // A drop-frame minute not divisible by ten starts at frame 2.
@@ -246,9 +255,15 @@ mod tests {
         // The first codeword after the jam starts 28.7 ms after it and carries the jam's
         // time of day; the next starts 33.4 ms later.
         let df = rate(30000, 1001, true);
-        let after = |ms: i128| timecode_at(jam.time.add_nanos(ms * 1_000_000).unwrap(), df, jam).unwrap().to_string();
-        assert_eq!(after(40), "00:00:00;00");
-        assert_eq!(after(70), "00:00:00;01");
+        let after = |ms: i128| timecode_at(jam.time.add_nanos(ms * 1_000_000).unwrap(), df, jam).map(|a| a.to_string());
+        assert_eq!(after(40).as_deref(), Some("00:00:00;00"));
+        assert_eq!(after(70).as_deref(), Some("00:00:00;01"));
+        // Before it, the codeword in progress began under the jam before.
+        assert_eq!(after(10), None);
+        assert_eq!(timecode_at(jam.time.add_nanos(-1).unwrap(), df, jam), None);
+        // A jam off the whole second is not one a grandmaster could send.
+        let fraction = Jam { time: jam.time.add_nanos(500_000_000).unwrap(), ..jam };
+        assert_eq!(timecode_at(t, rate(25, 1, false), fraction), None);
     }
 
     #[test]

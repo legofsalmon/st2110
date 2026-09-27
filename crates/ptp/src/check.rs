@@ -3,7 +3,7 @@
 use st2110_sdp::{Rule, Severity};
 
 use crate::describe::{clock_class, interval};
-use crate::message::{Action, Body, Flags, Message, TlvContent, tlv_type};
+use crate::message::{Action, Body, Flags, Message, Timestamp, TlvContent, tlv_type};
 use crate::rules::*;
 use crate::smpte::{LockingStatus, SyncMetadata};
 use crate::time::TAI_UTC_2017;
@@ -54,43 +54,8 @@ pub fn check(message: &Message) -> Vec<Finding> {
     let log = h.log_message_interval;
     let outside = |range: std::ops::RangeInclusive<i8>| log != NO_INTERVAL && !range.contains(&log);
     match &message.body {
-        Body::Announce(announce) => {
-            if outside(-3..=1) {
-                f.add(&ANNOUNCE_INTERVAL, format!("logMessageInterval is {log} ({}), outside −3 to 1", interval(log)));
-            }
-            let quality = &announce.quality;
-            if quality.accuracy == 0xFE {
-                f.add(&CLOCK_ACCURACY, "the grandmaster's clockAccuracy is Unknown (FEh)");
-            }
-            if crate::describe::time_source(announce.time_source).is_none() {
-                f.add(&TIME_SOURCE, format!("timeSource {:02X}h is a reserved value", announce.time_source));
-            }
-            if !matches!(quality.class, 6 | 13) {
-                f.add(
-                    &GM_CLOCK_CLASS,
-                    format!(
-                        "grandmaster {} has clockClass {}: {}",
-                        announce.grandmaster,
-                        quality.class,
-                        clock_class(quality.class)
-                    ),
-                );
-            }
-            if h.flags.has(Flags::UTC_OFFSET_VALID) && announce.current_utc_offset < TAI_UTC_2017 as i16 {
-                f.add(
-                    &UTC_OFFSET,
-                    format!(
-                        "currentUtcOffset is {} s, but TAI − UTC has been {TAI_UTC_2017} s since 1 January 2017",
-                        announce.current_utc_offset
-                    ),
-                );
-            }
-            if !h.flags.has(Flags::PTP_TIMESCALE) {
-                f.add(
-                    &ARB_TIMESCALE,
-                    format!("grandmaster {} runs an arbitrary timescale (ptpTimescale is clear)", announce.grandmaster),
-                );
-            }
+        Body::Announce(_) if outside(-3..=1) => {
+            f.add(&ANNOUNCE_INTERVAL, format!("logMessageInterval is {log} ({}), outside −3 to 1", interval(log)));
         }
         Body::Sync { .. } | Body::FollowUp { .. } if outside(-7..=-1) => {
             f.add(&SYNC_INTERVAL, format!("logMessageInterval is {log} ({}), outside −7 to −1", interval(log)));
@@ -100,11 +65,71 @@ pub fn check(message: &Message) -> Vec<Finding> {
         }
         _ => {}
     }
+    if let Some((name, timestamp)) = timestamp(&message.body)
+        && timestamp.time().is_none()
+    {
+        f.add(&TIMESTAMP_NANOSECONDS, format!("{name} has nanosecondsField {}, not below 10⁹", timestamp.nanoseconds));
+    }
+    if let Body::Announce(announce) = &message.body {
+        let quality = &announce.quality;
+        if quality.accuracy == 0xFE {
+            f.add(&CLOCK_ACCURACY, "the grandmaster's clockAccuracy is Unknown (FEh)");
+        }
+        if crate::describe::time_source(announce.time_source).is_none() {
+            f.add(&TIME_SOURCE, format!("timeSource {:02X}h is a reserved value", announce.time_source));
+        }
+        if !matches!(quality.class, 6 | 13) {
+            f.add(
+                &GM_CLOCK_CLASS,
+                format!(
+                    "grandmaster {} has clockClass {}: {}",
+                    announce.grandmaster,
+                    quality.class,
+                    clock_class(quality.class)
+                ),
+            );
+        }
+        let ptp = h.flags.has(Flags::PTP_TIMESCALE);
+        match (quality.class, ptp) {
+            (6 | 7, false) => f.add(
+                &CLOCK_CLASS_TIMESCALE,
+                format!("clockClass {} is for a clock distributing PTP time, but ptpTimescale is clear", quality.class),
+            ),
+            (13 | 14, true) => f.add(
+                &CLOCK_CLASS_TIMESCALE,
+                format!("clockClass {} is for an arbitrary timescale, but ptpTimescale is set", quality.class),
+            ),
+            _ => {}
+        }
+        if h.flags.has(Flags::UTC_OFFSET_VALID) && announce.current_utc_offset < TAI_UTC_2017 as i16 {
+            f.add(
+                &UTC_OFFSET,
+                format!(
+                    "currentUtcOffset is {} s, but TAI − UTC has been {TAI_UTC_2017} s since 1 January 2017",
+                    announce.current_utc_offset
+                ),
+            );
+        }
+        if !ptp {
+            f.add(
+                &ARB_TIMESCALE,
+                format!("grandmaster {} runs an arbitrary timescale (ptpTimescale is clear)", announce.grandmaster),
+            );
+        }
+    }
     for tlv in &message.tlvs {
         if tlv.value.len() % 2 == 1 {
             f.add(
                 &TLV_LENGTH,
                 format!("the {} TLV's lengthField is {}, an odd number", tlv.type_name(), tlv.value.len()),
+            );
+        } else if tlv.kind == tlv_type::PATH_TRACE && tlv.value.len() % 8 != 0 {
+            f.add(
+                &TLV_LENGTH,
+                format!(
+                    "the PATH_TRACE TLV's lengthField is {}, not a whole number of 8-octet clock identities",
+                    tlv.value.len()
+                ),
             );
         }
         if tlv.is_sync_metadata() {
@@ -121,6 +146,19 @@ pub fn check(message: &Message) -> Vec<Finding> {
         f.add(&TLV_LENGTH, error.to_string());
     }
     f.0
+}
+
+/// The timestamp in a message's body, and its name.
+fn timestamp(body: &Body) -> Option<(&'static str, Timestamp)> {
+    Some(match body {
+        Body::Sync { origin } | Body::DelayReq { origin } | Body::PdelayReq { origin } => ("originTimestamp", *origin),
+        Body::Announce(announce) => ("originTimestamp", announce.origin),
+        Body::FollowUp { precise_origin } => ("preciseOriginTimestamp", *precise_origin),
+        Body::DelayResp { receive, .. } => ("receiveTimestamp", *receive),
+        Body::PdelayResp { request_receipt, .. } => ("requestReceiptTimestamp", *request_receipt),
+        Body::PdelayRespFollowUp { response_origin, .. } => ("responseOriginTimestamp", *response_origin),
+        Body::Signaling { .. } | Body::Management(_) | Body::Reserved => return None,
+    })
 }
 
 /// The message around a synchronization metadata TLV.

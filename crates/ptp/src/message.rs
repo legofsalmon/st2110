@@ -263,10 +263,15 @@ impl Timestamp {
     }
 }
 
-/// Written `1790510437.123456789`.
+/// Written `1790510437.123456789`, or `1790510438 s and 4294967295 ns, not a valid
+/// time` when the nanoseconds are a second or more.
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{:09}", self.seconds, self.nanoseconds)
+        if self.time().is_some() {
+            write!(f, "{}.{:09}", self.seconds, self.nanoseconds)
+        } else {
+            write!(f, "{} s and {} ns, not a valid time", self.seconds, self.nanoseconds)
+        }
     }
 }
 

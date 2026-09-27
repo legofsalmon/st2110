@@ -19,6 +19,7 @@ pub(crate) struct Args {
     pub video: Vec<String>,
     pub audio: Vec<u32>,
     pub jam: Option<String>,
+    pub jam_local_offset: Option<i32>,
     pub non_drop: bool,
 }
 
@@ -52,8 +53,13 @@ fn work_out(args: &Args) -> Result<Timing, String> {
         None => now(args.tai_utc)?,
     };
     let jam = args.jam.as_deref().map(|text| time("--jam", text)).transpose()?;
-    if jam.is_some_and(|jam| jam > t) {
-        return Err("--jam is later than the time asked about; time code counts from a jam before it".into());
+    if let (Some(text), Some(jam)) = (&args.jam, jam) {
+        if jam.subsec_nanos() != 0 {
+            return Err(format!("--jam {text}: a daily jam falls on a whole second, as timeOfPreviousJam counts"));
+        }
+        if jam > t {
+            return Err("--jam is later than the time asked about; time code counts from a jam before it".into());
+        }
     }
     let mut video = args
         .video
@@ -74,9 +80,10 @@ fn work_out(args: &Args) -> Result<Timing, String> {
         video,
         audio,
         jam,
+        jam_local_offset: args.jam_local_offset,
         drop_frame: !args.non_drop,
     };
-    timing::at(t, &options).ok_or_else(|| "a rate is too large to work with".into())
+    timing::at(t, &options).map_err(|e| e.to_string())
 }
 
 /// PTP time from the system clock, taking it to keep UTC.
@@ -114,7 +121,7 @@ fn write_text(out: &mut impl Write, t: &Timing, style: Style) -> io::Result<()> 
             None => {
                 let why = match TimecodeRate::for_frame_rate(v.rate, false) {
                     None => "ST 12-1 has no time code at this rate",
-                    Some(_) => "no daily jam before this time",
+                    Some(_) => "no daily jam before the codeword in progress began",
                 };
                 writeln!(out, "  {:<11} none: {why}", "time code")?;
             }

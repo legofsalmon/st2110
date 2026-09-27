@@ -21,9 +21,6 @@
 //! below describe them. The registry checks read a snapshot the caller assembles from
 //! the Query API (or one saved by `st2110 nmos --save`); fetching is left to the page.
 
-use std::collections::BTreeMap;
-
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::Serializer;
 use st2110_nmos::Snapshot;
@@ -320,16 +317,21 @@ export interface TimingOptions {
   /** PTP time, "1790510437.123456789" or "1790510437:123456789", or UTC,
    *  "2026-09-27T12:00:00Z" as toISOString writes it. Now when omitted. */
   at?: string;
-  /** TAI − UTC in seconds; 37 when omitted. */
+  /** TAI − UTC in seconds, at most a day either way; 37 when omitted. */
   taiUtc?: number;
-  /** Seconds from PTP time to Local Time (currentLocalOffset); UTC when omitted. */
+  /** Seconds from PTP time to Local Time (currentLocalOffset), at most a day either way;
+   *  UTC when omitted. */
   localOffset?: number;
   /** Video frame rates: 50, "60000/1001", 59.94. */
   video?: (number | string)[];
   /** Audio sampling rates in Hz. */
   audio?: number[];
-  /** The last daily jam, as PTP or UTC time; the last Local Time midnight when omitted. */
+  /** The last daily jam, a whole second of PTP or UTC time and not after `at`; the last
+   *  Local Time midnight when omitted. */
   jam?: string;
+  /** The local offset when the jam happened (previousJamLocalOffset), which time code
+   *  keeps until the next jam; localOffset when omitted. */
+  jamLocalOffset?: number;
   /** Whether 30000/1001 time code drops frames; true when omitted. */
   dropFrame?: boolean;
 }
@@ -443,45 +445,41 @@ extern "C" {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct TimingOptions {
     at: Option<String>,
     tai_utc: Option<i32>,
     local_offset: Option<i32>,
-    video: Vec<RateValue>,
-    audio: Vec<u32>,
+    /// Numbers or text, each read as its JSON text.
+    video: Option<Vec<serde_json::Value>>,
+    audio: Option<Vec<u32>>,
     jam: Option<String>,
+    jam_local_offset: Option<i32>,
     drop_frame: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RateValue {
-    Number(f64),
-    Text(String),
 }
 
 /// Works out where a PTP time falls, by ST 2059-1: for each video frame rate its frame,
 /// RTP timestamps and time code, and for each audio rate its RTP timestamp and AES3 block.
 #[wasm_bindgen(unchecked_return_type = "Timing")]
 pub fn timing(
-    #[wasm_bindgen(unchecked_param_type = "TimingOptions")] options: Option<JsValue>,
+    #[wasm_bindgen(unchecked_optional_param_type = "TimingOptions")] options: Option<JsValue>,
 ) -> Result<JsValue, JsError> {
-    let o: TimingOptions = if let Some(options) = options.filter(|o| !o.is_null() && !o.is_undefined()) {
-        let invalid = |e: serde_wasm_bindgen::Error| JsError::new(&format!("timing options: {e}"));
-        // Struct fields are looked up by name, so a misspelt option would be ignored.
-        let names: BTreeMap<String, IgnoredAny> = serde_wasm_bindgen::from_value(options.clone()).map_err(invalid)?;
-        const KNOWN: [&str; 7] = ["at", "taiUtc", "localOffset", "video", "audio", "jam", "dropFrame"];
-        if let Some(name) = names.keys().find(|name| !KNOWN.contains(&name.as_str())) {
-            return Err(JsError::new(&format!(
-                "timing options: unknown option {name}; expected one of {}",
-                KNOWN.join(", ")
-            )));
-        }
-        serde_wasm_bindgen::from_value(options).map_err(invalid)?
-    } else {
-        TimingOptions::default()
+    let o: TimingOptions = match options.filter(|o| !o.is_null() && !o.is_undefined()) {
+        // Read through JSON, as checkRegistry reads a snapshot, and through a Value, so
+        // that errors do not give a line and column in text the caller never wrote.
+        Some(options) => json_text(&options)
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()))
+            .map_err(|e| JsError::new(&format!("timing options: {e}")))?,
+        None => TimingOptions::default(),
     };
+    for (name, offset) in
+        [("taiUtc", o.tai_utc), ("localOffset", o.local_offset), ("jamLocalOffset", o.jam_local_offset)]
+    {
+        if let Some(offset) = offset.filter(|offset| !(-86_400..=86_400).contains(offset)) {
+            return Err(JsError::new(&format!("{name}: {offset} s is more than a day")));
+        }
+    }
     let tai_utc = o.tai_utc.unwrap_or(TAI_UTC_2017);
     let time = |name: &str, text: &str| {
         timing::read_time(text, tai_utc)
@@ -493,29 +491,40 @@ pub fn timing(
             .ok_or_else(|| JsError::new("the clock is out of PTP's range"))?,
     };
     let jam = o.jam.as_deref().map(|text| time("jam", text)).transpose()?;
+    if let (Some(text), Some(jam)) = (&o.jam, jam) {
+        if jam.subsec_nanos() != 0 {
+            return Err(JsError::new(&format!("jam: {text} is not a whole second, as a daily jam is")));
+        }
+        if jam > t {
+            return Err(JsError::new(&format!("jam: {text} is later than at; time code counts from a jam before it")));
+        }
+    }
     let video = o
         .video
+        .unwrap_or_default()
         .iter()
         .map(|rate| {
             let text = match rate {
-                RateValue::Number(n) => n.to_string(),
-                RateValue::Text(text) => text.clone(),
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
             };
             timing::read_frame_rate(&text).ok_or_else(|| JsError::new(&format!("video: {text} is not a frame rate")))
         })
         .collect::<Result<_, _>>()?;
-    if o.audio.contains(&0) {
+    let audio = o.audio.unwrap_or_default();
+    if audio.contains(&0) {
         return Err(JsError::new("audio: 0 is not a sampling rate"));
     }
     let options = Options {
         tai_utc,
         local_offset: o.local_offset.unwrap_or(-tai_utc),
         video,
-        audio: o.audio,
+        audio,
         jam,
+        jam_local_offset: o.jam_local_offset,
         drop_frame: o.drop_frame.unwrap_or(true),
     };
-    to_js(&timing::at(t, &options).ok_or_else(|| JsError::new("a rate is too large to work with"))?)
+    to_js(&timing::at(t, &options).map_err(|e| JsError::new(&e.to_string()))?)
 }
 
 /// Every rule: the SDP file rules, then the registry rules, then the PTP message rules.

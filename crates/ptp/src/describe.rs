@@ -33,6 +33,7 @@ pub fn clock_accuracy(value: u8) -> Option<&'static str> {
         0x2F => "within 1 s",
         0x30 => "within 10 s",
         0x31 => "more than 10 s",
+        0x80..=0xFD => "set by an alternate profile",
         0xFE => "unknown",
         _ => return None,
     })
@@ -183,6 +184,16 @@ pub fn summary(message: &Message) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accuracies() {
+        assert_eq!(clock_accuracy(0x21), Some("within 100 ns"));
+        assert_eq!(clock_accuracy(0x80), Some("set by an alternate profile"));
+        assert_eq!(clock_accuracy(0xFD), Some("set by an alternate profile"));
+        for reserved in [0x00, 0x16, 0x32, 0x7F, 0xFF] {
+            assert_eq!(clock_accuracy(reserved), None, "{reserved:02X}h");
+        }
+    }
 
     #[test]
     fn intervals() {

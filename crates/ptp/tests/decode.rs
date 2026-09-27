@@ -274,13 +274,15 @@ fn cases() -> Vec<(&'static str, Build)> {
         ("sync-interval", Build { log: 0, ..sync() }),
         ("sync-interval", Build { log: -8, ..sync() }),
         ("delay-req-interval", Build { log: 5, ..delay_resp() }),
+        ("timestamp-nanoseconds", Build { body: timestamp(NOON, u32::MAX), ..sync() }),
         // Offsets into the Announce body: clockClass at 14, clockAccuracy at 15,
         // timeSource at 29.
         ("clock-accuracy", announce_with(|b| b.body[15] = 0xFE)),
         ("time-source", announce_with(|b| b.body[29] = 0x11)),
         ("gm-clock-class", announce_with(|b| b.body[14] = 248)),
+        ("clock-class-timescale", announce_with(|b| b.body[14] = 13)),
         ("utc-offset", announce_with(|b| b.body[10..12].copy_from_slice(&36_i16.to_be_bytes()))),
-        ("arb-timescale", announce_with(|b| b.flags &= !Flags::PTP_TIMESCALE)),
+        ("arb-timescale", announce_with(|b| (b.flags, b.body[14]) = (b.flags & !Flags::PTP_TIMESCALE, 13))),
         ("sm-tlv-message", management(0, [0xFF; 8]).tlv(tlv_type::ORGANIZATION_EXTENSION, &value)),
         ("sm-tlv-message", management(3, FOLLOWER).tlv(tlv_type::ORGANIZATION_EXTENSION, &value)),
         ("sm-tlv-message", announce().tlv(tlv_type::ORGANIZATION_EXTENSION, &value)),
@@ -298,6 +300,7 @@ fn cases() -> Vec<(&'static str, Build)> {
         ("sm-local-offset", metadata_with(|sm| sm.current_local_offset -= 86_400)),
         ("tlv-length", announce().tlv(0x8008, &[0, 0, 0])),
         ("tlv-length", announce_with(|b| b.tlvs.extend([0, 0]))),
+        ("tlv-length", announce().tlv(tlv_type::PATH_TRACE, &GM[..6])),
     ]
 }
 
@@ -342,6 +345,8 @@ fn what_findings_say() {
             "grandmaster 08-00-11-FF-FE-21-E1-B0 has clockClass 248: free-running: the default class",
         ),
         ("sync-interval", 0, "logMessageInterval is 0 (one a second), outside −7 to −1"),
+        ("timestamp-nanoseconds", 0, "originTimestamp has nanosecondsField 4294967295, not below 10⁹"),
+        ("clock-class-timescale", 0, "clockClass 13 is for an arbitrary timescale, but ptpTimescale is set"),
         ("sm-tlv-message", 0, "synchronization metadata: actionField is GET, not COMMAND"),
         (
             "sm-tlv-message",
@@ -359,9 +364,13 @@ fn what_findings_say() {
         ("sm-jump", 0, "jumpSeconds is -3600 but timeOfNextJump is 0"),
         ("tlv-length", 0, "the PAD TLV's lengthField is 3, an odd number"),
         ("tlv-length", 1, "2 octets at octet 64 are too few for a TLV"),
+        ("tlv-length", 2, "the PATH_TRACE TLV's lengthField is 6, not a whole number of 8-octet clock identities"),
     ] {
         assert_eq!(said(rule, n), message);
     }
+    // A timestamp that is no time says so where it is shown.
+    let bad = Build { body: timestamp(NOON, u32::MAX), ..sync() }.decode();
+    assert_eq!(describe::summary(&bad)[1], "origin 1790510437 s and 4294967295 ns, not a valid time; two-step");
 }
 
 #[test]

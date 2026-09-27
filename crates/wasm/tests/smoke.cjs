@@ -117,7 +117,28 @@ assert.deepEqual(
 );
 assert.equal(at.audio[0].rtp, 2205388965);
 assert.ok(Number(timing().ptp) > 1790510437, "now, by Date.now()");
-assert.throws(() => timing({ localoffset: 3563 }), /unknown option localoffset/);
+assert.throws(() => timing({ localoffset: 3563 }), /unknown field `localoffset`, expected one of `at`/);
+assert.throws(() => timing({ video: [null] }), /video: null is not a frame rate/);
+assert.throws(() => timing({ audio: [48000.5] }), /timing options: invalid type: floating point `48000.5`, expected u32$/);
+let deepRate = [];
+const deepOptions = { video: [deepRate] };
+for (let i = 0; i < 10000; i++) deepRate = deepRate[0] = [];
+assert.throws(() => timing(deepOptions), /timing options/);
+const cyclicOptions = { video: [] };
+cyclicOptions.video.push(cyclicOptions);
+assert.throws(() => timing(cyclicOptions), /timing options: TypeError/);
+assert.equal(timing({ at: "1790510437", video: [50], dropFrame: undefined }).video[0].rtp, 3061351376);
 assert.throws(() => timing({ video: ["fast"] }), /not a frame rate/);
 assert.throws(() => timing({ at: "noon" }), /not a PTP or UTC time/);
+// Missing lists are empty lists, however they are missing.
+assert.deepEqual(timing({ at: "1790510437", video: undefined, audio: null }).video, []);
+assert.throws(() => timing({ taiUtc: -2147483648 }), /taiUtc: -2147483648 s is more than a day/);
+assert.throws(() => timing({ at: "1790510437", jam: "1790467237.5" }), /jam: 1790467237.5 is not a whole second/);
+assert.throws(() => timing({ at: "1790510437", jam: "1790510438" }), /jam: 1790510438 is later than at/);
+// The clocks went forward on 28 March 2027; time code keeps the midnight jam's offset.
+const spring = timing({ at: "2027-03-28T12:00:00Z", localOffset: 3563, jamLocalOffset: -37, video: [25] });
+assert.deepEqual(
+  [spring.local, spring.video[0].timecode.address, spring.video[0].timecode.jam_local],
+  ["2027-03-28 13:00:00.000000000", "12:00:00:00", "2027-03-28 00:00:00.000000000"],
+);
 console.log(`ok: ${all.length} rules, ${registry.summary.senders} senders, ${messages.length} PTP messages`);

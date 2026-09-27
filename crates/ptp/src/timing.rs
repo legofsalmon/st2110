@@ -2,6 +2,8 @@
 //! their RTP timestamps, the time code, and the audio blocks. This is what `st2110 time`
 //! prints and the WebAssembly `timing` export returns.
 
+use std::fmt;
+
 use st2110_sdp::{FrameRateError, Rational, parse_frame_rate};
 
 use crate::epoch::{self, Signal};
@@ -22,8 +24,13 @@ pub struct Options {
     pub video: Vec<Rational>,
     /// Audio sampling rates in Hz.
     pub audio: Vec<u32>,
-    /// The last daily jam; when `None`, the last Local Time midnight.
+    /// The last daily jam, a whole second of PTP time; when `None`, the last Local Time
+    /// midnight.
     pub jam: Option<PtpTime>,
+    /// `currentLocalOffset` at the jam, which ST 2059-2 sends as
+    /// `previousJamLocalOffset`; when `None`, `local_offset`. Time code keeps the jam's
+    /// offset until the next jam, so after a daylight saving change it differs.
+    pub jam_local_offset: Option<i32>,
     /// Whether time code at 30000/1001 codewords a second counts in drop-frame.
     pub drop_frame: bool,
 }
@@ -38,6 +45,7 @@ impl Default for Options {
             video: Vec::new(),
             audio: Vec::new(),
             jam: None,
+            jam_local_offset: None,
             drop_frame: true,
         }
     }
@@ -79,7 +87,8 @@ pub struct Video {
     pub rtp: u32,
     /// The RTP timestamp of the next frame.
     pub next_rtp: u32,
-    /// The time code, when ST 12-1 defines one for the rate and there is a jam before `t`.
+    /// The time code, when ST 12-1 defines one for the rate and the codeword in
+    /// progress began after a jam.
     pub timecode: Option<Timecode>,
 }
 
@@ -117,17 +126,73 @@ pub struct Audio {
     pub next_block: PtpTime,
 }
 
-/// Works out where `t` falls for each signal in `options`. `None` only for rates too
-/// large to work with, far beyond any real frame or sampling rate.
-pub fn at(t: PtpTime, options: &Options) -> Option<Timing> {
-    // Local midnight can fall before the epoch, leaving no jam to count from.
-    let jam = match options.jam {
-        Some(time) => Some(Jam { time, local_offset: options.local_offset }),
-        None => Jam::midnight(t, options.local_offset),
+/// Why [`at`] could not work a time out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimingError {
+    /// A rate too large to work with, far beyond any real frame or sampling rate.
+    Rate,
+    /// The next frame or block would begin after the last PTP time, 2⁴⁸ s after the
+    /// epoch.
+    End,
+}
+
+impl fmt::Display for TimingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rate => "a rate is too large to work with",
+            Self::End => "the next frame or block would begin after the last PTP time, 2⁴⁸ s after the epoch",
+        })
+    }
+}
+
+impl std::error::Error for TimingError {}
+
+/// Where time code counts from.
+#[derive(Clone, Copy, Debug)]
+enum Jams {
+    /// A jam given, and only that one.
+    Given(Jam),
+    /// Local midnight, each day, at this local offset.
+    Midnight(i32),
+}
+
+impl Jams {
+    /// The time code in progress at `t`, from the jam that set it.
+    fn timecode(self, t: PtpTime, rate: TimecodeRate) -> Option<Timecode> {
+        let (address, jam) = match self {
+            Self::Given(jam) => (timecode_at(t, rate, jam)?, jam),
+            Self::Midnight(offset) => {
+                let jam = Jam::midnight(t, offset)?;
+                match timecode_at(t, rate, jam) {
+                    Some(address) => (address, jam),
+                    // The codeword in progress began before midnight's first one.
+                    None => {
+                        let before = Jam::midnight(jam.time.add_nanos(-1)?, offset)?;
+                        (timecode_at(t, rate, before)?, before)
+                    }
+                }
+            }
+        };
+        Some(Timecode {
+            address,
+            rate: rate.rate(),
+            drop_frame: rate.drop_frame(),
+            jam: jam.time,
+            jam_local: jam.time.local(jam.local_offset),
+        })
+    }
+}
+
+/// Works out where `t` falls for each signal in `options`.
+pub fn at(t: PtpTime, options: &Options) -> Result<Timing, TimingError> {
+    let jam_offset = options.jam_local_offset.unwrap_or(options.local_offset);
+    let jams = match options.jam {
+        Some(time) => Jams::Given(Jam { time, local_offset: jam_offset }),
+        None => Jams::Midnight(jam_offset),
     };
-    let video = options.video.iter().map(|&rate| video(t, rate, jam, options.drop_frame)).collect::<Option<_>>()?;
-    let audio = options.audio.iter().map(|&rate| audio(t, rate)).collect::<Option<_>>()?;
-    Some(Timing {
+    let video = options.video.iter().map(|&rate| video(t, rate, jams, options.drop_frame)).collect::<Result<_, _>>()?;
+    let audio = options.audio.iter().map(|&rate| audio(t, rate)).collect::<Result<_, _>>()?;
+    Ok(Timing {
         ptp: t,
         utc: t.utc(options.tai_utc),
         tai_utc: options.tai_utc,
@@ -138,40 +203,34 @@ pub fn at(t: PtpTime, options: &Options) -> Option<Timing> {
     })
 }
 
-fn video(t: PtpTime, rate: Rational, jam: Option<Jam>, drop_frame: bool) -> Option<Video> {
-    let frame = epoch::period_index(t, rate)?;
+fn video(t: PtpTime, rate: Rational, jams: Jams, drop_frame: bool) -> Result<Video, TimingError> {
+    use TimingError::{End, Rate};
+    let frame = epoch::period_index(t, rate).ok_or(Rate)?;
+    let next = frame.checked_add(1).ok_or(Rate)?;
     let timecode = TimecodeRate::for_frame_rate(rate, drop_frame)
         .or_else(|| TimecodeRate::for_frame_rate(rate, false))
-        .zip(jam.filter(|jam| jam.time <= t))
-        .and_then(|(tc, jam)| {
-            Some(Timecode {
-                address: timecode_at(t, tc, jam)?,
-                rate: tc.rate(),
-                drop_frame: tc.drop_frame(),
-                jam: jam.time,
-                jam_local: jam.time.local(jam.local_offset),
-            })
-        });
-    Some(Video {
+        .and_then(|tc| jams.timecode(t, tc));
+    Ok(Video {
         rate,
-        frame: u64::try_from(frame).ok()?,
-        frame_start: epoch::period_start(frame, rate)?,
-        next_frame: epoch::period_start(frame.checked_add(1)?, rate)?,
-        rtp: epoch::frame_rtp_timestamp(frame, rate, VIDEO_CLOCK_RATE)?,
-        next_rtp: epoch::frame_rtp_timestamp(frame.checked_add(1)?, rate, VIDEO_CLOCK_RATE)?,
+        frame: u64::try_from(frame).map_err(|_| Rate)?,
+        frame_start: epoch::period_start(frame, rate).ok_or(Rate)?,
+        next_frame: epoch::period_start(next, rate).ok_or(End)?,
+        rtp: epoch::frame_rtp_timestamp(frame, rate, VIDEO_CLOCK_RATE).ok_or(Rate)?,
+        next_rtp: epoch::frame_rtp_timestamp(next, rate, VIDEO_CLOCK_RATE).ok_or(Rate)?,
         timecode,
     })
 }
 
-fn audio(t: PtpTime, rate: u32) -> Option<Audio> {
-    let blocks = Signal::Aes3(rate).rate()?;
-    let block = epoch::period_index(t, blocks)?;
-    Some(Audio {
+fn audio(t: PtpTime, rate: u32) -> Result<Audio, TimingError> {
+    use TimingError::{End, Rate};
+    let blocks = Signal::Aes3(rate).rate().ok_or(Rate)?;
+    let block = epoch::period_index(t, blocks).ok_or(Rate)?;
+    Ok(Audio {
         rate,
         rtp: epoch::rtp_timestamp(t, rate),
-        block: u64::try_from(block).ok()?,
-        block_start: epoch::period_start(block, blocks)?,
-        next_block: epoch::period_start(block.checked_add(1)?, blocks)?,
+        block: u64::try_from(block).map_err(|_| Rate)?,
+        block_start: epoch::period_start(block, blocks).ok_or(Rate)?,
+        next_block: epoch::period_start(block.checked_add(1).ok_or(Rate)?, blocks).ok_or(End)?,
     })
 }
 
@@ -257,9 +316,55 @@ mod tests {
     }
 
     #[test]
-    fn absurd_rates_give_none() {
+    fn a_jam_keeps_its_own_offset() {
+        // The clocks went forward at 01:00 UTC on 28 March 2027, but time code counts from
+        // the midnight jam, made at GMT, until the next one.
+        let t = read_time("2027-03-28T12:00:00Z", TAI_UTC_2017).unwrap();
+        let bst = Options { local_offset: 3563, video: vec![read_frame_rate("25").unwrap()], ..Options::default() };
+        let gmt = Options { jam_local_offset: Some(-37), ..bst.clone() };
+        for options in [gmt.clone(), Options { jam: read_time("2027-03-28T00:00:00Z", TAI_UTC_2017), ..gmt }] {
+            let timing = at(t, &options).unwrap();
+            assert_eq!(timing.local.to_string(), "2027-03-28 13:00:00.000000000");
+            let tc = timing.video[0].timecode.as_ref().unwrap();
+            assert_eq!(tc.address.to_string(), "12:00:00:00");
+            assert_eq!(
+                (tc.jam.seconds(), tc.jam_local.to_string()),
+                (1_806_192_037, "2027-03-28 00:00:00.000000000".into())
+            );
+        }
+        // Without it, the offset is taken not to have changed since the jam.
+        let tc = at(t, &bst).unwrap().video.remove(0).timecode.unwrap();
+        assert_eq!((tc.address.to_string(), tc.jam.seconds()), ("13:00:00:00".into(), 1_806_188_437));
+    }
+
+    #[test]
+    fn just_after_midnight() {
+        // The first 29.97 codeword after the jam at midnight starts 25.13 ms after it; the
+        // one in progress before then counts from the jam the day before, whose count has
+        // run 2.6 frames ahead of the clock since.
+        let options = Options { video: vec![read_frame_rate("29.97").unwrap()], ..Options::default() };
+        let timecode = |text| {
+            let tc = at(read_time(text, TAI_UTC_2017).unwrap(), &options).unwrap().video.remove(0).timecode.unwrap();
+            (tc.address.to_string(), format!("{:.0}", tc.jam_local))
+        };
+        assert_eq!(timecode("2026-09-27T00:00:00.010Z"), ("00:00:00;02".into(), "2026-09-26 00:00:00".into()));
+        assert_eq!(timecode("2026-09-27T00:00:00.030Z"), ("00:00:00;00".into(), "2026-09-27 00:00:00".into()));
+        // A jam given is the only one: before its first codeword there is no time code.
+        let jam = Options { jam: read_time("2026-09-27T00:00:00Z", TAI_UTC_2017), ..options.clone() };
+        let t = read_time("2026-09-27T00:00:00.010Z", TAI_UTC_2017).unwrap();
+        assert!(at(t, &jam).unwrap().video[0].timecode.is_none());
+    }
+
+    #[test]
+    fn rates_and_times_out_of_reach() {
         let t = PtpTime::parse("1790510437").unwrap();
         let options = Options { video: vec![Rational::new(u64::MAX, 1).unwrap()], ..Options::default() };
-        assert_eq!(at(t, &options), None);
+        assert_eq!(at(t, &options), Err(TimingError::Rate));
+        // The last PTP time has no next frame.
+        let last = PtpTime::parse("281474976710655.999999999").unwrap();
+        let video = Options { video: vec![read_frame_rate("25").unwrap()], ..Options::default() };
+        assert_eq!(at(last, &video), Err(TimingError::End));
+        assert_eq!(at(last, &Options { audio: vec![48_000], ..Options::default() }), Err(TimingError::End));
+        assert!(TimingError::End.to_string().starts_with("the next frame or block would begin after"));
     }
 }

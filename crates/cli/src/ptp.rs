@@ -15,6 +15,15 @@ use crate::{Format, Style, plural, read_bytes};
 struct Checked {
     file: String,
     messages: Vec<Entry>,
+    /// Why the file holds no messages to read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Checked {
+    fn errors(&self) -> usize {
+        self.messages.iter().map(Entry::errors).sum::<usize>() + usize::from(self.error.is_some())
+    }
 }
 
 /// One message: where it was, and what it said or why it could not be read.
@@ -60,7 +69,7 @@ pub(crate) fn run(files: &[PathBuf], format: Format, quiet: bool, deny_warnings:
     for path in files {
         let file = path.display().to_string();
         match read_bytes(path) {
-            Ok(bytes) => checked.push(Checked { file, messages: entries(&bytes) }),
+            Ok(bytes) => checked.push(read(file, &bytes)),
             Err(e) => {
                 eprintln!("st2110: {file}: {e}");
                 unreadable = true;
@@ -80,10 +89,9 @@ pub(crate) fn run(files: &[PathBuf], format: Format, quiet: bool, deny_warnings:
             writeln!(out)?;
         }
     }
-    let failed = checked
-        .iter()
-        .flat_map(|c| &c.messages)
-        .any(|e| e.errors() > 0 || (deny_warnings && count(e.findings(), Severity::Warning) > 0));
+    let failed = checked.iter().any(|c| {
+        c.errors() > 0 || (deny_warnings && c.messages.iter().any(|e| count(e.findings(), Severity::Warning) > 0))
+    });
     Ok(match (unreadable, failed) {
         (true, _) => ExitCode::from(2),
         (false, true) => ExitCode::from(1),
@@ -93,19 +101,37 @@ pub(crate) fn run(files: &[PathBuf], format: Format, quiet: bool, deny_warnings:
 
 /// The messages in a file: one per line of hex, as `tshark -T fields -e udp.payload`
 /// writes them, or the whole file as one message in binary.
-fn entries(bytes: &[u8]) -> Vec<Entry> {
-    // A binary message always has control characters: its second octet is 02h or 12h.
-    if !bytes.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace()) {
-        return vec![Entry { line: None, outcome: outcome(Ok(bytes.to_vec())) }];
+fn read(file: String, bytes: &[u8]) -> Checked {
+    let failed = |error: &str| Checked { file: file.clone(), messages: Vec::new(), error: Some(error.into()) };
+    // Every PTP version 2 message has 02h or 12h for its second octet, so these byte
+    // order marks never start one.
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return failed("the file is UTF-16 text; save it as UTF-8 or ASCII, one message in hex per line");
     }
-    let text = String::from_utf8_lossy(bytes);
-    text.lines()
+    // That second octet is a control character too. Text has none but line breaks and
+    // tabs, whatever its comments hold.
+    if bytes.iter().any(|b| b.is_ascii_control() && !b.is_ascii_whitespace()) {
+        let outcome = match outcome(Ok(bytes.to_vec())) {
+            Outcome::Failed { error } => {
+                Outcome::Failed { error: format!("read as one binary message, having control characters: {error}") }
+            }
+            decoded => decoded,
+        };
+        return Checked { file, messages: vec![Entry { line: None, outcome }], error: None };
+    }
+    let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
+    let messages: Vec<Entry> = text
+        .lines()
         .enumerate()
         .filter_map(|(i, line)| {
             let line = line.split('#').next().unwrap_or_default().trim();
             (!line.is_empty()).then(|| Entry { line: Some(i + 1), outcome: outcome(hex(line)) })
         })
-        .collect()
+        .collect();
+    if messages.is_empty() {
+        return failed("no messages: give one message in hex per line, or one binary message");
+    }
+    Checked { file, messages, error: None }
 }
 
 fn outcome(bytes: Result<Vec<u8>, String>) -> Outcome {
@@ -133,6 +159,9 @@ fn hex(line: &str) -> Result<Vec<u8>, String> {
 }
 
 fn write_text(out: &mut impl Write, c: &Checked, quiet: bool, style: Style) -> io::Result<()> {
+    if let Some(error) = &c.error {
+        writeln!(out, "{}: {}: {error}", c.file, style.severity(Severity::Error))?;
+    }
     for entry in &c.messages {
         let location = match entry.line {
             Some(line) => format!("{}:{line}", c.file),
@@ -161,7 +190,7 @@ fn write_text(out: &mut impl Write, c: &Checked, quiet: bool, style: Style) -> i
         }
     }
     let findings: Vec<&Finding> = c.messages.iter().flat_map(Entry::findings).collect();
-    let errors = c.messages.iter().map(Entry::errors).sum::<usize>();
+    let errors = c.errors();
     let warnings = findings.iter().filter(|f| f.severity == Severity::Warning).count();
     let notes = findings.iter().filter(|f| f.severity == Severity::Info).count();
     let messages = plural(c.messages.len(), "message");

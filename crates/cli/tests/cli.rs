@@ -289,6 +289,26 @@ fn ptp_reads_binary_and_writes_json() {
 }
 
 #[test]
+fn ptp_reads_text_whatever_its_comments_hold() {
+    let hex = std::fs::read_to_string(ptp_fixture("grandmaster.hex")).unwrap();
+    let sync = hex.lines().filter(|line| !line.starts_with('#')).nth(1).unwrap();
+    for input in [format!("# Sync — two-step, 8 a second\n{sync}\n"), format!("\u{FEFF}{sync}\r\n")] {
+        let output = with_stdin(&["ptp", "-"], &input);
+        assert_eq!(output.status.code(), Some(0), "{input:?}");
+        assert!(stdout(&output).contains("-: 1 message, no problems found"), "{}", stdout(&output));
+    }
+    let failed = |input: &[u8], expected: &str| {
+        let output = with_stdin_bytes(&["ptp", "-"], input);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stdout(&output).contains(expected), "{}", stdout(&output));
+    };
+    failed(b"", "-: error: no messages: give one message in hex per line, or one binary message");
+    failed(b"# nothing yet\n\n", "-: 0 messages, 1 error, 0 warnings, 0 notes");
+    failed(&[0xFF, 0xFE, b'0', 0], "-: error: the file is UTF-16 text");
+    failed(&[0; 44], "-: error: read as one binary message, having control characters: PTP version 0");
+}
+
+#[test]
 fn ptp_warnings_fail_only_when_denied() {
     let hex = std::fs::read_to_string(ptp_fixture("misconfigured.hex")).unwrap();
     let announce = hex.lines().nth(2).unwrap();
@@ -335,4 +355,44 @@ fn time_defaults_json_and_errors() {
     assert!(String::from_utf8_lossy(&bad.stderr).contains("--at noon: not a PTP time"));
     assert_eq!(st2110(&["time", "--video", "fast"]).status.code(), Some(2));
     assert_eq!(st2110(&["time", "--at", "1790510437", "--jam", "1790510438"]).status.code(), Some(2));
+}
+
+#[test]
+fn time_code_around_jams() {
+    let timecode = |args: &[&str]| {
+        let text = stdout(&st2110(&[&["time"], args].concat()));
+        text.lines().find(|line| line.starts_with("  time code")).unwrap_or_default().to_string()
+    };
+    // The clocks went forward at 01:00 UTC; time code keeps the midnight jam's offset.
+    let spring = ["--at", "2027-03-28T12:00:00Z", "--local-offset", "3563", "--video", "25"];
+    assert_eq!(
+        timecode(&[&spring[..], &["--jam-local-offset", "-37"]].concat()),
+        "  time code   12:00:00:00 (25 fps, from the jam at 2027-03-28 00:00:00 Local Time)"
+    );
+    // Before the first 29.97 codeword after midnight, the jam the day before counts.
+    assert_eq!(
+        timecode(&["--at", "2026-09-27T00:00:00.010Z", "--video", "29.97"]),
+        "  time code   00:00:00;02 (30000/1001 fps drop-frame, from the jam at 2026-09-26 00:00:00 Local Time)"
+    );
+    assert_eq!(
+        timecode(&["--at", "2026-09-27T00:00:00.010Z", "--video", "29.97", "--jam", "2026-09-27T00:00:00Z"]),
+        "  time code   none: no daily jam before the codeword in progress began"
+    );
+}
+
+#[test]
+fn time_refuses_what_it_cannot_work_out() {
+    let refused = |args: &[&str], expected: &str| {
+        let output = st2110(&[&["time"], args].concat());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+    };
+    refused(&["--tai-utc=-2147483648"], "-2147483648 is not in -86400..=86400");
+    refused(&["--local-offset", "86401"], "86401 is not in -86400..=86400");
+    refused(&["--at", "2026-09-27T12:00:00Z", "--jam", "2026-09-27T00:00:00.5Z"], "falls on a whole second");
+    refused(
+        &["--at", "281474976710655.999999999", "--video", "25"],
+        "the next frame or block would begin after the last PTP time",
+    );
 }

@@ -112,15 +112,26 @@ enum Command {
         audio: Vec<u32>,
         /// Seconds from PTP time to Local Time: ST 2059-2's currentLocalOffset, such as
         /// 3563 for UTC+1. UTC (minus TAI − UTC) when omitted.
-        #[arg(long, value_name = "SECONDS", allow_negative_numbers = true)]
+        #[arg(long, value_name = "SECONDS", allow_negative_numbers = true, value_parser = offset())]
         local_offset: Option<i32>,
         /// TAI − UTC in seconds.
-        #[arg(long, value_name = "SECONDS", default_value_t = st2110_ptp::TAI_UTC_2017, allow_negative_numbers = true)]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = st2110_ptp::TAI_UTC_2017,
+            allow_negative_numbers = true,
+            value_parser = offset()
+        )]
         tai_utc: i32,
-        /// The last daily jam, as PTP or UTC time, such as a grandmaster's
+        /// The last daily jam, a whole second of PTP or UTC time, such as a grandmaster's
         /// timeOfPreviousJam. The last Local Time midnight when omitted.
         #[arg(long, value_name = "TIME")]
         jam: Option<String>,
+        /// The local offset when the jam happened: ST 2059-2's previousJamLocalOffset.
+        /// Time code keeps it until the next jam, so give it when the offset has changed
+        /// since, as at a daylight saving change. --local-offset when omitted.
+        #[arg(long, value_name = "SECONDS", allow_negative_numbers = true, value_parser = offset())]
+        jam_local_offset: Option<i32>,
         /// Count 30000/1001 time code without dropping frames.
         #[arg(long)]
         non_drop: bool,
@@ -136,6 +147,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = RulesFormat::Text)]
         format: RulesFormat,
     },
+}
+
+/// Reads an offset in seconds of at most a day either way, beyond any real one.
+fn offset() -> clap::builder::RangedI64ValueParser<i32> {
+    clap::value_parser!(i32).range(-86_400..=86_400)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -160,8 +176,8 @@ fn main() -> ExitCode {
             nmos::run(&target, &fetch, format, quiet, deny_warnings)
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
-        Command::Time { at, video, audio, local_offset, tai_utc, jam, non_drop, format } => {
-            let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, non_drop };
+        Command::Time { at, video, audio, local_offset, tai_utc, jam, jam_local_offset, non_drop, format } => {
+            let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
             timing::run(&args, format)
         }
         Command::Rules { ids, format } => list_rules(&ids, format),

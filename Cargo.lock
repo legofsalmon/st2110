@@ -640,6 +640,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "st2110-nmos",
  "st2110-ptp",
  "st2110-sdp",

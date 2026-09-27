@@ -16,7 +16,7 @@ Every finding cites the clause behind it.
 |---|---|
 | [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
 | [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching and the registry checker's 20 rules. The Query API client is the optional `client` feature. |
-| [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 18 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
+| [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 ptp` and `st2110 time`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
@@ -125,14 +125,15 @@ audio 48000 Hz
 - `--at` takes PTP time in seconds (or IS-04's `seconds:nanoseconds`) or a UTC time. Without it, `st2110 time` uses the system clock.
 - `--video` and `--audio` take each rate to work out, as often as needed. Without either, it shows 50 and 59.94 fps video and 48 kHz audio.
 - `--local-offset` is a grandmaster's `currentLocalOffset`: seconds from PTP time to Local Time, such as 3563 for British Summer Time. Local Time is UTC when it is not given.
-- `--jam` sets the last daily jam, which is otherwise the last Local Time midnight. `--non-drop` counts 29.97 time code without dropping frames, and `--tai-utc` changes TAI − UTC from 37 s.
+- `--jam` sets the last daily jam, which is otherwise the last Local Time midnight. Time code keeps the local offset of its jam until the next one, so after a daylight saving change give the jam's offset, a grandmaster's `previousJamLocalOffset`, as `--jam-local-offset`; without it the offset is taken not to have changed since the jam.
+- `--non-drop` counts 29.97 time code without dropping frames, and `--tai-utc` changes TAI − UTC from 37 s.
 - The arithmetic is exact: PTP time is kept in integer nanoseconds and rates as ratios, so 1000/1001 rates land on the right nanosecond and RTP timestamps step 1501 and 1502 at 59.94 fps.
-
-Severities follow the standards' own words. An **error** breaks a "shall" (or an RFC or NMOS "MUST"), so equipment may reject or misread what it describes. A **warning** breaks a "should" or is a known interoperability hazard. An **info** note needs no action on its own.
 
 ## What it checks
 
 The full catalogue, with the clause behind each rule, is in [docs/rules.md](docs/rules.md).
+
+Severities follow the standards' own words. An **error** breaks a "shall" (or an RFC or NMOS "MUST"), so equipment may reject or misread what it describes. A **warning** breaks a "should" or is a known interoperability hazard. An **info** note needs no action on its own.
 
 ### SDP files
 
@@ -167,9 +168,10 @@ It reads resources registered at any IS-04 version from v1.0 to v1.3, and report
 | Area | Checks |
 |---|---|
 | ST 2059-2 attributes | `domainNumber`, and the Announce, Sync and Delay_Req rates the profile allows |
-| Grandmaster | `clockAccuracy` not Unknown, a defined `timeSource`, `clockClass` locked rather than in holdover or free-running, a valid `currentUtcOffset` of at least 37 s, and a note for an arbitrary timescale |
+| Timestamps | Nanoseconds below a second |
+| Grandmaster | `clockAccuracy` not Unknown, a defined `timeSource`, `clockClass` locked rather than in holdover or free-running and agreeing with `ptpTimescale`, a valid `currentUtcOffset` of at least 37 s, and a note for an arbitrary timescale |
 | Synchronization metadata | Carried in a Management COMMAND to all ports, a `lengthField` of 48, the frame rate, locking status and reserved bits, jams on a whole 10 minutes of Local Time, jumps with both a size and a time, and time-zone offsets in range |
-| TLVs | Even lengths that end within the message |
+| TLVs | Even lengths that end within the message, and PATH_TRACE lengths of whole clock identities |
 
 It follows ST 2059-1:2021 and ST 2059-2:2021, with IEEE 1588-2008 and -2019.
 

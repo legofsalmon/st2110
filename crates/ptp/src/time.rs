@@ -61,38 +61,38 @@ impl PtpTime {
         Self::from_nanos(self.0.checked_add(nanos)?)
     }
 
-    /// Reads `1790510437.123456789` (up to nine decimals, or none) or the IS-04 and
-    /// IS-05 form, `1790510437:123456789`.
+    /// Reads `1790510437.123456789` (one to nine decimals, or none and no point) or the
+    /// IS-04 and IS-05 form, `1790510437:123456789`.
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         let (seconds, fraction) = match text.split_once([':', '.']) {
-            Some((seconds, fraction)) => (seconds, fraction),
-            None => (text, ""),
+            Some((seconds, fraction)) => (seconds, Some(digits(fraction).filter(|f| f.len() <= 9)?)),
+            None => (text, None),
         };
         let seconds: u64 = digits(seconds)?.parse().ok()?;
-        let nanoseconds = if fraction.is_empty() {
-            0
-        } else if text.contains(':') {
+        let nanoseconds = match fraction {
+            None => 0,
             // IS-04 writes nanoseconds as an integer: `12:5` is 12 s and 5 ns.
-            digits(fraction).filter(|f| f.len() <= 9)?.parse().ok()?
-        } else {
-            let fraction = digits(fraction).filter(|f| f.len() <= 9)?;
-            format!("{fraction:0<9}").parse().ok()?
+            Some(fraction) if text.contains(':') => fraction.parse().ok()?,
+            Some(fraction) => format!("{fraction:0<9}").parse().ok()?,
         };
         Self::new(seconds, nanoseconds)
     }
 
     /// The calendar date and time this is in UTC, when TAI − UTC is `tai_utc` seconds.
     pub fn utc(self, tai_utc: i32) -> Civil {
-        Civil::from_nanos(self.0 - i128::from(tai_utc) * NANOS)
+        Civil::from_nanos(self.0 - i128::from(tai_utc) * NANOS).expect(WITHIN_YEARS)
     }
 
     /// The calendar date and time this is in Local Time, which ST 2059-2 defines as PTP
     /// time plus `currentLocalOffset`.
     pub fn local(self, local_offset: i32) -> Civil {
-        Civil::from_nanos(self.0 + i128::from(local_offset) * NANOS)
+        Civil::from_nanos(self.0 + i128::from(local_offset) * NANOS).expect(WITHIN_YEARS)
     }
 }
+
+/// 2⁴⁸ s and 2³¹ s more are some nine million years, far inside a [`Civil`] year.
+const WITHIN_YEARS: &str = "a PTP time is within ten million years of 1970";
 
 /// Written `1790510437.123456789`.
 impl fmt::Display for PtpTime {
@@ -133,9 +133,10 @@ pub struct Civil {
 
 impl Civil {
     /// The date and time `nanos` nanoseconds after 1970-01-01 00:00:00 on the same scale.
-    pub fn from_nanos(nanos: i128) -> Self {
+    /// `None` when the year does not fit in an `i64`.
+    pub fn from_nanos(nanos: i128) -> Option<Self> {
         let seconds = nanos.div_euclid(NANOS);
-        let days = seconds.div_euclid(86_400) as i64;
+        let days = seconds.div_euclid(86_400);
         let of_day = seconds.rem_euclid(86_400) as u32;
         // Days to a date, after Howard Hinnant's civil_from_days.
         let z = days + 719_468;
@@ -146,8 +147,8 @@ impl Civil {
         let mp = (5 * doy + 2) / 153;
         let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
         let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-        let year = yoe + era * 400 + i64::from(month <= 2);
-        Self {
+        let year = i64::try_from(yoe + era * 400 + i128::from(month <= 2)).ok()?;
+        Some(Self {
             year,
             month,
             day,
@@ -155,7 +156,7 @@ impl Civil {
             minute: (of_day / 60 % 60) as u8,
             second: (of_day % 60) as u8,
             nanosecond: nanos.rem_euclid(NANOS) as u32,
-        }
+        })
     }
 }
 
@@ -163,13 +164,14 @@ impl Civil {
     /// Nanoseconds from 1970-01-01 00:00:00 on the same scale: the inverse of
     /// [`Civil::from_nanos`].
     pub fn to_nanos(&self) -> i128 {
-        // A date to days, after Howard Hinnant's days_from_civil.
-        let year = self.year - i64::from(self.month <= 2);
+        // A date to days, after Howard Hinnant's days_from_civil, in i128 so that no year
+        // overflows.
+        let year = i128::from(self.year) - i128::from(self.month <= 2);
         let era = year.div_euclid(400);
         let yoe = year.rem_euclid(400);
-        let doy = (153 * ((i64::from(self.month) + 9) % 12) + 2) / 5 + i64::from(self.day) - 1;
+        let doy = (153 * ((i128::from(self.month) + 9) % 12) + 2) / 5 + i128::from(self.day) - 1;
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        let days = i128::from(era * 146_097 + doe - 719_468);
+        let days = era * 146_097 + doe - 719_468;
         let seconds =
             days * 86_400 + i128::from(self.hour) * 3600 + i128::from(self.minute) * 60 + i128::from(self.second);
         seconds * NANOS + i128::from(self.nanosecond)
@@ -202,7 +204,7 @@ impl Civil {
             nanosecond,
         };
         // Out-of-range fields carry over into others, so a round trip catches them all.
-        (Self::from_nanos(civil.to_nanos()) == civil).then_some(civil)
+        (Self::from_nanos(civil.to_nanos()) == Some(civil)).then_some(civil)
     }
 }
 
@@ -247,7 +249,7 @@ mod tests {
         assert_eq!(PtpTime::parse("1790510437.5").unwrap().subsec_nanos(), 500_000_000);
         assert_eq!(PtpTime::parse("12:5").unwrap().subsec_nanos(), 5);
         assert_eq!(PtpTime::parse("1790510437").unwrap().nanos(), 1_790_510_437 * NANOS);
-        for bad in ["", ".5", "1.1234567891", "1:1000000000", "-1", "1e9", "281474976710656"] {
+        for bad in ["", ".5", "1.", "1:", "1.1234567891", "1:1000000000", "-1", "1e9", "281474976710656"] {
             assert_eq!(PtpTime::parse(bad), None, "{bad}");
         }
         assert_eq!(t.to_string(), "1790510437.123456789");
@@ -262,10 +264,18 @@ mod tests {
         assert_eq!(PtpTime::EPOCH.utc(0).to_string(), "1970-01-01 00:00:00.000000000");
         assert_eq!(format!("{:.0}", t.utc(TAI_UTC_2017)), "2026-09-27 12:00:00");
         assert_eq!(format!("{:.3}", t.utc(TAI_UTC_2017)), "2026-09-27 12:00:00.123");
-        assert_eq!(Civil::from_nanos(-NANOS).to_string(), "1969-12-31 23:59:59.000000000");
+        let civil = |nanos| Civil::from_nanos(nanos).unwrap().to_string();
+        assert_eq!(civil(-NANOS), "1969-12-31 23:59:59.000000000");
         // 2000 is a leap year, 2100 is not.
-        assert_eq!(Civil::from_nanos(951_782_400 * NANOS).to_string(), "2000-02-29 00:00:00.000000000");
-        assert_eq!(Civil::from_nanos(4_107_542_400 * NANOS).to_string(), "2100-03-01 00:00:00.000000000");
+        assert_eq!(civil(951_782_400 * NANOS), "2000-02-29 00:00:00.000000000");
+        assert_eq!(civil(4_107_542_400 * NANOS), "2100-03-01 00:00:00.000000000");
+        // Years beyond an i64, both ways.
+        assert_eq!(Civil::from_nanos(i128::MAX), None);
+        assert_eq!(Civil::from_nanos(i128::MIN), None);
+        for year in [i64::MAX, i64::MIN] {
+            let far = Civil { year, month: 1, day: 1, hour: 0, minute: 0, second: 0, nanosecond: 0 };
+            assert_eq!(Civil::from_nanos(far.to_nanos()), Some(far));
+        }
     }
 
     #[test]
@@ -290,7 +300,7 @@ mod tests {
         }
         assert!(Civil::parse("2028-02-29T00:00:00Z").is_some());
         for nanos in [-NANOS, 0, 951_782_400 * NANOS + 7, 4_107_542_399 * NANOS, 1 << 60] {
-            assert_eq!(Civil::from_nanos(nanos).to_nanos(), nanos);
+            assert_eq!(Civil::from_nanos(nanos).unwrap().to_nanos(), nanos);
         }
     }
 
