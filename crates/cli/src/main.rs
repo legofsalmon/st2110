@@ -1,4 +1,6 @@
-//! `st2110`: check SMPTE ST 2110 SDP files from the command line.
+//! `st2110`: check SMPTE ST 2110 SDP files and NMOS registries from the command line.
+
+mod nmos;
 
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -7,10 +9,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream, rules};
+use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 
 #[derive(Parser)]
-#[command(name = "st2110", version, about = "Check SMPTE ST 2110 SDP files against the standards")]
+#[command(name = "st2110", version, about = "Check SMPTE ST 2110 SDP files and NMOS registries against the standards")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,7 +38,35 @@ enum Command {
         #[arg(long)]
         deny_warnings: bool,
     },
-    /// List the lint rules, or show the ones named.
+    /// Check an NMOS registry: its resources, PTP clocks, connections and every
+    /// Sender's SDP file.
+    ///
+    /// TARGET is a registry's Query API URL, or a snapshot saved with --save (`-` reads
+    /// standard input). Exits with 0 when nothing is an error, 1 when something is (or
+    /// is a warning, with --deny-warnings), and 2 when the registry or file cannot be read.
+    Nmos {
+        /// Query API URL, such as http://registry.example:8080, or a saved snapshot.
+        target: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        /// Print only warnings and errors, without the lists of Senders and Receivers (text output).
+        #[arg(short, long)]
+        quiet: bool,
+        /// Exit with status 1 on warnings too.
+        #[arg(long)]
+        deny_warnings: bool,
+        /// Save what was read as a snapshot, to check again later without the registry.
+        #[arg(long, value_name = "FILE")]
+        save: Option<PathBuf>,
+        /// Seconds to wait for each response from the registry or a Node.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        timeout: f64,
+        /// Do not fetch the Senders' SDP files.
+        #[arg(long)]
+        no_sdp: bool,
+    },
+    /// List the rules, or show the ones named.
     Rules {
         /// Rule identifiers, such as mediaclk-offset; every rule when none is given.
         ids: Vec<String>,
@@ -63,6 +93,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
+        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp } => {
+            let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp };
+            nmos::run(&target, &fetch, format, quiet, deny_warnings)
+        }
         Command::Rules { ids, format } => list_rules(&ids, format),
     };
     match result {
@@ -126,7 +160,7 @@ fn lint(files: &[PathBuf], format: Format, quiet: bool, deny_warnings: bool) -> 
 
 /// Reads a file, or standard input for `-`. Bytes that are not UTF-8, as in a
 /// Latin-1 session name, become U+FFFD rather than stopping the check.
-fn read(path: &Path) -> io::Result<String> {
+pub(crate) fn read(path: &Path) -> io::Result<String> {
     let bytes = if path.as_os_str() == "-" {
         let mut bytes = Vec::new();
         io::stdin().read_to_end(&mut bytes)?;
@@ -139,20 +173,20 @@ fn read(path: &Path) -> io::Result<String> {
 
 /// ANSI colours, used only when writing to a terminal and `NO_COLOR` is unset.
 #[derive(Clone, Copy)]
-struct Style {
+pub(crate) struct Style {
     color: bool,
 }
 
 impl Style {
-    fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         Self { color: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() }
     }
 
-    fn paint(self, code: &str, text: &str) -> String {
+    pub(crate) fn paint(self, code: &str, text: &str) -> String {
         if self.color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_string() }
     }
 
-    fn severity(self, severity: Severity) -> String {
+    pub(crate) fn severity(self, severity: Severity) -> String {
         let code = match severity {
             Severity::Error => "1;31",
             Severity::Warning => "1;33",
@@ -206,7 +240,7 @@ fn write_text(out: &mut impl Write, c: &Checked, quiet: bool, style: Style) -> i
     Ok(())
 }
 
-fn describe(stream: &Stream) -> String {
+pub(crate) fn describe(stream: &Stream) -> String {
     let mut label = format!("stream {} (line {}, {}", stream.index, stream.line, stream.essence.standard());
     if let Some(mid) = &stream.mid {
         label.push_str(&format!(", mid {mid}"));
@@ -226,14 +260,35 @@ fn write_diagnostic(out: &mut impl Write, file: &str, d: &Diagnostic, style: Sty
     writeln!(out, "{location}: {}[{}]: {} ({})", style.severity(d.severity), d.rule, d.message, d.reference)
 }
 
-fn plural(count: usize, noun: &str) -> String {
+pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
+}
+
+/// Looks a rule up in either catalogue.
+fn find_rule(id: &str) -> Option<&'static Rule> {
+    st2110_sdp::rules::find(id).or_else(|| st2110_nmos::rules::find(id))
+}
+
+/// Both catalogues as the Markdown page published in `docs/rules.md`.
+fn rules_markdown() -> String {
+    format!(
+        "# Rules\n\n\
+         Generated by `st2110 rules --format markdown`. Severity: **error** breaks a \"shall\" \
+         (or an RFC \"MUST\"), **warning** breaks a \"should\" or is a known interoperability \
+         hazard, **info** is a note that needs no action on its own.\n\n\
+         ## SDP files\n\n\
+         `st2110 lint` checks these in each SDP file, and `st2110 nmos` in each Sender's.\n\n{}\n\
+         ## NMOS registries\n\n\
+         `st2110 nmos` checks these across a registry's resources and against each Sender's SDP file.\n\n{}",
+        st2110_sdp::rules::markdown_table(st2110_sdp::rules::ALL),
+        st2110_sdp::rules::markdown_table(st2110_nmos::rules::ALL)
+    )
 }
 
 fn list_rules(ids: &[String], format: RulesFormat) -> io::Result<ExitCode> {
     let mut selected: Vec<&Rule> = Vec::new();
     for id in ids {
-        match rules::find(id) {
+        match find_rule(id) {
             Some(rule) => selected.push(rule),
             None => {
                 eprintln!("st2110: no rule is named {id}; `st2110 rules` lists them all");
@@ -242,12 +297,12 @@ fn list_rules(ids: &[String], format: RulesFormat) -> io::Result<ExitCode> {
         }
     }
     if ids.is_empty() {
-        selected = rules::ALL.to_vec();
+        selected = st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).copied().collect();
     }
     let mut out = io::stdout().lock();
     match format {
-        RulesFormat::Markdown if ids.is_empty() => write!(out, "{}", rules::markdown())?,
-        RulesFormat::Markdown => write!(out, "{}", rules::markdown_table(&selected))?,
+        RulesFormat::Markdown if ids.is_empty() => write!(out, "{}", rules_markdown())?,
+        RulesFormat::Markdown => write!(out, "{}", st2110_sdp::rules::markdown_table(&selected))?,
         RulesFormat::Json => {
             serde_json::to_writer_pretty(&mut out, &selected)?;
             writeln!(out)?;

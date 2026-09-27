@@ -1,22 +1,21 @@
 [package]
-name = "st2110-cli"
-description = "Command-line checks for SMPTE ST 2110 SDP files and NMOS registries"
+name = "st2110-nmos"
+description = "Read-only checks of an AMWA NMOS registry and the SDP files its Senders publish"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "st2110"
-path = "src/main.rs"
+[features]
+# An HTTP client for the IS-04 Query API and Senders' SDP files.
+client = ["dep:ureq"]
 
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
-st2110-nmos = { workspace = true, features = ["client"] }
-clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq = { workspace = true, optional = true }
 
 [lints]
 workspace = true
