@@ -255,6 +255,8 @@ pub(crate) struct Clock<'a> {
     pub ref_type: &'a str,
     pub gmid: Option<&'a str>,
     pub locked: Option<bool>,
+    /// Whether the clock is traceable to TAI.
+    pub traceable: Option<bool>,
 }
 
 impl Clock<'_> {
@@ -410,7 +412,13 @@ impl<'a> Model<'a> {
                 {
                     c.wrong("gmid", "a lowercase clock identity, such as 08-00-11-ff-fe-21-e1-b0");
                 }
-                Clock { name: c.required_str("name").unwrap_or_default(), ref_type, gmid, locked: c.bool("locked") }
+                Clock {
+                    name: c.required_str("name").unwrap_or_default(),
+                    ref_type,
+                    gmid,
+                    locked: c.bool("locked"),
+                    traceable: c.bool("traceable"),
+                }
             });
             let interfaces = f.objects("interfaces", |i| i.required_str("name").unwrap_or_default());
             model.add_problems(Kind::Node, index, f);

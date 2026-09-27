@@ -48,13 +48,13 @@ rules! {
     PTP_UNLOCKED = "ptp-unlocked", Warning, "IS-04 v1.3 schemas",
         "Each PTP clock a Node reports is locked to a grandmaster.";
     PTP_GRANDMASTERS = "ptp-grandmasters", Warning, "IEEE 1588-2008 §9.3 · ST 2059-2:2021",
-        "Every locked PTP clock follows the same grandmaster; two grandmasters means two unaligned timing domains.";
+        "Every locked PTP clock follows the same grandmaster; two grandmasters mean two unaligned timing domains, unless both are traceable to TAI.";
     PTP_SDP_GRANDMASTER = "ptp-sdp-grandmaster", Warning, "ST 2110-10:2022 §8.2",
         "The grandmaster in a Sender's `a=ts-refclk` is the one its Source's clock is locked to.";
 
     // Connections.
     SUBSCRIPTION_STATE = "subscription-state", Error, "IS-04 v1.3 Behaviour: Nodes",
-        "A subscription names a Sender or Receiver only while it is active, and a Sender names a Receiver only for a unicast connection.";
+        "A subscription names a Sender or Receiver only while it is active, and a Sender names a Receiver only while it pushes a unicast stream to it.";
     INACTIVE_SENDER = "inactive-sender", Warning, "IS-04 v1.3 Behaviour: Nodes",
         "An active Receiver's Sender is active too, so the stream it expects is on the network.";
     RECEIVER_CAPS = "receiver-caps", Warning, "BCP-004-01 v1.0 · IS-04 v1.3 schemas",

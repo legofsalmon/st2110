@@ -197,17 +197,38 @@ pub fn lint(sdp: &str) -> Result<JsValue, JsError> {
     to_js(&st2110_sdp::lint(sdp))
 }
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = JSON, js_name = stringify, catch)]
+    fn json_stringify(value: &JsValue) -> Result<Option<String>, JsValue>;
+
+    #[wasm_bindgen(js_name = String)]
+    fn js_string(value: &JsValue) -> String;
+}
+
+/// A value as JSON text. Objects are read through JSON rather than directly, so that
+/// nesting is limited as it is for text (serde_json stops at 128 levels) instead of
+/// overflowing the stack, and keys set to `undefined` are left out as JSON leaves them.
+fn json_text(value: &JsValue) -> Result<String, String> {
+    if let Some(text) = value.as_string() {
+        return Ok(text);
+    }
+    match json_stringify(value) {
+        Ok(Some(text)) => Ok(text),
+        Ok(None) => Err("it has no JSON form".into()),
+        Err(e) => Err(js_string(&e)),
+    }
+}
+
 /// Checks a registry snapshot: its resources, PTP clocks, connections and every
 /// Sender's SDP file. Takes the snapshot as an object or as JSON text.
 #[wasm_bindgen(js_name = checkRegistry, unchecked_return_type = "RegistryReport")]
 pub fn check_registry(
     #[wasm_bindgen(unchecked_param_type = "Snapshot | string")] snapshot: JsValue,
 ) -> Result<JsValue, JsError> {
-    let snapshot = match snapshot.as_string() {
-        Some(text) => Snapshot::from_json(&text).map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?,
-        None => serde_wasm_bindgen::from_value(snapshot)
-            .map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?,
-    };
+    let snapshot = json_text(&snapshot)
+        .and_then(|text| Snapshot::from_json(&text).map_err(|e| e.to_string()))
+        .map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?;
     to_js(&st2110_nmos::check(&snapshot))
 }
 

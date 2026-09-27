@@ -22,14 +22,18 @@ use serde_json::Value;
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
+use crate::check::is_http;
 use crate::{Kind, Manifest, Snapshot};
 
 /// The IS-04 versions this client reads, oldest first.
 const VERSIONS: [&str; 4] = ["v1.0", "v1.1", "v1.2", "v1.3"];
 
-/// The most a single response may hold. Registries that do not page return every
+/// The most a Query API response may hold. Registries that do not page return every
 /// resource of a type at once.
 const BODY_LIMIT: u64 = 256 << 20;
+
+/// The most an SDP file may hold. They are a few kilobytes, and many are fetched at once.
+const SDP_LIMIT: u64 = 1 << 20;
 
 /// How a [`QueryClient`] talks to the registry.
 #[derive(Clone, Debug)]
@@ -78,8 +82,20 @@ fn error(url: &str, message: impl Into<String>) -> Error {
 struct Response {
     status: u16,
     paged: bool,
+    since: Option<String>,
     until: Option<String>,
     body: String,
+}
+
+/// The page of a collection to ask for next.
+enum Page {
+    /// No paging parameters: everything, or the registry's own first page.
+    First,
+    /// The next resources in creation order, after this cursor.
+    After(String),
+    /// The previous page in the registry's own order, which is newest first: the
+    /// resources up to and including this cursor.
+    UpTo(String),
 }
 
 /// A client for one registry's Query API.
@@ -125,7 +141,7 @@ impl QueryClient {
         }
         let root =
             if trimmed.ends_with("/x-nmos/query") { format!("{trimmed}/") } else { format!("{trimmed}/x-nmos/query/") };
-        let response = client.get(&root, "application/json")?;
+        let response = client.get(&root, "application/json", BODY_LIMIT)?;
         if response.status != 200 {
             return Err(error(&root, format!("HTTP {}: no IS-04 Query API here", response.status)));
         }
@@ -151,20 +167,21 @@ impl QueryClient {
         &self.base
     }
 
-    fn get(&self, url: &str, accept: &str) -> Result<Response, Error> {
+    fn get(&self, url: &str, accept: &str, limit: u64) -> Result<Response, Error> {
         let mut response =
             self.agent.get(url).header("Accept", accept).call().map_err(|e| error(url, e.to_string()))?;
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let paged = header("X-Paging-Limit").is_some();
+        let since = header("X-Paging-Since");
         let until = header("X-Paging-Until");
         let status = response.status().as_u16();
         let body = response
             .body_mut()
             .with_config()
-            .limit(BODY_LIMIT)
+            .limit(limit)
             .read_to_string()
             .map_err(|e| error(url, format!("reading the response: {e}")))?;
-        Ok(Response { status, paged, until, body })
+        Ok(Response { status, paged, since, until, body })
     }
 
     /// Lists every resource of one type, paging through the collection in creation
@@ -174,59 +191,74 @@ impl QueryClient {
         let collection = format!("{}{}/", self.base, kind.plural());
         // A registry answers 501 to paging or downgrade queries it does not implement,
         // without saying which, so try each combination in turn: paging, downgrade.
-        let downgrade = self.version != "v1.0";
+        // IS-04 v1.0 has neither, and its registries may read unknown parameters as
+        // filters that match nothing.
+        let v1_0 = self.version == "v1.0";
         let mut attempts = [(true, true), (false, true), (true, false), (false, false)]
             .into_iter()
-            .filter(|&(_, with_downgrade)| downgrade || !with_downgrade);
+            .filter(|&attempt| !v1_0 || attempt == (false, false));
         let (mut paging, mut downgrade) = attempts.next().expect("at least one attempt");
-        let mut since = "0:0".to_string();
+        let first = |paging: bool| if paging { Page::After("0:0".into()) } else { Page::First };
+        let mut page = first(paging);
         let mut resources = Vec::new();
         let mut seen = HashSet::new();
         // A bound on pages, in case a registry's cursors never reach the end.
         for _ in 0..100_000 {
             let mut query = Vec::new();
-            if paging {
-                query.push(format!("paging.order=create&paging.since={since}&paging.limit={}", self.options.page_size));
+            match &page {
+                Page::First => {}
+                Page::After(since) => query
+                    .push(format!("paging.order=create&paging.since={since}&paging.limit={}", self.options.page_size)),
+                Page::UpTo(until) => query.push(format!("paging.until={until}")),
             }
             if downgrade {
                 query.push("query.downgrade=v1.0".to_string());
             }
             let url = if query.is_empty() { collection.clone() } else { format!("{collection}?{}", query.join("&")) };
-            let response = self.get(&url, "application/json")?;
+            let response = self.get(&url, "application/json", BODY_LIMIT)?;
             if response.status == 501
                 && resources.is_empty()
                 && let Some(next) = attempts.next()
             {
                 (paging, downgrade) = next;
+                page = first(paging);
                 continue;
             }
             if response.status != 200 {
                 return Err(error(&url, format!("HTTP {}", response.status)));
             }
-            let page: Vec<Value> = serde_json::from_str(&response.body)
+            let items: Vec<Value> = serde_json::from_str(&response.body)
                 .map_err(|e| error(&url, format!("expected a JSON array of {}: {e}", kind.plural())))?;
-            let empty = page.is_empty();
-            for resource in page {
+            let empty = items.is_empty();
+            let before = resources.len();
+            for resource in items {
                 let id = resource.get("id").and_then(Value::as_str).map(str::to_string);
                 if id.is_none_or(|id| seen.insert(id)) {
                     resources.push(resource);
                 }
             }
             // Without X-Paging-Limit the registry is not paging: that was everything.
-            if !paging || !response.paged || empty {
+            if !response.paged || empty {
                 return Ok(resources);
             }
-            match response.until {
-                Some(until) if until != since => since = until,
-                _ => return Ok(resources),
+            if resources.len() == before {
+                return Err(error(&url, "the registry's paging cursors do not advance: a page held nothing new"));
             }
+            // A registry may page a query that asked for no paging, newest first, as
+            // IS-04 allows: then read on backwards from the start of that page.
+            page = match (page, response.since, response.until) {
+                (Page::After(since), _, Some(until)) if until != since => Page::After(until),
+                (Page::First, Some(since), _) => Page::UpTo(since),
+                (Page::UpTo(until), Some(since), _) if since != until => Page::UpTo(since),
+                _ => return Ok(resources),
+            };
         }
         Err(error(&collection, "the registry's paging cursors never reached the end of the collection"))
     }
 
     /// Fetches a transport file. Failures are recorded in the result, not returned.
     pub fn manifest(&self, href: &str) -> Manifest {
-        match self.get(href, "application/sdp, text/plain;q=0.9, */*;q=0.8") {
+        match self.get(href, "application/sdp, text/plain;q=0.9, */*;q=0.8", SDP_LIMIT) {
             Ok(response) if (200..300).contains(&response.status) => {
                 Manifest { url: href.to_string(), status: Some(response.status), sdp: Some(response.body), error: None }
             }
@@ -265,8 +297,7 @@ impl QueryClient {
             .filter_map(|s| {
                 let id = s.get("id")?.as_str()?;
                 let href = s.get("manifest_href")?.as_str()?;
-                let http = href.starts_with("http://") || href.starts_with("https://");
-                http.then(|| (id.to_string(), href.to_string()))
+                is_http(href).then(|| (id.to_string(), href.to_string()))
             })
             .collect();
         let next = AtomicUsize::new(0);

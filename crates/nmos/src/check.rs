@@ -1,13 +1,13 @@
 //! The registry checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 
 use serde_json::Value;
 use st2110_sdp::{ClockIdentity, Rational, RefClock, Stream, parse_frame_rate};
 
 use crate::caps::{self, SdpFacts, StreamFacts};
-use crate::model::{Core, Flow, Kind, Model, Node, Receiver, Sender, Source, is_uuid, short_urn};
+use crate::model::{Clock, Core, Flow, Kind, Model, Node, Receiver, Sender, Source, is_uuid, short_urn};
 use crate::report::{Findings, Grandmaster, ReceiverView, Report, ResourceRef, SenderView, Summary};
 use crate::rules::*;
 use crate::{Manifest, Snapshot};
@@ -63,9 +63,15 @@ fn name(core: &Core<'_>) -> String {
     ResourceRef::of(core).describe()
 }
 
-/// Lists names for a message: `eth0, eth1`, or `none`.
-fn list(items: &[&str]) -> String {
-    if items.is_empty() { "none".into() } else { items.join(", ") }
+/// Lists names for a message: `eth0, eth1`, or `none`. Past ten, says how many more.
+fn list<'s>(items: impl IntoIterator<Item = &'s str>) -> String {
+    let mut items = items.into_iter();
+    let shown: Vec<&str> = items.by_ref().take(10).collect();
+    match (shown.is_empty(), items.count()) {
+        (true, _) => "none".into(),
+        (false, 0) => shown.join(", "),
+        (false, more) => format!("{} and {more} more", shown.join(", ")),
+    }
 }
 
 fn resources(model: &Model<'_>, findings: &mut Findings) {
@@ -108,6 +114,7 @@ fn version_problem(version: &str) -> Option<String> {
 }
 
 fn references(model: &Model<'_>, findings: &mut Findings) {
+    let mut interfaces = HashMap::new();
     let device = |core: &Core<'_>, id: Option<&str>, findings: &mut Findings| {
         if let Some(id) = id
             && model.device(id).is_none()
@@ -156,7 +163,8 @@ fn references(model: &Model<'_>, findings: &mut Findings) {
                 format!("its subscription names Receiver {id}, which is not registered"),
             );
         }
-        bindings(model, &sender.core, sender.device_id, sender.interface_bindings.as_deref(), findings);
+        let bindings = sender.interface_bindings.as_deref();
+        check_bindings(model, &mut interfaces, &sender.core, sender.device_id, bindings, findings);
     }
     for receiver in &model.receivers {
         device(&receiver.core, receiver.device_id, findings);
@@ -169,29 +177,41 @@ fn references(model: &Model<'_>, findings: &mut Findings) {
                 format!("its subscription names Sender {id}, which is not registered"),
             );
         }
-        bindings(model, &receiver.core, receiver.device_id, receiver.interface_bindings.as_deref(), findings);
+        let bindings = receiver.interface_bindings.as_deref();
+        check_bindings(model, &mut interfaces, &receiver.core, receiver.device_id, bindings, findings);
     }
 }
 
 /// Checks that each interface a Sender or Receiver binds to is one its Node has.
-fn bindings(model: &Model<'_>, core: &Core<'_>, device: Option<&str>, bindings: Option<&[&str]>, f: &mut Findings) {
+/// `known` keeps each Node's interface names, by the Node's index, between calls.
+fn check_bindings<'a>(
+    model: &Model<'a>,
+    known: &mut HashMap<usize, HashSet<&'a str>>,
+    core: &Core<'_>,
+    device: Option<&str>,
+    bindings: Option<&[&str]>,
+    f: &mut Findings,
+) {
     let (Some(bindings), Some(node)) = (bindings, model.node_of(device)) else {
         return;
     };
     let Some(interfaces) = &node.interfaces else {
         return;
     };
-    let mut reported = Vec::new();
-    for name in bindings {
-        if !interfaces.contains(name) && !reported.contains(name) {
-            reported.push(name);
-            let message = if interfaces.is_empty() {
-                format!("it binds to interface {name}, but its Node lists no interfaces")
-            } else {
-                format!("it binds to interface {name}, but its Node's interfaces are {}", list(interfaces))
-            };
-            f.add(&UNKNOWN_INTERFACE, core, message);
+    let known = known.entry(node.core.index).or_insert_with(|| interfaces.iter().copied().collect());
+    let mut reported = HashSet::new();
+    let mut names = None;
+    for &name in bindings {
+        if known.contains(name) || !reported.insert(name) {
+            continue;
         }
+        let message = if interfaces.is_empty() {
+            format!("it binds to interface {name}, but its Node lists no interfaces")
+        } else {
+            let names = names.get_or_insert_with(|| list(interfaces.iter().copied()));
+            format!("it binds to interface {name}, but its Node's interfaces are {names}")
+        };
+        f.add(&UNKNOWN_INTERFACE, core, message);
     }
 }
 
@@ -206,18 +226,17 @@ fn clock(model: &Model<'_>, source: &Source<'_>, findings: &mut Findings) {
         return;
     };
     if !clocks.iter().any(|c| c.name == name) {
-        let names: Vec<&str> = clocks.iter().map(|c| c.name).collect();
         findings.add(
             &UNKNOWN_CLOCK,
             &source.core,
-            format!("its clock_name is {name}, but its Node's clocks are {}", list(&names)),
+            format!("its clock_name is {name}, but its Node's clocks are {}", list(clocks.iter().map(|c| c.name))),
         );
     }
 }
 
 /// Checks the Nodes' PTP clocks; returns the grandmasters they follow and how many are unlocked.
 fn ptp(model: &Model<'_>, findings: &mut Findings) -> (Vec<Grandmaster>, usize) {
-    let mut followers: BTreeMap<String, Vec<(&Node<'_>, &str)>> = BTreeMap::new();
+    let mut followers: BTreeMap<String, Vec<(&Node<'_>, &Clock<'_>)>> = BTreeMap::new();
     let mut unlocked = 0;
     for node in &model.nodes {
         for clock in node.clocks.iter().flatten().filter(|c| c.is_ptp()) {
@@ -234,7 +253,7 @@ fn ptp(model: &Model<'_>, findings: &mut Findings) -> (Vec<Grandmaster>, usize) 
                     );
                 }
                 (Some(true), Some(gmid)) => {
-                    followers.entry(gmid.to_ascii_lowercase()).or_default().push((node, clock.name));
+                    followers.entry(gmid.to_ascii_lowercase()).or_default().push((node, clock));
                 }
                 _ => {}
             }
@@ -243,16 +262,20 @@ fn ptp(model: &Model<'_>, findings: &mut Findings) -> (Vec<Grandmaster>, usize) 
     let mut grandmasters: Vec<Grandmaster> =
         followers.iter().map(|(id, clocks)| Grandmaster { id: id.clone(), clocks: clocks.len() }).collect();
     grandmasters.sort_by(|a, b| b.clocks.cmp(&a.clocks).then_with(|| a.id.cmp(&b.id)));
+    // Grandmasters traceable to TAI keep the same time, so clocks that follow
+    // different ones are still aligned.
+    let traceable = |id: &str| followers[id].iter().all(|(_, clock)| clock.traceable == Some(true));
     if let [main, others @ ..] = grandmasters.as_slice() {
         let total: usize = grandmasters.iter().map(|g| g.clocks).sum();
-        for other in others {
+        let main_traceable = traceable(&main.id);
+        for other in others.iter().filter(|other| !main_traceable || !traceable(&other.id)) {
             for (node, clock) in &followers[&other.id] {
                 findings.add(
                     &PTP_GRANDMASTERS,
                     &node.core,
                     format!(
-                        "PTP clock {clock} follows grandmaster {}, but most locked clocks ({} of {total}) follow {}",
-                        other.id, main.clocks, main.id
+                        "PTP clock {} follows grandmaster {}, but most locked clocks ({} of {total}) follow {}",
+                        clock.name, other.id, main.clocks, main.id
                     ),
                 );
             }
@@ -310,7 +333,7 @@ fn transport_file(model: &Model<'_>, snapshot: &Snapshot, sender: &Sender<'_>, f
 
     if let Some(bindings) = &sender.interface_bindings
         && !streams.is_empty()
-        && bindings.len() != streams.len()
+        && bindings.len() != sdp.facts.legs
     {
         f.add(
             &INTERFACE_BINDINGS,
@@ -318,7 +341,7 @@ fn transport_file(model: &Model<'_>, snapshot: &Snapshot, sender: &Sender<'_>, f
             format!(
                 "it lists {} for the {} in its SDP file",
                 count(bindings.len(), "interface binding"),
-                count(streams.len(), "stream")
+                count(sdp.facts.legs, "stream")
             ),
         );
     }
@@ -336,7 +359,7 @@ fn transport_file(model: &Model<'_>, snapshot: &Snapshot, sender: &Sender<'_>, f
     Some(sdp)
 }
 
-fn is_http(href: &str) -> bool {
+pub(crate) fn is_http(href: &str) -> bool {
     let lower = href.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
 }
@@ -369,12 +392,13 @@ fn transport_address(sender: &Sender<'_>, streams: &[Stream], f: &mut Findings) 
     }
 }
 
-fn param<'s>(stream: &'s Stream, name: &str) -> Option<&'s str> {
-    stream.parameters.iter().find(|p| p.name == name).and_then(|p| p.value.as_deref())
+/// A format parameter's value. Parameter names are not case-sensitive (RFC 2045 §5.1).
+pub(crate) fn param<'s>(stream: &'s Stream, name: &str) -> Option<&'s str> {
+    stream.parameters.iter().find(|p| p.name.eq_ignore_ascii_case(name)).and_then(|p| p.value.as_deref())
 }
 
 fn has_param(stream: &Stream, name: &str) -> bool {
-    stream.parameters.iter().any(|p| p.name == name)
+    stream.parameters.iter().any(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// Compares a Flow and its Source with the first stream of the Sender's SDP file.
@@ -418,14 +442,19 @@ fn video_sdp(flow: &Flow<'_>, stream: &Stream, mismatch: &mut impl FnMut(String)
         (true, false) => "interlaced",
         (true, true) => "PsF",
     };
-    let mode = flow.interlace_mode.unwrap_or("progressive");
+    // IS-04 v1.1 added interlace_mode and transfer_characteristic, with their
+    // defaults, along with media_type; a v1.0 Flow says nothing about either.
+    let v1_1 = flow.media_type.is_some();
+    let mode = flow.interlace_mode.or(v1_1.then_some("progressive"));
     let expected = match mode {
-        "progressive" => Some("progressive"),
-        "interlaced_tff" | "interlaced_bff" => Some("interlaced"),
-        "interlaced_psf" => Some("PsF"),
+        Some("progressive") => Some("progressive"),
+        Some("interlaced_tff" | "interlaced_bff") => Some("interlaced"),
+        Some("interlaced_psf") => Some("PsF"),
         _ => None,
     };
-    if expected.is_some_and(|e| e != signalled) {
+    if let (Some(mode), Some(expected)) = (mode, expected)
+        && expected != signalled
+    {
         mismatch(format!("its Flow's interlace_mode is {mode}, but its SDP file signals {signalled} video"));
     }
     if let (Some(colorspace), Some(colorimetry)) = (flow.colorspace, param(stream, "colorimetry"))
@@ -434,9 +463,10 @@ fn video_sdp(flow: &Flow<'_>, stream: &Stream, mismatch: &mut impl FnMut(String)
         mismatch(format!("its Flow's colorspace is {colorspace}, but colorimetry is {colorimetry}"));
     }
     // Both default to SDR.
-    let transfer = flow.transfer_characteristic.unwrap_or("SDR");
     let tcs = param(stream, "TCS").unwrap_or("SDR");
-    if transfer != tcs {
+    if let Some(transfer) = flow.transfer_characteristic.or(v1_1.then_some("SDR"))
+        && transfer != tcs
+    {
         mismatch(format!("its Flow's transfer_characteristic is {transfer}, but TCS is {tcs}"));
     }
     if !flow.media_type.is_some_and(|m| m.eq_ignore_ascii_case("video/raw")) {
@@ -568,19 +598,23 @@ fn subscriptions(model: &Model<'_>, sdps: &[Option<Sdp>], findings: &mut Finding
                 .and_then(|s| s.report.streams.first()?.destination.as_deref())
                 .and_then(is_multicast)
                 .unwrap_or(false);
-        if subscription.active == Some(false) {
-            findings.add(
-                &SUBSCRIPTION_STATE,
-                &sender.core,
-                format!("subscription.receiver_id is {receiver} while the Sender is inactive; it must be null"),
-            );
+        // Receivers fetch from these Senders, or subscribe through a broker.
+        let pull = sender.transport.filter(|t| {
+            matches!(*t, "urn:x-nmos:transport:dash" | "urn:x-nmos:transport:websocket" | "urn:x-nmos:transport:mqtt")
+        });
+        let message = if subscription.active == Some(false) {
+            format!("subscription.receiver_id is {receiver} while the Sender is inactive; it must be null")
         } else if multicast {
-            findings.add(
-                &SUBSCRIPTION_STATE,
-                &sender.core,
-                format!("subscription.receiver_id is {receiver}, but only a unicast Sender names its Receiver"),
-            );
-        }
+            format!("subscription.receiver_id is {receiver}, but only a unicast Sender names its Receiver")
+        } else if let Some(transport) = pull {
+            format!(
+                "subscription.receiver_id is {receiver}, but a {} Sender does not push to a Receiver, so it names none",
+                short_urn(transport)
+            )
+        } else {
+            continue;
+        };
+        findings.add(&SUBSCRIPTION_STATE, &sender.core, message);
     }
     for receiver in &model.receivers {
         let Some(subscription) = &receiver.subscription else { continue };
@@ -626,7 +660,8 @@ fn compatibility(receiver: &Receiver<'_>, stream: &StreamFacts<'_, '_>, sender: 
         && !types.is_empty()
         && !types.iter().any(|t| t.eq_ignore_ascii_case(media_type))
     {
-        return Some(format!("its caps.media_types ({}) leave out {media_type}, which {sender} sends", list(types)));
+        let types = list(types.iter().copied());
+        return Some(format!("its caps.media_types ({types}) leave out {media_type}, which {sender} sends"));
     }
     let reasons = caps::evaluate(receiver.constraint_sets?, stream).err()?;
     Some(format!("none of its constraint sets accepts what {sender} sends: {}", reasons.join("; ")))

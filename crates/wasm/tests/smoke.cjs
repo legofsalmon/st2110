@@ -61,4 +61,18 @@ assert.deepEqual(
   ],
 );
 assert.throws(() => checkRegistry("v=0"), /not a registry snapshot/);
+
+// Objects are read as JSON: undefined keys are missing, and deep nesting or a cycle
+// is refused without harming the module.
+const fresh = () => JSON.parse(facilityText);
+assert.equal(checkRegistry({ ...fresh(), manifests: undefined, receivers: undefined }).summary.receivers, 0);
+const deep = fresh();
+let nest = {};
+deep.nodes[0].tags = nest;
+for (let i = 0; i < 10000; i++) nest = nest.a = {};
+assert.throws(() => checkRegistry(deep), /not a registry snapshot/);
+const cyclic = fresh();
+cyclic.nodes[0].tags = cyclic;
+assert.throws(() => checkRegistry(cyclic), /not a registry snapshot: TypeError/);
+assert.deepEqual(checkRegistry(fresh()), registry);
 console.log(`ok: ${all.length} rules, ${registry.summary.senders} senders`);

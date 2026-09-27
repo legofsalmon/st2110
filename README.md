@@ -64,7 +64,7 @@ registry: 1 error, 3 warnings, 0 notes
 
 - `st2110 nmos URL` reads a registry through its IS-04 Query API, then fetches each Sender's SDP file from its `manifest_href`.
   - It uses the newest Query API version the registry offers from v1.0 to v1.3, or the one a URL such as `http://registry.example:8080/x-nmos/query/v1.2` names.
-  - It pages through each collection and asks for resources registered at every version. It falls back when a registry answers 501 to either request.
+  - It pages through each collection and asks for resources registered at every version. It falls back when a registry answers 501 to either request, and reads every page of a registry that pages without being asked. It asks a v1.0 registry, which has neither, for each collection whole.
   - It goes through the proxy in `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` unless `NO_PROXY` names the host, and checks HTTPS certificates against the system's trust store.
 - `--save FILE` keeps what it read as a JSON snapshot. `st2110 nmos FILE` checks a snapshot again without the network, and `-` reads one from standard input.
 - `--no-sdp` skips the SDP files, and `--timeout` sets the seconds allowed for each response (5 by default).
@@ -101,7 +101,7 @@ It reads SDP only. It never looks at packets, so it cannot confirm that a sender
 | Area | Checks |
 |---|---|
 | Resources | The attributes each IS-04 schema requires and their types, `id` and `version` syntax, duplicate ids, parents and references that are not registered, interface and clock names a Node does not have |
-| PTP | Unlocked clocks, locked clocks that follow different grandmasters, and a Sender whose `a=ts-refclk` disagrees with its Source's clock |
+| PTP | Unlocked clocks, locked clocks that follow different grandmasters (unless both are traceable to TAI), and a Sender whose `a=ts-refclk` disagrees with its Source's clock |
 | Connections | Subscriptions that contradict `active`, active Receivers taking from an inactive Sender, and Receivers whose BCP-004-01 `caps` reject what their Sender sends |
 | SDP files | Each Sender's `manifest_href` and whether it answers, every SDP rule above, one interface binding per stream, multicast or unicast addresses to match the transport, and the file against the Flow, Source and Sender attributes that the NMOS capabilities register maps to SDP |
 

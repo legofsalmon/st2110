@@ -234,6 +234,83 @@ fn messages_explain_the_mismatch() {
         ),
         "its bit_rate is 2500 kbit/s, but b=AS is 2300"
     );
+    assert_eq!(
+        message(
+            &with(|v| {
+                v["senders"][0]["interface_bindings"] = json!(["eth0"]);
+                one_media_section(v);
+            }),
+            "interface-bindings"
+        ),
+        "it lists 1 interface binding for the 2 streams in its SDP file"
+    );
+    assert_eq!(
+        message(
+            &with(|v| {
+                v["senders"][1]["transport"] = json!("urn:x-nmos:transport:websocket");
+                v["senders"][1]["subscription"]["receiver_id"] = json!("7ecf0002-0000-4000-8000-000000000002");
+            }),
+            "subscription-state"
+        ),
+        "subscription.receiver_id is 7ecf0002-0000-4000-8000-000000000002, but a websocket Sender does not push \
+         to a Receiver, so it names none"
+    );
+    // Long lists are cut short.
+    assert_eq!(
+        message(
+            &with(|v| {
+                v["nodes"][0]["interfaces"] = (0..15).map(|i| json!({"name": format!("if{i}")})).collect();
+                v["senders"][1]["interface_bindings"] = json!(["if3", "eth9", "eth9"]);
+            }),
+            "unknown-interface"
+        ),
+        "it binds to interface eth9, but its Node's interfaces are if0, if1, if2, if3, if4, if5, if6, if7, if8, \
+         if9 and 5 more"
+    );
+}
+
+/// The video Sender's ST 2022-7 pair in one media section with two SSRCs, as RFC 7104
+/// allows, rather than two media sections.
+fn one_media_section(v: &mut Value) {
+    let sdp = v["manifests"][VIDEO_SENDER]["sdp"].as_str().unwrap();
+    let (primary, _) = sdp.split_once("a=mid:primary\n").unwrap();
+    let one = primary
+        .replace("a=group:DUP primary secondary\n", "")
+        .replace("192.168.10.21\n", "192.168.10.21 192.168.20.21\n");
+    v["manifests"][VIDEO_SENDER]["sdp"] = json!(format!("{one}a=ssrc-group:DUP 1000 1010\n"));
+}
+
+#[test]
+fn v1_0_flows_have_no_v1_1_defaults() {
+    // A v1.0 Flow says nothing about interlacing or transfer characteristic, so an
+    // interlaced HLG SDP file does not contradict it, nor can caps judge them.
+    let snapshot = with(|v| {
+        let v1_0 = ["id", "version", "label", "description", "tags", "source_id", "parents", "format"];
+        v["flows"][0].as_object_mut().unwrap().retain(|key, _| v1_0.contains(&key.as_str()));
+        replace_in(&mut v["manifests"][VIDEO_SENDER]["sdp"], "TCS=SDR", "interlace; TCS=HLG");
+        v["receivers"][0]["caps"]["constraint_sets"][0]["urn:x-nmos:cap:format:interlace_mode"] =
+            json!({"enum": ["interlaced_tff", "interlaced_bff"]});
+    });
+    let findings = check(&snapshot).findings;
+    let rules: Vec<(&str, &str)> = findings.iter().map(|f| (f.rule, f.message.as_str())).collect();
+    assert!(!rules.iter().any(|(rule, _)| ["flow-sdp", "receiver-caps"].contains(rule)), "{rules:#?}");
+    // A v1.1 Flow without interlace_mode is progressive.
+    let snapshot = with(|v| {
+        v["flows"][0].as_object_mut().unwrap().remove("interlace_mode");
+        replace_in(&mut v["manifests"][VIDEO_SENDER]["sdp"], "TCS=SDR", "interlace; TCS=SDR");
+    });
+    assert!(ids(&snapshot).contains("flow-sdp"));
+}
+
+#[test]
+fn format_parameter_names_ignore_case() {
+    let snapshot = with(|v| {
+        v["flows"][0]["transfer_characteristic"] = json!("HLG");
+        replace_in(&mut v["manifests"][VIDEO_SENDER]["sdp"], "TCS=SDR", "tcs=HLG");
+        replace_in(&mut v["manifests"][VIDEO_SENDER]["sdp"], "TP=2110TPN", "tp=2110TPN");
+    });
+    let rules = ids(&snapshot);
+    assert!(!rules.contains("flow-sdp") && !rules.contains("sender-sdp"), "{rules:?}");
 }
 
 #[test]
@@ -254,6 +331,20 @@ fn valid_variations_are_clean() {
     );
     // The same NIC listed twice for both legs of an ST 2022-7 pair.
     clean("one NIC for both legs", with(|v| v["senders"][0]["interface_bindings"] = json!(["eth0", "eth0"])));
+    // Both legs in one media section.
+    let one = with(one_media_section);
+    let rules: Vec<&str> = check(&one).findings.iter().map(|f| f.rule).filter(|r| r.contains("interface")).collect();
+    assert!(rules.is_empty(), "{rules:?}");
+    // Grandmasters that are both traceable to TAI keep the same time.
+    clean(
+        "traceable grandmasters",
+        with(|v| {
+            v["nodes"][1]["clocks"][0]["gmid"] = json!("ac-de-48-ff-fe-00-11-22");
+            for node in 0..2 {
+                v["nodes"][node]["clocks"][0]["traceable"] = json!(true);
+            }
+        }),
+    );
     // A constraint set that is disabled is ignored, and one with nothing to evaluate
     // is satisfied.
     clean(

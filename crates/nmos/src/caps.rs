@@ -28,6 +28,9 @@ pub(crate) struct SdpFacts {
     pub maxptime: Option<f64>,
     /// `b=AS`, in kbit/s.
     pub bandwidth: Option<u64>,
+    /// RTP streams in the file: one per media section, or one per SSRC of an ST 2022-7
+    /// `a=ssrc-group:DUP` that sends both legs in one media section (RFC 7104).
+    pub legs: usize,
 }
 
 impl SdpFacts {
@@ -46,13 +49,25 @@ impl SdpFacts {
             .filter_map(|field| st2110_sdp::parse_bandwidth(&field.value).ok())
             .find(|(kind, _)| kind.eq_ignore_ascii_case("AS"))
             .map(|(_, kbps)| kbps);
-        let param = |name: &str| first_stream?.parameters.iter().find(|p| p.name == name).and_then(|p| p.value.clone());
+        let param = |name: &str| first_stream.and_then(|s| crate::check::param(s, name)).map(str::to_string);
+        let legs = sdp
+            .media
+            .iter()
+            .map(|section| {
+                let dup = section.attributes_named("ssrc-group").find_map(|a| {
+                    let mut words = a.text().split_whitespace();
+                    words.next().filter(|semantics| semantics.eq_ignore_ascii_case("DUP")).map(|_| words.count())
+                });
+                dup.unwrap_or(1).max(1)
+            })
+            .sum();
         Self {
             sampling: param("sampling"),
             tp: param("TP"),
             ptime: millis("ptime"),
             maxptime: millis("maxptime"),
             bandwidth,
+            legs,
         }
     }
 }
@@ -99,16 +114,18 @@ fn int(n: u64) -> Option<Target> {
 /// The stream's value for a parameter constraint, or `None` when it cannot be evaluated.
 fn target(urn: &str, s: &StreamFacts<'_, '_>) -> Option<Target> {
     let flow = s.flow;
-    let video = flow.format.map(short_urn) == Some("video");
+    // IS-04 v1.1 added interlace_mode and transfer_characteristic, with their
+    // defaults, along with media_type.
+    let v1_1_video = flow.format.map(short_urn) == Some("video") && flow.media_type.is_some();
     let text = |t: &str| Some(Target::Str(t.to_string()));
     match urn.strip_prefix("urn:x-nmos:cap:")? {
         "format:media_type" => text(flow.media_type?),
         "format:grain_rate" => rational(flow.grain_rate.or_else(|| s.source?.grain_rate)?),
         "format:frame_width" => int(flow.frame_width?),
         "format:frame_height" => int(flow.frame_height?),
-        "format:interlace_mode" => text(flow.interlace_mode.or(video.then_some("progressive"))?),
+        "format:interlace_mode" => text(flow.interlace_mode.or(v1_1_video.then_some("progressive"))?),
         "format:colorspace" => text(flow.colorspace?),
-        "format:transfer_characteristic" => text(flow.transfer_characteristic.or(video.then_some("SDR"))?),
+        "format:transfer_characteristic" => text(flow.transfer_characteristic.or(v1_1_video.then_some("SDR"))?),
         "format:color_sampling" => match s.sdp.and_then(|sdp| sdp.sampling.clone()) {
             Some(sampling) => Some(Target::Str(sampling)),
             None => text(&sampling(&flow.components)?),
