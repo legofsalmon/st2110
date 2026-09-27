@@ -87,7 +87,7 @@ fn work_out(args: &Args) -> Result<Timing, String> {
 }
 
 /// PTP time from the system clock, taking it to keep UTC.
-fn now(tai_utc: i32) -> Result<PtpTime, String> {
+pub(crate) fn now(tai_utc: i32) -> Result<PtpTime, String> {
     let unix = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "the system clock is before 1970")?;
     let nanos = i128::try_from(unix.as_nanos()).map_err(|_| "the system clock is out of range")?;
     PtpTime::from_utc(nanos, tai_utc).ok_or_else(|| "the system clock is out of range".into())

@@ -1,6 +1,6 @@
 [package]
 name = "st2110-cli"
-description = "Command-line checks for SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures"
+description = "Command-line checks for SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures, and IS-05 connections"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ st2110-sdp = { workspace = true, features = ["serde"] }
 st2110-nmos = { workspace = true, features = ["client"] }
 st2110-ptp = { workspace = true, features = ["serde"] }
 st2110-pcap = { workspace = true, features = ["serde"] }
+st2110-connect = { workspace = true, features = ["client"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

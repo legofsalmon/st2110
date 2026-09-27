@@ -65,6 +65,8 @@ rules! {
         "An RTP Sender's `manifest_href` is an HTTP(S) URL for its SDP file.";
     MANIFEST_UNREACHABLE = "manifest-unreachable", Warning, "IS-04 v1.3 Behaviour: Nodes",
         "A Sender's SDP file can be fetched; only an inactive Sender may answer 404.";
+    MANIFEST_TRANSPORTFILE = "manifest-transportfile", Warning, "IS-04 v1.3 Behaviour: Nodes · IS-05 v1.2 Overview",
+        "A Sender's `manifest_href` serves the stream its IS-05 `/transportfile` does, so a controller that reads either connects Receivers to what the Sender sends.";
     INTERFACE_BINDINGS = "interface-bindings", Warning, "IS-04 v1.3 Behaviour: Nodes · IS-05 v1.2 Behaviour: RTP Transport Type",
         "A Sender lists one interface binding per stream in its SDP file: two for an ST 2022-7 pair.";
     TRANSPORT_ADDRESS = "transport-address", Warning, "NMOS Parameter Registers: Transports",

@@ -1,0 +1,23 @@
+[package]
+name = "st2110-connect"
+description = "IS-05 connection management for ST 2110: plan, make and check connections from Senders to Receivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# An HTTP client for IS-05 Connection APIs, and the controller that makes connections with it.
+client = ["dep:ureq", "dep:st2110-nmos", "st2110-nmos/client"]
+
+[dependencies]
+st2110-sdp.workspace = true
+st2110-nmos = { workspace = true, optional = true }
+st2110-ptp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true, optional = true }
+
+[lints]
+workspace = true

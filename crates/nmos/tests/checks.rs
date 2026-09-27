@@ -46,6 +46,16 @@ fn replace_first_in(text: &mut Value, from: &str, to: &str) {
     *text = Value::String(old.replacen(from, to, 1));
 }
 
+/// Gives the audio Sender's Connection API a `/transportfile` of its own: its SDP
+/// file, changed.
+fn transport_file(value: &mut Value, change: impl FnOnce(&mut Value)) {
+    let mut file = value["manifests"][AUDIO_SENDER].clone();
+    file["url"] =
+        json!(format!("http://192.168.10.21/x-nmos/connection/v1.1/single/senders/{AUDIO_SENDER}/transportfile"));
+    change(&mut file["sdp"]);
+    value["transport_files"] = json!({AUDIO_SENDER: file});
+}
+
 /// One broken facility per rule.
 fn cases() -> Vec<(&'static str, Snapshot)> {
     vec![
@@ -84,6 +94,7 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
             "manifest-unreachable",
             with(|v| v["manifests"][AUDIO_SENDER] = json!({"url": "http://cam1/sdp", "status": 500})),
         ),
+        ("manifest-transportfile", with(|v| transport_file(v, |sdp| replace_in(sdp, "239.10.10.2", "239.10.10.9")))),
         ("interface-bindings", with(|v| v["senders"][0]["interface_bindings"] = json!(["eth0"]))),
         ("transport-address", with(|v| v["senders"][1]["transport"] = json!("urn:x-nmos:transport:rtp.ucast"))),
         ("flow-sdp", with(|v| v["flows"][1]["bit_depth"] = json!(16))),
@@ -255,6 +266,41 @@ fn messages_explain_the_mismatch() {
         "subscription.receiver_id is 7ecf0002-0000-4000-8000-000000000002, but a websocket Sender does not push \
          to a Receiver, so it names none"
     );
+    let transport_file_message =
+        |change: fn(&mut Value)| message(&with(|v| transport_file(v, change)), "manifest-transportfile");
+    let at = format!(
+        "in the one at http://192.168.10.21/x-nmos/connection/v1.1/single/senders/{AUDIO_SENDER}/transportfile"
+    );
+    assert_eq!(
+        transport_file_message(|sdp| replace_in(sdp, "239.10.10.2", "239.10.10.9")),
+        format!("stream 0 goes to 239.10.10.2:5006 in the SDP file at manifest_href, but to 239.10.10.9:5006 {at}")
+    );
+    assert_eq!(
+        transport_file_message(|sdp| replace_in(sdp, "239.10.10.2 192.168.10.22", "239.10.10.2 192.168.10.23")),
+        format!("stream 0 comes from 192.168.10.22 in the SDP file at manifest_href, but from 192.168.10.23 {at}")
+    );
+    assert_eq!(
+        transport_file_message(|sdp| replace_in(sdp, "L24/48000/8", "L24/48000/2")),
+        format!(
+            "stream 0 is L24 48 kHz, 8 channels (51,ST), 1 ms, level A, 9.22 Mb/s in the SDP file at manifest_href, \
+             but L24 48 kHz, 2 channels (51,ST), 1 ms, level A, 2.30 Mb/s {at}"
+        )
+    );
+    assert_eq!(
+        transport_file_message(|sdp| replace_in(sdp, "TSMODE=SAMP", "TSMODE=NEW")),
+        format!("stream 0 has tsmode=SAMP in the SDP file at manifest_href, but tsmode=NEW {at}")
+    );
+    assert_eq!(
+        transport_file_message(|sdp| replace_in(
+            sdp,
+            "a=mediaclk:direct=0\n",
+            "a=mediaclk:direct=0\nm=audio 5008 RTP/AVP 97\nc=IN IP4 239.10.10.3/32\n"
+        )),
+        format!(
+            "the SDP file at manifest_href has 1 stream, but the one at {} has 2 streams",
+            &at["in the one at ".len()..]
+        )
+    );
     // Long lists are cut short.
     assert_eq!(
         message(
@@ -372,6 +418,21 @@ fn valid_variations_are_clean() {
     );
     // A snapshot read without SDP files.
     clean("no SDP files", with(|v| v["manifests"] = json!({})));
+    // A Connection API that serves the same streams, written differently.
+    clean(
+        "the same transport file",
+        with(|v| {
+            transport_file(v, |sdp| {
+                replace_in(sdp, "\n", "\r\n");
+                replace_in(
+                    sdp,
+                    "channel-order=SMPTE2110.(51,ST); TSMODE=SAMP",
+                    "tsmode=SAMP; channel-order=SMPTE2110.(51,ST)",
+                );
+                replace_in(sdp, "o=- 1790510438 1790510438", "o=- 1790510438 1790510499");
+            })
+        }),
+    );
     // b=AS within rounding of bit_rate.
     clean(
         "bit rate rounding",

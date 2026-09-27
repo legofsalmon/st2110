@@ -227,6 +227,174 @@ fn nmos_unreachable_registry_exits_two() {
     assert_eq!(st2110(&["nmos", "--timeout", "0", "http://127.0.0.1:1"]).status.code(), Some(2));
 }
 
+#[test]
+fn connect_lists_what_each_receiver_can_take() {
+    let output = st2110(&["connect", FACILITY]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "receiver \"MON 1 audio\" (7ecf0002)\n  sender \"CAM 1 audio\" (5e0d0002), taking it now\n\
+         receiver \"MON 1 video\" (7ecf0001)\n  sender \"CAM 1 video\" (5e0d0001), taking it now\n"
+    );
+    let one = st2110(&["connect", FACILITY, "--receiver", "mon 1 video", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&one.stdout).expect("JSON");
+    assert_eq!(json["receivers"].as_array().unwrap().len(), 1);
+    assert_eq!(json["senders"][json["receivers"][0]["current"].as_u64().unwrap() as usize]["label"], "CAM 1 video");
+}
+
+#[test]
+fn connect_refuses_what_it_cannot_read() {
+    let stderr = |args: &[&str]| {
+        let output = st2110(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    assert!(
+        stderr(&["connect", FACILITY, "--receiver", "7ecf", "--disconnect"])
+            .contains("2 receivers have an id starting 7ecf")
+    );
+    assert!(
+        stderr(&["connect", FACILITY, "--receiver", "MON 1 video", "--sender", "CAM 9"])
+            .contains("no sender has the id or label CAM 9")
+    );
+    assert!(
+        stderr(&["connect", FACILITY, "--receiver", "MON 1 video", "--disconnect", "--at", "1:0"])
+            .contains("--at 1:0 has passed")
+    );
+    assert!(
+        stderr(&["connect", FACILITY, "--receiver", "MON 1 video", "--disconnect", "--at", "soon"])
+            .contains("--at soon: not now")
+    );
+    let salvo = std::env::temp_dir().join(format!("st2110-salvo-{}.json", std::process::id()));
+    std::fs::write(&salvo, r#"[{"receiver": "MON 1 video", "sender": "CAM 1 video", "disconnect": true}]"#).unwrap();
+    let both = stderr(&["connect", FACILITY, "--salvo", salvo.to_str().unwrap()]);
+    std::fs::write(&salvo, r#"{"receiver": "MON 1 video"}"#).unwrap();
+    let not_a_list = stderr(&["connect", FACILITY, "--salvo", salvo.to_str().unwrap()]);
+    std::fs::remove_file(&salvo).unwrap();
+    assert!(both.ends_with("connection 1: give one of a sender, an SDP file or disconnect\n"), "{both}");
+    assert!(not_a_list.contains("not a salvo: invalid type: map, expected a sequence"), "{not_a_list}");
+}
+
+/// A Connection API for the test facility's Receivers that activates each `PATCH` at
+/// once, shows an activation scheduled on each, and serves the Senders' SDP files.
+/// Returns its port.
+fn connection_api() -> u16 {
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Mutex};
+
+    let facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let active: Arc<Mutex<BTreeMap<String, serde_json::Value>>> = Arc::default();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" || header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let path = request.split_whitespace().nth(1).unwrap().to_string();
+            let parts: Vec<&str> = path.split('/').collect();
+            let (status, body) = match (request.split_whitespace().next(), parts.as_slice()) {
+                (Some("GET"), ["", "sdp", id]) => {
+                    (200, facility["manifests"][*id]["sdp"].as_str().unwrap().to_string())
+                }
+                (Some("GET"), [.., id, "constraints"]) => {
+                    let legs = if id.starts_with("7ecf0001") { 2 } else { 1 };
+                    let leg = serde_json::json!({"source_ip": {}, "multicast_ip": {}, "interface_ip": {}, "destination_port": {}, "rtp_enabled": {}});
+                    (200, serde_json::Value::Array(vec![leg; legs]).to_string())
+                }
+                (Some("GET"), [.., _, "staged"]) => {
+                    let due = "1790510497:0";
+                    let activation = serde_json::json!({"mode": "activate_scheduled_absolute", "requested_time": due, "activation_time": due});
+                    (200, serde_json::json!({"activation": activation}).to_string())
+                }
+                (Some("GET"), [.., id, "active"]) => {
+                    let idle = serde_json::json!({"sender_id": null, "master_enable": false, "transport_params": [{}]});
+                    (200, active.lock().unwrap().get(*id).unwrap_or(&idle).to_string())
+                }
+                (Some("PATCH"), [.., id, "staged"]) => {
+                    let mut staged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    staged["activation"]["activation_time"] = "1790510437:0".into();
+                    active.lock().unwrap().insert(id.to_string(), staged.clone());
+                    (200, staged.to_string())
+                }
+                _ => (404, String::new()),
+            };
+            let response =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    port
+}
+
+/// The test facility as a saved snapshot, its Devices and SDP files served on `port`.
+fn facility_on(port: u16) -> std::path::PathBuf {
+    let mut facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    for sender in facility["senders"].as_array_mut().unwrap() {
+        sender["manifest_href"] = format!("http://127.0.0.1:{port}/sdp/{}", sender["id"].as_str().unwrap()).into();
+    }
+    for device in facility["devices"].as_array_mut().unwrap() {
+        device["controls"][0]["href"] = format!("http://127.0.0.1:{port}/x-nmos/connection/v1.1/").into();
+    }
+    let path = std::env::temp_dir().join(format!("st2110-connect-{port}.json"));
+    std::fs::write(&path, facility.to_string()).unwrap();
+    path
+}
+
+#[test]
+fn connect_plans_makes_and_refuses_connections() {
+    let snapshot = facility_on(connection_api());
+    let snapshot = snapshot.to_str().unwrap();
+    let args = |extra: &[&'static str]| [&["connect", snapshot, "--receiver", "MON 1 video"], extra].concat();
+
+    let planned = st2110(&args(&["--sender", "CAM 1 video", "--dry-run"]));
+    assert_eq!(planned.status.code(), Some(0));
+    assert_eq!(
+        stdout(&planned),
+        "receiver \"MON 1 video\" (7ecf0001) ← sender \"CAM 1 video\" (5e0d0001): planned\n\
+         \x20 leg 1: 239.10.10.1:5004 from 192.168.10.21\n\
+         \x20 leg 2: 239.20.10.1:5004 from 192.168.20.21\n\
+         1 connection: 1 planned\n"
+    );
+
+    let done = st2110(&args(&["--sender", "CAM 1 video"]));
+    assert_eq!(done.status.code(), Some(0), "{}", String::from_utf8_lossy(&done.stderr));
+    let text = stdout(&done);
+    assert!(text.starts_with("receiver \"MON 1 video\" (7ecf0001) ← sender \"CAM 1 video\" (5e0d0001): done at 2026-09-27 12:00:00.000000000 UTC\n"), "{text}");
+
+    let refused = st2110(&args(&["--sender", "CAM 1 audio", "--format", "json"]));
+    assert_eq!(refused.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&refused.stdout).expect("JSON");
+    assert_eq!(json["connections"][0]["state"], "refused");
+    assert_eq!(
+        json["connections"][0]["problems"][0],
+        "it is a video Receiver, but sender \"CAM 1 audio\" (5e0d0002) sends audio"
+    );
+    assert_eq!(json["connections"][0]["request"]["transport_params"][1], serde_json::json!({"rtp_enabled": false}));
+
+    let cancelled = st2110(&args(&["--cancel"]));
+    assert_eq!(cancelled.status.code(), Some(0));
+    assert_eq!(
+        stdout(&cancelled),
+        "receiver \"MON 1 video\" (7ecf0001): cancelled the activation due at 2026-09-27 12:01:00.000000000 UTC\n"
+    );
+    std::fs::remove_file(snapshot).unwrap();
+}
+
 const PTP_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ptp/tests/fixtures");
 
 fn ptp_fixture(name: &str) -> String {

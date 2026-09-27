@@ -83,6 +83,10 @@ impl Registry {
             let id = sender["id"].as_str().unwrap().to_string();
             sender["manifest_href"] = json!(format!("http://127.0.0.1:{port}/sdp/{id}"));
         }
+        // The Devices' Connection APIs serve the same SDP files at /transportfile.
+        for device in value["devices"].as_array_mut().unwrap() {
+            device["controls"][0]["href"] = json!(format!("http://127.0.0.1:{port}/x-nmos/connection/v1.1/"));
+        }
         *facility.lock().unwrap() = value.clone();
         (Arc::new(Self { facility: value, requests }), port)
     }
@@ -93,7 +97,10 @@ impl Registry {
         if path == "/x-nmos/query/" {
             return (200, String::new(), json!(["v1.2/", "v1.3/", "v2.0/"]).to_string());
         }
-        if let Some(id) = path.strip_prefix("/sdp/") {
+        let transport_file = path
+            .strip_prefix("/x-nmos/connection/v1.1/single/senders/")
+            .and_then(|rest| rest.strip_suffix("/transportfile"));
+        if let Some(id) = path.strip_prefix("/sdp/").or(transport_file) {
             let sdp = facility["manifests"][id]["sdp"].as_str();
             return match sdp {
                 Some(sdp) if id == VIDEO_SENDER => (200, "Content-Type: application/sdp\r\n".into(), sdp.into()),
@@ -103,6 +110,13 @@ impl Registry {
         let Some(collection) = path.strip_prefix("/x-nmos/query/v1.3/").map(|c| c.trim_end_matches('/')) else {
             return (404, String::new(), String::new());
         };
+        if let Some((collection, id)) = collection.split_once('/') {
+            let items = facility[collection].as_array().cloned().unwrap_or_default();
+            return match items.into_iter().find(|item| item["id"] == id) {
+                Some(item) => (200, String::new(), item.to_string()),
+                None => (404, String::new(), json!({"code": 404, "error": "not found", "debug": null}).to_string()),
+            };
+        }
         let items = facility[collection].as_array().cloned().unwrap_or_default();
         let since = param("paging.since");
         if (collection == "devices" && since.is_some())
@@ -157,6 +171,13 @@ fn reads_a_registry() {
         registry.facility["manifests"][VIDEO_SENDER]["sdp"].as_str()
     );
     assert_eq!(snapshot.manifests[AUDIO_SENDER].status, Some(404));
+    // manifest_href names another URL, so /transportfile is fetched too.
+    assert_eq!(snapshot.transport_files[VIDEO_SENDER].sdp, snapshot.manifests[VIDEO_SENDER].sdp);
+    assert_eq!(
+        snapshot.transport_files[VIDEO_SENDER].url,
+        format!("http://127.0.0.1:{port}/x-nmos/connection/v1.1/single/senders/{VIDEO_SENDER}/transportfile")
+    );
+    assert_eq!(snapshot.transport_files[AUDIO_SENDER].status, Some(404));
 
     let requests = registry.requests();
     let asked = |text: &str| requests.iter().filter(|r| r.contains(text)).count();
@@ -181,6 +202,10 @@ fn reads_a_registry() {
     // The audio Sender is active, so its missing SDP file is a finding.
     let rules: Vec<&str> = check(&snapshot).findings.iter().map(|f| f.rule).collect();
     assert_eq!(rules, ["manifest-unreachable"]);
+
+    let receiver = client.resource(Kind::Receiver, "7ecf0001-0000-4000-8000-000000000001").unwrap();
+    assert_eq!(receiver.as_ref(), registry.facility["receivers"].get(0));
+    assert_eq!(client.resource(Kind::Receiver, "0badbeef-0000-4000-8000-000000000000").unwrap(), None);
 }
 
 #[test]

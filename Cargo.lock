@@ -604,10 +604,23 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "st2110-connect",
  "st2110-nmos",
  "st2110-pcap",
  "st2110-ptp",
  "st2110-sdp",
+]
+
+[[package]]
+name = "st2110-connect"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "st2110-nmos",
+ "st2110-ptp",
+ "st2110-sdp",
+ "ureq",
 ]
 
 [[package]]
@@ -651,6 +664,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "st2110-connect",
  "st2110-nmos",
  "st2110-pcap",
  "st2110-ptp",
