@@ -13,16 +13,21 @@ fn st2110(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_st2110")).args(args).env("NO_COLOR", "1").output().expect("runs")
 }
 
-fn with_stdin(args: &[&str], input: &str) -> Output {
+fn with_stdin_bytes(args: &[&str], input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_st2110"))
         .args(args)
+        .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("runs");
-    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("writes");
+    child.stdin.take().expect("stdin").write_all(input).expect("writes");
     child.wait_with_output().expect("finishes")
+}
+
+fn with_stdin(args: &[&str], input: &str) -> Output {
+    with_stdin_bytes(args, input.as_bytes())
 }
 
 fn stdout(output: &Output) -> String {
@@ -113,6 +118,15 @@ fn rules_lists_and_explains() {
         serde_json::from_slice(&st2110(&["rules", "--format", "json", "ssn"]).stdout).unwrap();
     assert_eq!(json[0]["severity"], "error");
     assert_eq!(st2110(&["rules", "no-such-rule"]).status.code(), Some(2));
+    let ptp = stdout(&st2110(&["rules", "sm-jam-time"]));
+    assert!(ptp.starts_with("sm-jam-time error (ST 2059-2:2021 Annex A)"), "{ptp}");
+    // No identifier is in two catalogues.
+    let every: serde_json::Value = serde_json::from_slice(&st2110(&["rules", "--format", "json"]).stdout).unwrap();
+    let mut ids: Vec<&str> = every.as_array().unwrap().iter().map(|rule| rule["id"].as_str().unwrap()).collect();
+    let count = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), count);
 }
 
 const FACILITY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../nmos/tests/fixtures/facility.json");
@@ -211,4 +225,114 @@ fn nmos_unreachable_registry_exits_two() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&format!("http://127.0.0.1:{port}/x-nmos/query/")), "{stderr}");
     assert_eq!(st2110(&["nmos", "--timeout", "0", "http://127.0.0.1:1"]).status.code(), Some(2));
+}
+
+const PTP_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ptp/tests/fixtures");
+
+fn ptp_fixture(name: &str) -> String {
+    format!("{PTP_FIXTURES}/{name}")
+}
+
+#[test]
+fn ptp_describes_clean_messages() {
+    let output = st2110(&["ptp", &ptp_fixture("grandmaster.hex")]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    for line in [
+        "grandmaster.hex:3: Announce from 08-00-11-FF-FE-21-E1-B0 port 1, domain 127, sequence 1, one a second",
+        "  UTC offset 37 s (valid); PTP timescale, UTC offset valid, time traceable, frequency traceable",
+        "  precise origin 1790510438.123457021, correction 1.500 ns",
+        "  synchronization metadata: 30000/1001 fps drop-frame, externally locked, local offset 3563 s, \
+         next jam 2026-09-28 00:00:00 Local Time, jump of -3600 s at 2026-10-25 02:00:00 Local Time",
+        "grandmaster.hex: 5 messages, no problems found",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+#[test]
+fn ptp_reports_problems_and_undecodable_lines() {
+    let output = st2110(&["ptp", "--quiet", &ptp_fixture("misconfigured.hex")]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(!text.contains("Announce from"), "{text}");
+    for line in [
+        "misconfigured.hex:3: warning[gm-clock-class]: grandmaster 08-00-11-FF-FE-21-E1-B0 has clockClass 248",
+        "misconfigured.hex:5: error[sync-interval]: logMessageInterval is 0 (one a second), outside −7 to −1",
+        "misconfigured.hex:7: error[sm-jam-time]: timeOfNextJam 1790550337 is 2026-09-28 00:05:00 Local Time",
+        "misconfigured.hex:9: error: 40 octets, but the message needs 44",
+        "misconfigured.hex:11: error: 'n' is not a hex digit",
+        "misconfigured.hex: 5 messages, 4 errors, 2 warnings, 0 notes",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+#[test]
+fn ptp_reads_binary_and_writes_json() {
+    let hex = std::fs::read_to_string(ptp_fixture("grandmaster.hex")).unwrap();
+    let management = hex.lines().filter(|line| !line.starts_with('#')).nth(4).unwrap();
+    let bytes: Vec<u8> =
+        (0..management.len()).step_by(2).map(|i| u8::from_str_radix(&management[i..i + 2], 16).unwrap()).collect();
+    let output = with_stdin_bytes(&["ptp", "--format", "json", "-"], &bytes);
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let entry = &json[0]["messages"][0];
+    assert!(entry.get("line").is_none(), "{entry}");
+    assert_eq!(entry["message"]["body"]["type"], "management");
+    assert_eq!(entry["message"]["body"]["action"], "COMMAND");
+    let content = &entry["message"]["tlvs"][0]["content"];
+    assert_eq!(content["kind"], "sync_metadata");
+    assert_eq!(content["locking_status"], "externally locked");
+    assert_eq!(content["current_local_offset"], 3563);
+    assert_eq!(entry["findings"], serde_json::json!([]));
+}
+
+#[test]
+fn ptp_warnings_fail_only_when_denied() {
+    let hex = std::fs::read_to_string(ptp_fixture("misconfigured.hex")).unwrap();
+    let announce = hex.lines().nth(2).unwrap();
+    assert_eq!(with_stdin(&["ptp", "-"], announce).status.code(), Some(0));
+    assert_eq!(with_stdin(&["ptp", "--deny-warnings", "-"], announce).status.code(), Some(1));
+    assert_eq!(st2110(&["ptp", "no-such-file.hex"]).status.code(), Some(2));
+}
+
+#[test]
+fn time_at_an_instant() {
+    let args = ["time", "--at", "2026-09-27T12:00:00.123456789Z", "--local-offset", "3563"];
+    let output = st2110(&[&args[..], &["--video", "59.94", "--audio", "48000"]].concat());
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    for line in [
+        "PTP time    1790510437.123456789",
+        "Local Time  2026-09-27 13:00:00.123456789 (offset 3563 s)",
+        "video 60000/1001 (59.94 fps)",
+        "  began       1790510437.115400000, RTP 3061361762 at 90 kHz",
+        "  next        1790510437.132083334, RTP 3061363263",
+        "  time code   13:00:00;04 (30000/1001 fps drop-frame, from the jam at 2026-09-27 00:00:00 Local Time)",
+        "  RTP         2205388965 for a sample taken now",
+        "  next block  1790510437.124000000",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+#[test]
+fn time_defaults_json_and_errors() {
+    let output = st2110(&["time", "--at", "1790510437.123456789", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["local"], "2026-09-27 12:00:00.123456789");
+    let rates: Vec<&str> = json["video"].as_array().unwrap().iter().map(|v| v["rate"].as_str().unwrap()).collect();
+    assert_eq!(rates, ["50", "60000/1001"]);
+    assert_eq!(json["video"][1]["timecode"]["address"], "12:00:00;04");
+    assert_eq!(json["audio"][0]["rate"], 48000);
+    let non_drop = st2110(&["time", "--at", "1790510437.123456789", "--video", "29.97", "--non-drop"]);
+    assert!(stdout(&non_drop).contains("11:59:16:28 (30000/1001 fps, from the jam"), "{}", stdout(&non_drop));
+    // The system clock when no time is given.
+    assert_eq!(st2110(&["time"]).status.code(), Some(0));
+    let bad = st2110(&["time", "--at", "noon"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("--at noon: not a PTP time"));
+    assert_eq!(st2110(&["time", "--video", "fast"]).status.code(), Some(2));
+    assert_eq!(st2110(&["time", "--at", "1790510437", "--jam", "1790510438"]).status.code(), Some(2));
 }

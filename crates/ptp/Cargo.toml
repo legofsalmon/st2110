@@ -1,0 +1,18 @@
+[package]
+name = "st2110-ptp"
+description = "PTP message decoding against SMPTE ST 2059-2, and ST 2059-1 timing arithmetic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+serde = ["dep:serde", "st2110-sdp/serde"]
+
+[dependencies]
+st2110-sdp.workspace = true
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

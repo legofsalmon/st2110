@@ -1,11 +1,14 @@
 # st2110
 
-Tools for SMPTE ST 2110 media over IP, written in Rust. There are two so far:
+Tools for SMPTE ST 2110 media over IP, written in Rust. There are three so far:
 
 - an SDP linter, which reads the session description a sender publishes, describes
   each stream in it and checks it against ST 2110 and the documents it builds on;
 - an NMOS registry checker, which reads a facility's IS-04 registry and checks its
-  resources, PTP clocks and connections, and every Sender's SDP file.
+  resources, PTP clocks and connections, and every Sender's SDP file;
+- PTP tools, which decode IEEE 1588 messages and check them against the ST 2059-2
+  profile, and work out from PTP time where frames, RTP timestamps and time code fall
+  by ST 2059-1.
 
 Every finding cites the clause behind it.
 
@@ -13,7 +16,8 @@ Every finding cites the clause behind it.
 |---|---|
 | [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
 | [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching and the registry checker's 20 rules. The Query API client is the optional `client` feature. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint` and `st2110 nmos`. |
+| [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 18 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 ptp` and `st2110 time`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -73,6 +77,57 @@ registry: 1 error, 3 warnings, 0 notes
 
 It only reads. It does not browse DNS-SD for the registry, so give it the URL, and it does not yet send IS-10 access tokens.
 
+## Decode PTP messages
+
+```console
+$ tshark -r studio.pcap -Y "ptp && udp" -T fields -e udp.payload > gm.hex
+$ st2110 ptp gm.hex
+gm.hex:1: Announce from 08-00-11-FF-FE-21-E1-B0 port 1, domain 127, sequence 2, one a second
+  grandmaster 08-00-11-FF-FE-21-E1-B0: priority 128/128, class 248 (free-running: the default class), accuracy unknown (FEh), variance 4E5Dh, 0 steps removed, GNSS (20h)
+  UTC offset 37 s (valid); PTP timescale, UTC offset valid
+gm.hex:1: warning[clock-accuracy]: the grandmaster's clockAccuracy is Unknown (FEh) (ST 2059-2:2021 §6.5.4)
+gm.hex:1: warning[gm-clock-class]: grandmaster 08-00-11-FF-FE-21-E1-B0 has clockClass 248: free-running: the default class (IEEE 1588-2008 §7.6.2.4)
+gm.hex:2: Sync from 08-00-11-FF-FE-21-E1-B0 port 1, domain 127, sequence 9, one a second
+  origin 1790510439.000000000; two-step
+gm.hex:2: error[sync-interval]: logMessageInterval is 0 (one a second), outside −7 to −1 (ST 2059-2:2021 §6.5.2)
+gm.hex:3: Management from 08-00-11-FF-FE-21-E1-B0 port 1, domain 127, sequence 2
+  COMMAND to FF-FF-FF-FF-FF-FF-FF-FF port 65535, boundary hops 0 of 0
+  synchronization metadata: 30000/1001 fps drop-frame, externally locked, local offset 3563 s, next jam 2026-09-28 00:05:00 Local Time, jump of -3600 s at 2026-10-25 02:00:00 Local Time
+gm.hex:3: error[sm-jam-time]: timeOfNextJam 1790550337 is 2026-09-28 00:05:00 Local Time, not a whole number of 10 minutes (ST 2059-2:2021 Annex A)
+gm.hex: 3 messages, 2 errors, 2 warnings, 0 notes
+```
+
+- `st2110 ptp FILE...` reads one message per line in hex, with or without colons between octets, or a file that holds one message in binary. `#` starts a comment, and `-` reads standard input.
+- It decodes every IEEE 1588-2008 and -2019 message type, and the TLVs after them: the ST 2059-2 synchronization metadata, path traces, and the organization and management TLVs by name.
+- It checks each message on its own: the domain and message rates the profile allows, the grandmaster's quality and time source, and the synchronization metadata's frame rate, jam times and time jumps. Checks across messages, such as whether every Announce names the same grandmaster, wait for the pcap analyser.
+- `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`. A line that is not a message counts as an error.
+
+## Work out ST 2059-1 timing
+
+```console
+$ st2110 time --at 2026-09-27T12:00:00.123456789Z --local-offset 3563 --video 59.94 --audio 48000
+PTP time    1790510437.123456789
+UTC         2026-09-27 12:00:00.123456789 (TAI − UTC 37 s)
+Local Time  2026-09-27 13:00:00.123456789 (offset 3563 s)
+
+video 60000/1001 (59.94 fps)
+  frame       107323302924 since the SMPTE Epoch
+  began       1790510437.115400000, RTP 3061361762 at 90 kHz
+  next        1790510437.132083334, RTP 3061363263
+  time code   13:00:00;04 (30000/1001 fps drop-frame, from the jam at 2026-09-27 00:00:00 Local Time)
+
+audio 48000 Hz
+  RTP         2205388965 for a sample taken now
+  AES3 block  447627609280 of 192 samples, began 1790510437.120000000
+  next block  1790510437.124000000
+```
+
+- `--at` takes PTP time in seconds (or IS-04's `seconds:nanoseconds`) or a UTC time. Without it, `st2110 time` uses the system clock.
+- `--video` and `--audio` take each rate to work out, as often as needed. Without either, it shows 50 and 59.94 fps video and 48 kHz audio.
+- `--local-offset` is a grandmaster's `currentLocalOffset`: seconds from PTP time to Local Time, such as 3563 for British Summer Time. Local Time is UTC when it is not given.
+- `--jam` sets the last daily jam, which is otherwise the last Local Time midnight. `--non-drop` counts 29.97 time code without dropping frames, and `--tai-utc` changes TAI − UTC from 37 s.
+- The arithmetic is exact: PTP time is kept in integer nanoseconds and rates as ratios, so 1000/1001 rates land on the right nanosecond and RTP timestamps step 1501 and 1502 at 59.94 fps.
+
 Severities follow the standards' own words. An **error** breaks a "shall" (or an RFC or NMOS "MUST"), so equipment may reject or misread what it describes. A **warning** breaks a "should" or is a known interoperability hazard. An **info** note needs no action on its own.
 
 ## What it checks
@@ -107,6 +162,17 @@ It reads SDP only. It never looks at packets, so it cannot confirm that a sender
 
 It reads resources registered at any IS-04 version from v1.0 to v1.3, and reports an attribute as missing only when every version that could have registered the resource requires it.
 
+### PTP messages
+
+| Area | Checks |
+|---|---|
+| ST 2059-2 attributes | `domainNumber`, and the Announce, Sync and Delay_Req rates the profile allows |
+| Grandmaster | `clockAccuracy` not Unknown, a defined `timeSource`, `clockClass` locked rather than in holdover or free-running, a valid `currentUtcOffset` of at least 37 s, and a note for an arbitrary timescale |
+| Synchronization metadata | Carried in a Management COMMAND to all ports, a `lengthField` of 48, the frame rate, locking status and reserved bits, jams on a whole 10 minutes of Local Time, jumps with both a size and a time, and time-zone offsets in range |
+| TLVs | Even lengths that end within the message |
+
+It follows ST 2059-1:2021 and ST 2059-2:2021, with IEEE 1588-2008 and -2019.
+
 ## Use the library
 
 ```rust
@@ -136,6 +202,29 @@ for f in &report.findings {
 
 `report.senders` and `report.receivers` list the connections as a controller would show them, with the streams from each Sender's SDP file.
 
+For PTP, decode and check a message, or do the ST 2059-1 arithmetic directly:
+
+```rust
+use st2110_ptp::epoch::{self, Signal};
+use st2110_ptp::PtpTime;
+use st2110_sdp::Rational;
+
+let message = st2110_ptp::decode(&udp_payload)?;
+for line in st2110_ptp::describe::summary(&message) {
+    println!("{line}");
+}
+for f in st2110_ptp::check(&message) {
+    println!("{} {}: {}", f.severity, f.rule, f.message);
+}
+
+let now = PtpTime::parse("1790510437.123456789").unwrap();
+let rate = Rational::new(60000, 1001).unwrap();
+let (frame, at) = epoch::next_alignment(now, Signal::Video(rate)).unwrap();
+println!("frame {frame} starts at {at}, RTP {:?}", epoch::frame_rtp_timestamp(frame, rate, 90_000));
+```
+
+`st2110_ptp::timing::at` gathers everything `st2110 time` prints, and `timecode::timecode_at` gives the time code for any rate and daily jam.
+
 ## Use it from JavaScript
 
 ```console
@@ -144,10 +233,10 @@ $ cargo build -p st2110-wasm --target wasm32-unknown-unknown --release
 $ wasm-bindgen --target web --out-dir crates/wasm/pkg target/wasm32-unknown-unknown/release/st2110_wasm.wasm
 ```
 
-`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)` and `rules()`, and ships TypeScript types for what they return:
+`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)`, `decodePtp(bytes)`, `timing(options)` and `rules()`, and ships TypeScript types for what they return:
 
 ```js
-import init, { lint, checkRegistry } from "./pkg/st2110_wasm.js";
+import init, { lint, checkRegistry, decodePtp, timing } from "./pkg/st2110_wasm.js";
 
 await init();
 const report = lint(sdpText);
@@ -155,9 +244,15 @@ for (const d of report.diagnostics) console.log(d.line, d.severity, d.rule, d.me
 
 const registry = checkRegistry(snapshot);
 for (const f of registry.findings) console.log(f.resource?.label, f.severity, f.rule, f.message);
+
+const ptp = decodePtp(udpPayload);
+for (const f of ptp.findings) console.log(f.severity, f.rule, f.message);
+
+const now = timing({ video: ["60000/1001"], audio: [48000], localOffset: 3563 });
+console.log(now.video[0].next_frame, now.video[0].next_rtp, now.video[0].timecode?.address);
 ```
 
-`checkRegistry` takes a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself.
+`checkRegistry` takes a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself. `decodePtp` takes a `Uint8Array` and throws when it is not a PTP message. `timing` takes the options `st2110 time` does, with `at` as PTP time or a UTC time such as `new Date().toISOString()` gives; without `at` it uses the page's clock.
 
 ## Development
 
@@ -167,7 +262,7 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo test --workspace
 ```
 
-To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
+To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A PTP rule goes in `crates/ptp/src/rules.rs`, is raised from `crates/ptp/src/check.rs`, and needs a case in `crates/ptp/tests/decode.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
 
 ```console
 $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
@@ -175,4 +270,4 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 ## Roadmap
 
-These are the first two steps of the plan in the September 2026 standards review: the SDP model and linter, then the read-only NMOS client. Next come PTP decoders with ST 2059-1 arithmetic, an RP 2110-25 pcap analyser, an IS-05 controller, and senders and receivers on Intel MTL.
+These are the first three steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, and PTP decoders with ST 2059-1 arithmetic. Next come an RP 2110-25 pcap analyser, which will also follow PTP across a capture, an IS-05 controller, and senders and receivers on Intel MTL.

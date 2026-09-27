@@ -1,6 +1,6 @@
 [package]
 name = "st2110-cli"
-description = "Command-line checks for SMPTE ST 2110 SDP files and NMOS registries"
+description = "Command-line checks for SMPTE ST 2110 SDP files, NMOS registries and PTP messages"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
 st2110-nmos = { workspace = true, features = ["client"] }
+st2110-ptp = { workspace = true, features = ["serde"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
