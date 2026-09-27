@@ -23,6 +23,7 @@ use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::check::is_http;
+use crate::routing::transport_file_urls;
 use crate::{Kind, Manifest, Snapshot};
 
 /// The IS-04 versions this client reads, oldest first.
@@ -168,8 +169,15 @@ impl QueryClient {
     }
 
     fn get(&self, url: &str, accept: &str, limit: u64) -> Result<Response, Error> {
-        let mut response =
-            self.agent.get(url).header("Accept", accept).call().map_err(|e| error(url, e.to_string()))?;
+        // Transport files change when a Sender is reconfigured, so none may come from a
+        // cache (IS-05 v1.2 Behaviour: Transport Files & Caching).
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Accept", accept)
+            .header("Cache-Control", "no-cache")
+            .call()
+            .map_err(|e| error(url, e.to_string()))?;
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let paged = header("X-Paging-Limit").is_some();
         let since = header("X-Paging-Since");
@@ -256,6 +264,30 @@ impl QueryClient {
         Err(error(&collection, "the registry's paging cursors never reached the end of the collection"))
     }
 
+    /// Reads one resource by its `id`, or `None` when the registry does not hold it.
+    /// A resource registered at an older IS-04 version is read too, where the registry
+    /// supports downgrade queries; without one, IS-04 answers 409 for it.
+    pub fn resource(&self, kind: Kind, id: &str) -> Result<Option<Value>, Error> {
+        let plain = format!("{}{}/{id}", self.base, kind.plural());
+        let mut url = plain.clone();
+        if self.version != "v1.0" {
+            url.push_str("?query.downgrade=v1.0");
+        }
+        let mut response = self.get(&url, "application/json", BODY_LIMIT)?;
+        // A registry without downgrade queries answers 501, or 400.
+        if url != plain && matches!(response.status, 400 | 501) {
+            url = plain;
+            response = self.get(&url, "application/json", BODY_LIMIT)?;
+        }
+        match response.status {
+            200 => serde_json::from_str(&response.body)
+                .map(Some)
+                .map_err(|e| error(&url, format!("expected a JSON {}: {e}", kind.as_str()))),
+            404 => Ok(None),
+            status => Err(error(&url, format!("HTTP {status}"))),
+        }
+    }
+
     /// Fetches a transport file. Failures are recorded in the result, not returned.
     pub fn manifest(&self, href: &str) -> Manifest {
         match self.get(href, "application/sdp, text/plain;q=0.9, */*;q=0.8", SDP_LIMIT) {
@@ -268,7 +300,8 @@ impl QueryClient {
     }
 
     /// Reads every resource and, unless [`Options::fetch_sdp`] is off, each RTP
-    /// Sender's SDP file.
+    /// Sender's SDP file: from its `manifest_href`, and from its Connection API's
+    /// `/transportfile` too where that is another URL.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         let mut snapshot = Snapshot {
             source: Some(self.base.clone()),
@@ -282,14 +315,20 @@ impl QueryClient {
             ..Snapshot::default()
         };
         if self.options.fetch_sdp {
-            snapshot.manifests = self.manifests(&snapshot.senders).into_iter().collect();
+            let manifests = Self::manifest_urls(&snapshot.senders);
+            let transport_files = transport_file_urls(&snapshot);
+            let urls: Vec<&str> = manifests.iter().chain(&transport_files).map(|(_, url)| url.as_str()).collect();
+            let mut fetched = self.fetch(&urls).into_iter();
+            let split = manifests.len();
+            snapshot.manifests = manifests.into_iter().map(|(id, _)| id).zip(fetched.by_ref().take(split)).collect();
+            snapshot.transport_files = transport_files.into_iter().map(|(id, _)| id).zip(fetched).collect();
         }
         Ok(snapshot)
     }
 
-    /// Fetches the SDP file of every RTP Sender with an HTTP(S) `manifest_href`, several at once.
-    fn manifests(&self, senders: &[Value]) -> Vec<(String, Manifest)> {
-        let wanted: Vec<(String, String)> = senders
+    /// Each RTP Sender with an HTTP(S) `manifest_href`, and that URL.
+    fn manifest_urls(senders: &[Value]) -> Vec<(String, String)> {
+        senders
             .iter()
             .filter(|s| {
                 s.get("transport").and_then(Value::as_str).is_some_and(|t| t.starts_with("urn:x-nmos:transport:rtp"))
@@ -299,19 +338,27 @@ impl QueryClient {
                 let href = s.get("manifest_href")?.as_str()?;
                 is_http(href).then(|| (id.to_string(), href.to_string()))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Fetches transport files, several at once, in the order of `urls`.
+    fn fetch(&self, urls: &[&str]) -> Vec<Manifest> {
         let next = AtomicUsize::new(0);
-        let fetched = Mutex::new(Vec::with_capacity(wanted.len()));
+        let fetched = Mutex::new(Vec::with_capacity(urls.len()));
         std::thread::scope(|scope| {
-            for _ in 0..self.options.parallel.clamp(1, wanted.len().max(1)) {
+            for _ in 0..self.options.parallel.clamp(1, urls.len().max(1)) {
                 scope.spawn(|| {
-                    while let Some((id, href)) = wanted.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let manifest = self.manifest(href);
-                        fetched.lock().expect("no fetch panics while holding the lock").push((id.clone(), manifest));
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(url) = urls.get(i) else { break };
+                        let manifest = self.manifest(url);
+                        fetched.lock().expect("no fetch panics while holding the lock").push((i, manifest));
                     }
                 });
             }
         });
-        fetched.into_inner().expect("no fetch panics while holding the lock")
+        let mut fetched = fetched.into_inner().expect("no fetch panics while holding the lock");
+        fetched.sort_unstable_by_key(|(i, _)| *i);
+        fetched.into_iter().map(|(_, manifest)| manifest).collect()
     }
 }

@@ -14,6 +14,10 @@
 //!   [`st2110_sdp::lint`]), or that disagree with the Flow, Source and Sender they
 //!   describe.
 //!
+//! [`routing`] reads what a controller needs to make connections: the Sender or
+//! Receiver a name refers to, its Device's IS-05 Connection API, and the crosspoint
+//! matrix of which Senders each Receiver can take.
+//!
 //! The `client` feature adds [`client::QueryClient`], which reads a snapshot from a
 //! live registry.
 //!
@@ -45,6 +49,7 @@ mod check;
 pub mod client;
 mod model;
 mod report;
+pub mod routing;
 pub mod rules;
 mod snapshot;
 

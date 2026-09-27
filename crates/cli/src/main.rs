@@ -1,6 +1,8 @@
 //! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet
-//! captures from the command line, and work out ST 2059-1 timing.
+//! captures from the command line, connect Receivers to Senders through IS-05, and work
+//! out ST 2059-1 timing.
 
+mod connect;
 mod nmos;
 mod pcap;
 mod ptp;
@@ -10,6 +12,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -19,7 +22,7 @@ use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 #[command(
     name = "st2110",
     version,
-    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards"
+    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards, and connect Receivers to Senders"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -73,6 +76,85 @@ enum Command {
         /// Do not fetch the Senders' SDP files.
         #[arg(long)]
         no_sdp: bool,
+    },
+    /// Connect Receivers to Senders through IS-05, or list which Senders each Receiver
+    /// can take.
+    ///
+    /// TARGET is a registry's Query API URL, or a snapshot saved with `st2110 nmos
+    /// --save`. Name a Receiver with --receiver and what it is to take with --sender,
+    /// --sdp or --disconnect, or give several connections to make together with --salvo.
+    /// Without them, lists which Senders each Receiver can take (or the one --receiver
+    /// names), by transport, format and capabilities. --cancel cancels an activation
+    /// scheduled on a Receiver.
+    ///
+    /// Each connection is checked against the Receiver's constraints and capabilities
+    /// before anything is sent, and on its /active endpoint and in the registry after.
+    /// Several are made as a salvo that switches at one PTP time, --lead from now, and is
+    /// rolled back when a Connection API rejects its part. Exits with 0 when every
+    /// connection was made, scheduled or (with --dry-run) planned, 1 when one was
+    /// refused, failed or differs, and 2 when the registry or a file cannot be read or a
+    /// name finds no Sender or Receiver, or more than one.
+    Connect {
+        /// Query API URL, such as http://registry.example:8080, or a saved snapshot.
+        target: String,
+        /// The Receiver: its id, its label, or the start of its id.
+        #[arg(long, value_name = "RECEIVER", conflicts_with = "salvo")]
+        receiver: Option<String>,
+        /// The Sender whose stream it is to take: its id, its label, or the start of its id.
+        #[arg(long, value_name = "SENDER", group = "take", requires = "receiver")]
+        sender: Option<String>,
+        /// An SDP file of the stream it is to take, such as one from outside NMOS; `-`
+        /// reads standard input.
+        #[arg(long, value_name = "FILE", group = "take", requires = "receiver")]
+        sdp: Option<PathBuf>,
+        /// Disconnect it.
+        #[arg(long, group = "take", requires = "receiver")]
+        disconnect: bool,
+        /// Cancel the activation scheduled on it.
+        #[arg(long, group = "take", requires = "receiver", conflicts_with_all = ["at", "after", "dry_run"])]
+        cancel: bool,
+        /// A JSON file of connections to make together, such as
+        /// [{"receiver": "MON 1", "sender": "CAM 2"}, {"receiver": "MON 2", "sdp":
+        /// "feed.sdp"}, {"receiver": "MON 3", "disconnect": true}].
+        #[arg(long, value_name = "FILE", conflicts_with = "take")]
+        salvo: Option<PathBuf>,
+        /// When they take effect: now, a PTP time such as 1790510437:0, or a UTC time such
+        /// as 2026-09-27T12:00:00Z. Now for one connection when omitted, and --lead from
+        /// now for several.
+        #[arg(long, value_name = "TIME", conflicts_with = "after")]
+        at: Option<String>,
+        /// Seconds after each Connection API has the request that they take effect.
+        #[arg(long = "in", value_name = "SECONDS")]
+        after: Option<f64>,
+        /// Seconds ahead to schedule several connections, for every Connection API to
+        /// have its request in time.
+        #[arg(long, value_name = "SECONDS", default_value_t = 2.0)]
+        lead: f64,
+        /// Plan and check the connections, and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Send connections the checks found problems with; the Receiver may refuse them.
+        #[arg(long)]
+        force: bool,
+        /// Seconds to wait for each response.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        timeout: f64,
+        /// Seconds to wait for a Receiver's /active endpoint, and then the registry, to
+        /// show a connection; one scheduled further ahead is not waited for.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        wait: f64,
+        /// TAI − UTC in seconds.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = st2110_ptp::TAI_UTC_2017,
+            allow_negative_numbers = true,
+            value_parser = offset()
+        )]
+        tai_utc: i32,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
     /// Decode PTP messages and check them against the ST 2059-2 profile.
     ///
@@ -236,6 +318,43 @@ fn main() -> ExitCode {
         Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp } => {
             let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp };
             nmos::run(&target, &fetch, format, quiet, deny_warnings)
+        }
+        Command::Connect {
+            target,
+            receiver,
+            sender,
+            sdp,
+            disconnect,
+            cancel,
+            salvo,
+            at,
+            after,
+            lead,
+            dry_run,
+            force,
+            timeout,
+            wait,
+            tai_utc,
+            format,
+        } => {
+            let args = connect::Args {
+                target,
+                receiver,
+                sender,
+                sdp,
+                disconnect,
+                cancel,
+                salvo,
+                at,
+                after,
+                lead,
+                dry_run,
+                force,
+                timeout,
+                wait,
+                tai_utc,
+            };
+            connect::run(&args, format)
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
         Command::Pcap { files, sdp, timescale, tai_utc, format, quiet, deny_warnings } => {
@@ -411,6 +530,14 @@ fn write_diagnostic(out: &mut impl Write, file: &str, d: &Diagnostic, style: Sty
         None => file.to_string(),
     };
     writeln!(out, "{location}: {}[{}]: {} ({})", style.severity(d.severity), d.rule, d.message, d.reference)
+}
+
+/// A number of seconds given for `option`: a timeout, a wait or a lead, up to a day.
+pub(crate) fn seconds(option: &str, value: f64) -> Result<Duration, String> {
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .filter(|duration| duration.as_secs() < 86_400)
+        .ok_or_else(|| format!("{option} {value} is not a number of seconds from 0 to a day"))
 }
 
 pub(crate) fn plural(count: usize, noun: &str) -> String {

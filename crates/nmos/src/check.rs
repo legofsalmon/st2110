@@ -59,12 +59,12 @@ pub fn check(snapshot: &Snapshot) -> Report {
 }
 
 /// Names a resource in a message about another one.
-fn name(core: &Core<'_>) -> String {
+pub(crate) fn name(core: &Core<'_>) -> String {
     ResourceRef::of(core).describe()
 }
 
 /// Lists names for a message: `eth0, eth1`, or `none`. Past ten, says how many more.
-fn list<'s>(items: impl IntoIterator<Item = &'s str>) -> String {
+pub(crate) fn list<'s>(items: impl IntoIterator<Item = &'s str>) -> String {
     let mut items = items.into_iter();
     let shown: Vec<&str> = items.by_ref().take(10).collect();
     match (shown.is_empty(), items.count()) {
@@ -284,7 +284,7 @@ fn ptp(model: &Model<'_>, findings: &mut Findings) -> (Vec<Grandmaster>, usize) 
     (grandmasters, unlocked)
 }
 
-fn is_rtp(sender: &Sender<'_>) -> bool {
+pub(crate) fn is_rtp(sender: &Sender<'_>) -> bool {
     sender.transport.is_some_and(|t| t == "urn:x-nmos:transport:rtp" || t.starts_with("urn:x-nmos:transport:rtp."))
 }
 
@@ -346,6 +346,12 @@ fn transport_file(model: &Model<'_>, snapshot: &Snapshot, sender: &Sender<'_>, f
         );
     }
     transport_address(sender, streams, f);
+    if let Some(file) = core.id.and_then(|id| snapshot.transport_files.get(id))
+        && let Some(text) = file.sdp.as_deref().filter(|t| !t.trim().is_empty())
+        && let Some(difference) = difference(streams, &st2110_sdp::lint(text).streams, &file.url)
+    {
+        f.add(&MANIFEST_TRANSPORTFILE, core, difference);
+    }
     if let Some(stream) = streams.first() {
         let (flow, source) = model.flow_of(sender);
         if let Some(flow) = flow {
@@ -357,6 +363,67 @@ fn transport_file(model: &Model<'_>, snapshot: &Snapshot, sender: &Sender<'_>, f
         }
     }
     Some(sdp)
+}
+
+/// Compares two addresses as IP addresses when both are, and as text otherwise.
+fn same_address(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a.eq_ignore_ascii_case(b),
+        },
+        (a, b) => a == b,
+    }
+}
+
+/// How the streams in the SDP file from `manifest_href` differ from those in the one
+/// the Connection API serves at `url`: in where they go, where they come from, or what
+/// they carry. `None` when a Receiver would read both alike.
+fn difference(manifest: &[Stream], transport_file: &[Stream], url: &str) -> Option<String> {
+    const HERE: &str = "the SDP file at manifest_href";
+    let there = format!("the one at {url}");
+    if manifest.len() != transport_file.len() {
+        return Some(format!(
+            "{HERE} has {}, but {there} has {}",
+            count(manifest.len(), "stream"),
+            count(transport_file.len(), "stream")
+        ));
+    }
+    for (a, b) in manifest.iter().zip(transport_file) {
+        let i = a.index;
+        let to = |s: &Stream| match (&s.destination, s.port) {
+            (Some(address), Some(port)) => format!("{address}:{port}"),
+            (Some(address), None) => address.clone(),
+            (None, _) => "no address".into(),
+        };
+        if !same_address(a.destination.as_deref(), b.destination.as_deref()) || a.port != b.port {
+            return Some(format!("stream {i} goes to {} in {HERE}, but to {} in {there}", to(a), to(b)));
+        }
+        if !same_address(a.source.as_deref(), b.source.as_deref()) {
+            let from = |s: &Stream| s.source.clone().unwrap_or_else(|| "any source".into());
+            return Some(format!("stream {i} comes from {} in {HERE}, but from {} in {there}", from(a), from(b)));
+        }
+        if a.payload_type != b.payload_type {
+            let pt = |s: &Stream| s.payload_type.map_or_else(|| "none".into(), |pt| pt.to_string());
+            return Some(format!("stream {i} has payload type {} in {HERE}, but {} in {there}", pt(a), pt(b)));
+        }
+        if a.summary != b.summary {
+            return Some(format!("stream {i} is {} in {HERE}, but {} in {there}", a.summary, b.summary));
+        }
+        let params = |s: &Stream| -> BTreeMap<String, Option<String>> {
+            s.parameters.iter().map(|p| (p.name.to_ascii_lowercase(), p.value.clone())).collect()
+        };
+        let (pa, pb) = (params(a), params(b));
+        if let Some(name) = pa.keys().chain(pb.keys()).find(|name| pa.get(*name) != pb.get(*name)) {
+            let show = |p: &BTreeMap<String, Option<String>>| match p.get(name) {
+                None => format!("no {name}"),
+                Some(None) => name.clone(),
+                Some(Some(value)) => format!("{name}={value}"),
+            };
+            return Some(format!("stream {i} has {} in {HERE}, but {} in {there}", show(&pa), show(&pb)));
+        }
+    }
+    None
 }
 
 pub(crate) fn is_http(href: &str) -> bool {
@@ -649,7 +716,7 @@ fn connections(model: &Model<'_>, sdps: &[Option<Sdp>], findings: &mut Findings)
 }
 
 /// Why a Receiver's capabilities reject the stream a Sender sends.
-fn compatibility(receiver: &Receiver<'_>, stream: &StreamFacts<'_, '_>, sender: &str) -> Option<String> {
+pub(crate) fn compatibility(receiver: &Receiver<'_>, stream: &StreamFacts<'_, '_>, sender: &str) -> Option<String> {
     let format = stream.flow.format.or_else(|| stream.source?.format);
     if let (Some(wanted), Some(format)) = (receiver.format, format)
         && wanted != format

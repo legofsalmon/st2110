@@ -278,6 +278,16 @@ pub(crate) struct Node<'a> {
 pub(crate) struct Device<'a> {
     pub core: Core<'a>,
     pub node_id: Option<&'a str>,
+    /// Control endpoints, such as an IS-05 Connection API; `None` before IS-04 v1.1.
+    pub controls: Option<Vec<Control<'a>>>,
+}
+
+/// A control endpoint a Device advertises, such as its IS-05 Connection API.
+#[derive(Debug)]
+pub(crate) struct Control<'a> {
+    /// A URN such as `urn:x-nmos:control:sr-ctrl/v1.1`.
+    pub kind: &'a str,
+    pub href: &'a str,
 }
 
 #[derive(Debug)]
@@ -429,8 +439,12 @@ impl<'a> Model<'a> {
             let core = Core::read(Kind::Device, index, &mut f);
             f.required_str("type");
             let node_id = f.required_str("node_id");
+            let controls = f.objects("controls", |c| Control {
+                kind: c.required_str("type").unwrap_or_default(),
+                href: c.required_str("href").unwrap_or_default(),
+            });
             model.add_problems(Kind::Device, index, f);
-            model.devices.push(Device { core, node_id });
+            model.devices.push(Device { core, node_id, controls });
         }
         for (index, value) in snapshot.sources.iter().enumerate() {
             let mut f = Fields::new(value);

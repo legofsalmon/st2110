@@ -4,7 +4,17 @@
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
-const { lint, rules, checkRegistry, decodePtp, timing, analyseCapture } = require("../pkg/st2110_wasm.js");
+const {
+  lint,
+  rules,
+  checkRegistry,
+  routingMatrix,
+  planConnection,
+  verifyConnection,
+  decodePtp,
+  timing,
+  analyseCapture,
+} = require("../pkg/st2110_wasm.js");
 
 const fixture = (name) => readFileSync(path.join(__dirname, "../../sdp/tests/fixtures", name), "utf8");
 
@@ -77,6 +87,69 @@ const cyclic = fresh();
 cyclic.nodes[0].tags = cyclic;
 assert.throws(() => checkRegistry(cyclic), /not a registry snapshot: TypeError/);
 assert.deepEqual(checkRegistry(fresh()), registry);
+
+// The crosspoint matrix: each Receiver takes the one Sender of its format, and is now.
+const matrix = routingMatrix(facilityText);
+assert.deepEqual(matrix.senders.map((s) => s.label), ["CAM 1 audio", "CAM 1 video"]);
+assert.deepEqual(
+  matrix.receivers.map((r) => [r.receiver.label, r.fits, r.current]),
+  [
+    ["MON 1 audio", [0], 0],
+    ["MON 1 video", [1], 1],
+  ],
+);
+assert.throws(() => routingMatrix("v=0"), /not a registry snapshot/);
+
+// A connection planned from the video Sender's SDP file and an ST 2022-7 Receiver's constraints.
+const videoSender = "5e0d0001-0000-4000-8000-000000000001";
+const leg = {
+  source_ip: {},
+  multicast_ip: {},
+  interface_ip: {},
+  destination_port: { minimum: 5000, maximum: 5999 },
+  rtp_enabled: {},
+};
+const plan = planConnection({
+  sdp: fresh().manifests[videoSender].sdp,
+  constraints: [leg, leg],
+  senderId: videoSender,
+  at: "2000000000:0",
+});
+assert.deepEqual(plan.request.activation, { mode: "activate_scheduled_absolute", requested_time: "2000000000:0" });
+assert.deepEqual(plan.request.transport_params[1], {
+  multicast_ip: "239.20.10.1",
+  source_ip: "192.168.20.21",
+  destination_port: 5004,
+  rtp_enabled: true,
+});
+assert.deepEqual([plan.notes, plan.problems], [[], []]);
+const active = {
+  ...plan.request,
+  transport_params: plan.request.transport_params.map((p) => ({ ...p, interface_ip: "192.168.10.31" })),
+};
+assert.deepEqual(verifyConnection(plan, active), []);
+active.transport_params[0].destination_port = 5006;
+assert.deepEqual(verifyConnection(plan, active), ["leg 1: destination_port is 5006, not 5004"]);
+const narrow = planConnection({
+  sdp: plan.request.transport_file.data,
+  constraints: [{ ...leg, destination_port: { maximum: 5000 } }],
+});
+assert.deepEqual(narrow.problems, ["leg 1: destination_port 5004 is above the maximum, 5000"]);
+assert.equal(narrow.request.sender_id, null);
+assert.match(narrow.notes[0], /joins path 1 only/);
+assert.deepEqual(planConnection({ in: 1.5 }).request, {
+  sender_id: null,
+  master_enable: false,
+  activation: { mode: "activate_scheduled_relative", requested_time: "1:500000000" },
+});
+assert.throws(() => planConnection({ sdp: "v=0" }), /constraints: the Receiver's are needed/);
+assert.throws(() => planConnection({ sdp: "v=0", constraints: [leg] }), /sdp: the SDP file has no media section/);
+assert.throws(() => planConnection({ at: "now", in: 2 }), /give at or in, not both/);
+assert.deepEqual(planConnection({ at: "NOW" }).request.activation, { mode: "activate_immediate", requested_time: null });
+assert.throws(() => planConnection({ at: "1790510439:0" }), /at: 1790510439:0 has passed/);
+assert.throws(() => planConnection({ in: NaN }), /in: not a number of seconds \(NaN and Infinity are not\)/);
+assert.throws(() => planConnection({ in: -1 }), /in: -1 is not a number of seconds/);
+assert.throws(() => planConnection({ sender: videoSender }), /unknown field `sender`/);
 
 // PTP messages from the grandmaster fixture, one per line in hex.
 const messages = readFileSync(path.join(__dirname, "../../ptp/tests/fixtures/grandmaster.hex"), "utf8")

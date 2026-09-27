@@ -1,11 +1,14 @@
 # st2110
 
-Tools for SMPTE ST 2110 media over IP, written in Rust. There are four so far:
+Tools for SMPTE ST 2110 media over IP, written in Rust. There are five so far:
 
 - an SDP linter, which reads the session description a sender publishes, describes
   each stream in it and checks it against ST 2110 and the documents it builds on;
 - an NMOS registry checker, which reads a facility's IS-04 registry and checks its
   resources, PTP clocks and connections, and every Sender's SDP file;
+- an IS-05 connection controller, which connects Receivers to Senders one at a time
+  or as a salvo that switches at one PTP time, checking each against the Receiver's
+  constraints and capabilities first and on the Receiver and in the registry after;
 - PTP tools, which decode IEEE 1588 messages and check them against the ST 2059-2
   profile, and work out from PTP time where frames, RTP timestamps and time code fall
   by ST 2059-1;
@@ -18,10 +21,11 @@ Every finding cites the clause behind it.
 | Crate | What it is |
 |---|---|
 | [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
-| [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching and the registry checker's 20 rules. The Query API client is the optional `client` feature. |
+| [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching, the registry checker's 21 rules, and the crosspoint matrix of which Senders each Receiver can take. The Query API client is the optional `client` feature. |
+| [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 ptp`, `st2110 pcap` and `st2110 time`. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap` and `st2110 time`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -70,7 +74,7 @@ receiver "MON 1 video" (7ecf0001): warning[receiver-caps]: none of its constrain
 registry: 1 error, 3 warnings, 0 notes
 ```
 
-- `st2110 nmos URL` reads a registry through its IS-04 Query API, then fetches each Sender's SDP file from its `manifest_href`.
+- `st2110 nmos URL` reads a registry through its IS-04 Query API, then fetches each Sender's SDP file from its `manifest_href`, and from its Connection API's `/transportfile` too when that is another URL.
   - It uses the newest Query API version the registry offers from v1.0 to v1.3, or the one a URL such as `http://registry.example:8080/x-nmos/query/v1.2` names.
   - It pages through each collection and asks for resources registered at every version. It falls back when a registry answers 501 to either request, and reads every page of a registry that pages without being asked. It asks a v1.0 registry, which has neither, for each collection whole.
   - It goes through the proxy in `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` unless `NO_PROXY` names the host, and checks HTTPS certificates against the system's trust store.
@@ -79,7 +83,50 @@ registry: 1 error, 3 warnings, 0 notes
 - `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`.
 - It exits with 0 when nothing is an error, 1 when something is, and 2 when the registry or file cannot be read.
 
-It only reads. It does not browse DNS-SD for the registry, so give it the URL, and it does not yet send IS-10 access tokens.
+It only reads; `st2110 connect` makes connections. It does not browse DNS-SD for the registry, so give it the URL, and it does not yet send IS-10 access tokens.
+
+## Connect Receivers to Senders
+
+```console
+$ st2110 connect http://registry.example:8080 --receiver "MON 1 video"
+receiver "MON 1 video" (7ecf0001)
+  sender "CAM 1 video" (5e0d0001), taking it now
+  sender "CAM 2 video" (5e0d0003)
+$ cat switch.json
+[
+  {"receiver": "MON 1 video", "sender": "CAM 2 video"},
+  {"receiver": "MON 1 audio", "sender": "CAM 2 audio"}
+]
+$ st2110 connect http://registry.example:8080 --salvo switch.json
+receiver "MON 1 video" (7ecf0001) ← sender "CAM 2 video" (5e0d0003): done at 2026-09-27 12:00:02.113542817 UTC
+  leg 1: 239.10.20.1:5004 from 192.168.10.21
+  leg 2: 239.20.20.1:5004 from 192.168.20.21
+receiver "MON 1 audio" (7ecf0002) ← sender "CAM 2 audio" (5e0d0004): done at 2026-09-27 12:00:02.113542817 UTC
+  leg 1: 239.10.20.2:5006 from 192.168.10.22
+2 connections: 2 done
+$ st2110 connect http://registry.example:8080 --receiver "MON 1 video" --sender "CAM 1 audio"
+receiver "MON 1 video" (7ecf0001) ← sender "CAM 1 audio" (5e0d0002): refused
+  leg 1: 239.10.10.2:5006 from 192.168.10.22
+  leg 2: off
+  note: the stream has one leg, so the Receiver's leg 2 is turned off: it has no ST 2022-7 protection
+  problem: it is a video Receiver, but sender "CAM 1 audio" (5e0d0002) sends audio
+1 connection: 1 refused
+```
+
+- `st2110 connect URL` lists which Senders each Receiver can take, by transport, format and BCP-004-01 capabilities (reading each Sender's SDP file for those judged on it), and marks the one it takes now; `--receiver` shows one Receiver, and `--format json` gives the whole crosspoint matrix.
+- `--receiver` with `--sender` connects a Receiver to a Sender's stream, `--sdp FILE` to the stream an SDP file describes (such as one from outside NMOS), and `--disconnect` turns it off. A Sender or Receiver is named by its id, its label or the start of its id.
+- `--salvo FILE` makes several connections together, from a JSON list like the one above; an entry takes `"sender"`, `"sdp"` or `"disconnect": true`.
+- Each connection follows IS-05 v1.2 as a controller should:
+  - it reads the Receiver's `/active` endpoint, its `/constraints` and the Sender's SDP file, fetched afresh from `manifest_href` or else its `/transportfile`;
+  - it stages the SDP file with every leg's `transport_params` spelled out (group, source, port and `rtp_enabled`), `master_enable` and `sender_id`. A two-leg ST 2022-7 Receiver given a one-leg stream has leg 2 turned off; a one-leg Receiver given a pair joins path 1;
+  - it sends nothing the Receiver's constraints or capabilities would reject, unless `--force` is given. `--dry-run` shows what it would send.
+- One connection takes effect at once. Several are scheduled for one PTP time `--lead` seconds ahead (2 by default), so that every Receiver switches together. `--at` sets the time (`now`, a PTP time or a UTC time), and `--in` a delay each Device counts from when it has the request.
+- Receivers that share a Connection API get one `/bulk/receivers` request, or one `PATCH` each when the API has no bulk interface. A salvo's requests have half the lead to be answered, so that when a Connection API refuses its part, fails or does not answer, the rest can be cancelled before they are due. A Receiver that switched all the same is put back as its `/active` endpoint showed it, and one that another controller has changed since is left alone.
+- After, it waits for each connection to come due, checks the Receiver's `/active` endpoint shows it, and checks the registry for the Receiver's new subscription and version, which IS-05 requires the Node to update; a registry that lags is a warning. `--wait` sets how long each check may take (5 s), and a connection due later than that is reported as scheduled. `--cancel` cancels an activation scheduled on a Receiver.
+- TARGET may also be a snapshot saved with `st2110 nmos --save`, when the registry is out of reach; the registry check is then skipped.
+- It exits with 0 when every connection was made, scheduled or planned, 1 when one was refused, failed or differs, and 2 when the registry or a file cannot be read, or a name finds no Sender or Receiver or more than one.
+
+It connects Receivers only: it does not yet set a unicast Sender's destination or turn Senders on and off. It polls rather than following the Query API's WebSocket subscriptions, and like `st2110 nmos` it does not browse DNS-SD or send IS-10 access tokens.
 
 ## Decode PTP messages
 
@@ -199,7 +246,7 @@ It reads SDP only, so it cannot confirm that a sender does what its SDP says; `s
 | Resources | The attributes each IS-04 schema requires and their types, `id` and `version` syntax, duplicate ids, parents and references that are not registered, interface and clock names a Node does not have |
 | PTP | Unlocked clocks, locked clocks that follow different grandmasters (unless both are traceable to TAI), and a Sender whose `a=ts-refclk` disagrees with its Source's clock |
 | Connections | Subscriptions that contradict `active`, active Receivers taking from an inactive Sender, and Receivers whose BCP-004-01 `caps` reject what their Sender sends |
-| SDP files | Each Sender's `manifest_href` and whether it answers, every SDP rule above, one interface binding per stream, multicast or unicast addresses to match the transport, and the file against the Flow, Source and Sender attributes that the NMOS capabilities register maps to SDP |
+| SDP files | Each Sender's `manifest_href` and whether it answers, every SDP rule above, one interface binding per stream, multicast or unicast addresses to match the transport, the file against the Flow, Source and Sender attributes that the NMOS capabilities register maps to SDP, and against the one its Connection API serves at `/transportfile` |
 
 It reads resources registered at any IS-04 version from v1.0 to v1.3, and reports an attribute as missing only when every version that could have registered the resource requires it.
 
@@ -299,6 +346,27 @@ for f in &report.findings {
 
 `st2110_pcap::Analyser` takes one frame at a time instead, for captures that arrive some other way.
 
+To make connections, read the registry without the SDP files, which are fetched as they are needed, and give the controller the routes (the `client` feature):
+
+```rust
+use st2110_connect::client::{ConnectionClient, Options};
+use st2110_connect::controller::{Route, Settings, Take, connect};
+use st2110_nmos::client::{self, QueryClient};
+
+let registry = QueryClient::connect("http://registry.example:8080", &client::Options { fetch_sdp: false, ..Default::default() })?;
+let routes = [
+    Route { receiver: "MON 1 video".into(), take: Take::Sender("CAM 2 video".into()) },
+    Route { receiver: "MON 1 audio".into(), take: Take::Sender("CAM 2 audio".into()) },
+];
+let client = ConnectionClient::new(&Options::default());
+let outcome = connect(&registry.snapshot()?, &routes, &client, Some(&registry), &Settings::default())?;
+for c in &outcome.connections {
+    println!("{} ← {}: {} {:?}", c.receiver.describe(), c.describe_take(), c.state.describe(), c.problems);
+}
+```
+
+Without the `client` feature, `st2110_connect::Plan::connect` plans one connection from an SDP file and a Receiver's constraints, and `Plan::verify` checks what its `/active` endpoint shows after; `st2110_nmos::routing` finds Senders and Receivers by name and builds the crosspoint matrix.
+
 ## Use it from JavaScript
 
 ```console
@@ -307,10 +375,11 @@ $ cargo build -p st2110-wasm --target wasm32-unknown-unknown --release
 $ wasm-bindgen --target web --out-dir crates/wasm/pkg target/wasm32-unknown-unknown/release/st2110_wasm.wasm
 ```
 
-`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)`, `decodePtp(bytes)`, `timing(options)`, `analyseCapture(bytes, options)` and `rules()`, and ships TypeScript types for what they return:
+`wasm-pack build crates/wasm --target web` does the same in one step. The package exports `lint(sdp)`, `checkRegistry(snapshot)`, `routingMatrix(snapshot)`, `planConnection(options)`, `verifyConnection(plan, active)`, `decodePtp(bytes)`, `timing(options)`, `analyseCapture(bytes, options)` and `rules()`, and ships TypeScript types for what they return:
 
 ```js
-import init, { lint, checkRegistry, decodePtp, timing, analyseCapture } from "./pkg/st2110_wasm.js";
+import init, { lint, checkRegistry, routingMatrix, planConnection, verifyConnection, decodePtp, timing, analyseCapture }
+  from "./pkg/st2110_wasm.js";
 
 await init();
 const report = lint(sdpText);
@@ -318,6 +387,10 @@ for (const d of report.diagnostics) console.log(d.line, d.severity, d.rule, d.me
 
 const registry = checkRegistry(snapshot);
 for (const f of registry.findings) console.log(f.resource?.label, f.severity, f.rule, f.message);
+
+const plan = planConnection({ sdp: senderSdp, constraints: receiverConstraints, senderId });
+// PATCH plan.request to the Receiver's /staged endpoint; once it is done:
+console.log(verifyConnection(plan, await (await fetch(activeUrl)).json()));
 
 const ptp = decodePtp(udpPayload);
 for (const f of ptp.findings) console.log(f.severity, f.rule, f.message);
@@ -329,7 +402,7 @@ const capture = analyseCapture(new Uint8Array(await file.arrayBuffer()), { sdp: 
 for (const f of capture.findings) console.log(f.flow, f.at, f.severity, f.rule, f.message);
 ```
 
-`checkRegistry` takes a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself. `decodePtp` takes a `Uint8Array` and throws when it is not a PTP message. `timing` takes the options `st2110 time` does, with `at` as PTP time or a UTC time such as `new Date().toISOString()` gives; without `at` it uses the page's clock. `analyseCapture` takes a capture's bytes, with the options `st2110 pcap` takes as `sdp`, `timescale` and `taiUtc`; it analyses from memory, so a page can take a capture as large as it can hold.
+`checkRegistry` and `routingMatrix` take a snapshot as an object or as JSON text, in the format `st2110 nmos --save` writes. The page fetches the resources and SDP files itself. `planConnection` takes the Sender's SDP file and the Receiver's `/constraints` as the page fetched them, with `senderId`, and `at` or `in` as `st2110 connect` takes them; without `sdp` it plans a disconnection. It returns the request to send and the problems the constraints would raise, and `verifyConnection` lists where the Receiver's `/active` endpoint differs from the plan. `decodePtp` takes a `Uint8Array` and throws when it is not a PTP message. `timing` takes the options `st2110 time` does, with `at` as PTP time or a UTC time such as `new Date().toISOString()` gives; without `at` it uses the page's clock. `analyseCapture` takes a capture's bytes, with the options `st2110 pcap` takes as `sdp`, `timescale` and `taiUtc`; it analyses from memory, so a page can take a capture as large as it can hold.
 
 ## Development
 
@@ -347,4 +420,4 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 ## Roadmap
 
-These are the first four steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, and the RP 2110-25 capture analyser. Next come an IS-05 controller, and senders and receivers on Intel MTL.
+These are the first five steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, and the IS-05 controller. Next come senders and receivers on Intel MTL.

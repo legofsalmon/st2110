@@ -4,13 +4,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::{Finding, Report, ResourceRef, Snapshot};
 use st2110_sdp::Severity;
 
-use crate::{Format, Style, describe, plural, read};
+use crate::{Format, Style, describe, plural, read, seconds};
 
 /// How to read a live registry.
 pub(crate) struct Fetch {
@@ -59,10 +58,10 @@ pub(crate) fn run(
 fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
     let lower = target.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        let timeout = Duration::try_from_secs_f64(fetch.timeout)
-            .ok()
-            .filter(|t| !t.is_zero())
-            .ok_or_else(|| format!("--timeout {} is not a number of seconds above 0", fetch.timeout))?;
+        let timeout = seconds("--timeout", fetch.timeout)?;
+        if timeout.is_zero() {
+            return Err(format!("--timeout {} is not a number of seconds above 0", fetch.timeout));
+        }
         let options = Options { timeout, fetch_sdp: fetch.sdp, ..Options::default() };
         let client = QueryClient::connect(target, &options).map_err(|e| e.to_string())?;
         return client.snapshot().map_err(|e| e.to_string());

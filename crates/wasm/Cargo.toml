@@ -1,6 +1,6 @@
 [package]
 name = "st2110-wasm"
-description = "WebAssembly bindings for the ST 2110 SDP linter, NMOS registry checks, PTP tools and capture analyser"
+description = "WebAssembly bindings for the ST 2110 SDP linter, NMOS registry checks, IS-05 connection planner, PTP tools and capture analyser"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
 st2110-nmos.workspace = true
+st2110-connect.workspace = true
 st2110-ptp = { workspace = true, features = ["serde"] }
 st2110-pcap = { workspace = true, features = ["serde"] }
 serde.workspace = true

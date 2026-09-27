@@ -35,6 +35,10 @@ pub struct Snapshot {
     pub receivers: Vec<Value>,
     /// What each Sender's `manifest_href` returned, keyed by Sender `id`.
     pub manifests: BTreeMap<String, Manifest>,
+    /// What each Sender's IS-05 `/transportfile` returned, keyed by Sender `id`, where
+    /// its Device's Connection API serves it at a URL other than `manifest_href`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub transport_files: BTreeMap<String, Manifest>,
 }
 
 /// The result of fetching one Sender's transport file.

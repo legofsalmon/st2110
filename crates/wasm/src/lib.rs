@@ -1,16 +1,21 @@
-//! WebAssembly bindings for the ST 2110 SDP linter, the NMOS registry checks, the PTP
-//! tools and the capture analyser, for browsers and Node.
+//! WebAssembly bindings for the ST 2110 SDP linter, the NMOS registry checks, the IS-05
+//! connection planner, the PTP tools and the capture analyser, for browsers and Node.
 //!
 //! Build with `wasm-pack build crates/wasm --target web` (or `--target nodejs`), then:
 //!
 //! ```js
-//! import init, { lint, checkRegistry, decodePtp, timing, analyseCapture } from "./pkg/st2110_wasm.js";
+//! import init, { lint, checkRegistry, routingMatrix, planConnection, verifyConnection, decodePtp, timing, analyseCapture }
+//!   from "./pkg/st2110_wasm.js";
 //!
 //! await init();
 //! const report = lint(sdpText);
 //! for (const d of report.diagnostics) console.log(d.line, d.severity, d.rule, d.message);
 //! const registry = checkRegistry(snapshot);
 //! for (const f of registry.findings) console.log(f.resource?.label, f.severity, f.rule, f.message);
+//! const matrix = routingMatrix(snapshot);
+//! const plan = planConnection({ sdp: senderSdp, constraints: receiverConstraints, senderId });
+//! // PATCH plan.request to the Receiver's /staged endpoint, then:
+//! const differences = verifyConnection(plan, await (await fetch(activeUrl)).json());
 //! const ptp = decodePtp(udpPayload);
 //! console.log(ptp.summary.join("\n"), ptp.findings);
 //! const now = timing({ video: ["60000/1001"], audio: [48000], localOffset: 3563 });
@@ -23,13 +28,15 @@
 //!
 //! Results are plain objects shaped like the Rust types; the TypeScript declarations
 //! below describe them. The registry checks read a snapshot the caller assembles from
-//! the Query API (or one saved by `st2110 nmos --save`); fetching is left to the page.
+//! the Query API (or one saved by `st2110 nmos --save`), and the connection planner
+//! what the caller fetched from the Connection API; fetching is left to the page.
 //! A capture is analysed from memory, so the largest a page can take is what it can
 //! hold; `st2110 pcap` reads files of any size as it goes.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::Serializer;
+use st2110_connect::{Activation, Constraints, Plan};
 use st2110_nmos::Snapshot;
 use st2110_pcap::{SdpFile, Timescale};
 use st2110_ptp::timing::{self, Options};
@@ -123,6 +130,8 @@ export interface Snapshot {
   senders?: object[];
   receivers?: object[];
   manifests?: Record<string, Manifest>;
+  /** What each Sender's Connection API serves at /transportfile, where manifest_href names another URL. */
+  transport_files?: Record<string, Manifest>;
 }
 
 export type ResourceKind = "node" | "device" | "source" | "flow" | "sender" | "receiver";
@@ -198,6 +207,60 @@ export interface RegistryReport {
   senders: SenderView[];
   receivers: ReceiverView[];
   findings: Finding[];
+}
+
+/** One Receiver's row: `fits` and `current` are positions in RoutingMatrix.senders. */
+export interface MatrixRow {
+  receiver: ResourceRef;
+  fits: number[];
+  current: number | null;
+}
+
+/** Which Senders each Receiver can take, both in label order. */
+export interface RoutingMatrix {
+  senders: ResourceRef[];
+  receivers: MatrixRow[];
+}
+
+/** One IS-05 constraint on a transport parameter. */
+export interface Constraint {
+  enum?: unknown[];
+  minimum?: number;
+  maximum?: number;
+  pattern?: string;
+  description?: string;
+}
+
+export interface ConnectionOptions {
+  /** The SDP file of the stream to take; leave it out to disconnect the Receiver. */
+  sdp?: string;
+  /** The Receiver's /constraints, one object per leg, as its Connection API returns them. */
+  constraints?: Record<string, Constraint>[];
+  /** The Sender whose stream it is; null or left out for one from outside NMOS. */
+  senderId?: string | null;
+  /** When it takes effect: "now" (the default), or a PTP time such as "1790510437:0" or UTC time such as "2026-09-27T12:00:00Z" still to come. */
+  at?: string;
+  /** Seconds after the Connection API has the request, in place of `at`. NaN and Infinity are refused. */
+  in?: number;
+  taiUtc?: number;
+}
+
+/** One stream a Receiver joins: the only one, or one leg of an ST 2022-7 pair. */
+export interface Leg {
+  destination: string;
+  multicast: boolean;
+  source_ip: string | null;
+  destination_port: number;
+}
+
+export interface ConnectionPlan {
+  /** The body to PATCH to the Receiver's /staged endpoint. */
+  request: Record<string, unknown>;
+  /** What its /active endpoint should show once the change takes effect. */
+  expect: { sender_id: string | null; master_enable: boolean; legs: (Leg | null)[] };
+  notes: string[];
+  /** Why the Receiver would refuse the request, judged against its constraints. */
+  problems: string[];
 }
 
 /** A PTP timestamp as sent: 48-bit seconds and nanoseconds. */
@@ -638,6 +701,100 @@ pub fn check_registry(
         .and_then(|text| Snapshot::from_json(&text).map_err(|e| e.to_string()))
         .map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?;
     to_js(&st2110_nmos::check(&snapshot))
+}
+
+/// Which Senders each Receiver in a registry snapshot can take, by transport, format
+/// and capabilities: the crosspoint matrix. Takes the snapshot as `checkRegistry` does.
+#[wasm_bindgen(js_name = routingMatrix, unchecked_return_type = "RoutingMatrix")]
+pub fn routing_matrix(
+    #[wasm_bindgen(unchecked_param_type = "Snapshot | string")] snapshot: JsValue,
+) -> Result<JsValue, JsError> {
+    let snapshot = json_text(&snapshot)
+        .and_then(|text| Snapshot::from_json(&text).map_err(|e| e.to_string()))
+        .map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?;
+    to_js(&st2110_nmos::routing::matrix(&snapshot))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionOptions {
+    sdp: Option<String>,
+    constraints: Option<serde_json::Value>,
+    sender_id: Option<String>,
+    at: Option<String>,
+    /// `null` when it was given but has no JSON form, as NaN and Infinity have none.
+    #[serde(rename = "in", deserialize_with = "given")]
+    after: Option<Option<f64>>,
+    tai_utc: Option<i32>,
+}
+
+/// A value that was given, even as `null`.
+fn given<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<f64>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
+}
+
+/// Plans connecting a Receiver to the stream an SDP file describes, as IS-05 asks of a
+/// controller: the request for its `/staged` endpoint, with each leg's transport
+/// parameters, and the problems its constraints would raise. Without `sdp`, plans
+/// disconnecting it. Sending the request, and fetching what it needs, is left to the page.
+#[wasm_bindgen(js_name = planConnection, unchecked_return_type = "ConnectionPlan")]
+pub fn plan_connection(
+    #[wasm_bindgen(unchecked_param_type = "ConnectionOptions")] options: JsValue,
+) -> Result<JsValue, JsError> {
+    let o: ConnectionOptions = read_options("connection options", Some(options))?;
+    within_a_day("taiUtc", o.tai_utc)?;
+    let tai_utc = o.tai_utc.unwrap_or(TAI_UTC_2017);
+    let activation = match (o.at.as_deref().map(str::trim), o.after) {
+        (Some(_), Some(_)) => return Err(JsError::new("give at or in, not both")),
+        (None, None) => Activation::Immediate,
+        (Some(text), None) if text.eq_ignore_ascii_case("now") => Activation::Immediate,
+        (Some(text), None) => {
+            let at = timing::read_time(text, tai_utc)
+                .ok_or_else(|| JsError::new(&format!("at: {text} is not now, a PTP time or a UTC time")))?;
+            let current = PtpTime::from_utc(now() as i128 * 1_000_000, tai_utc)
+                .ok_or_else(|| JsError::new("the clock is out of PTP's range"))?;
+            if at <= current {
+                return Err(JsError::new(&format!("at: {text} has passed")));
+            }
+            Activation::At(at)
+        }
+        (None, Some(seconds)) => Activation::After(
+            seconds
+                .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+                .and_then(|d| u64::try_from(d.as_nanos()).ok())
+                .ok_or_else(|| match seconds {
+                    Some(seconds) => JsError::new(&format!("in: {seconds} is not a number of seconds")),
+                    None => JsError::new("in: not a number of seconds (NaN and Infinity are not)"),
+                })?,
+        ),
+    };
+    let plan = match o.sdp {
+        None => Plan::disconnect(activation),
+        Some(sdp) => {
+            let constraints = o.constraints.ok_or_else(|| JsError::new("constraints: the Receiver's are needed"))?;
+            let constraints =
+                Constraints::from_json(&constraints).map_err(|e| JsError::new(&format!("constraints: {e}")))?;
+            Plan::connect(&sdp, o.sender_id.as_deref(), &constraints, activation)
+                .map_err(|e| JsError::new(&format!("sdp: {e}")))?
+        }
+    };
+    to_js(&plan)
+}
+
+/// Where a Receiver's `/active` endpoint differs from what a plan from `planConnection`
+/// asks for; an empty list when it shows the change took effect.
+#[wasm_bindgen(js_name = verifyConnection, unchecked_return_type = "string[]")]
+pub fn verify_connection(
+    #[wasm_bindgen(unchecked_param_type = "ConnectionPlan")] plan: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "object")] active: JsValue,
+) -> Result<JsValue, JsError> {
+    let read = |name: &str, value: &JsValue| {
+        json_text(value)
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string()))
+            .map_err(|e| JsError::new(&format!("{name}: {e}")))
+    };
+    let plan: Plan = serde_json::from_value(read("plan", &plan)?).map_err(|e| JsError::new(&format!("plan: {e}")))?;
+    to_js(&plan.verify(&read("active", &active)?))
 }
 
 /// A decoded PTP message, as `decodePtp` returns it.
