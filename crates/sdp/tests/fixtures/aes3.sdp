@@ -1,0 +1,12 @@
+v=0
+o=- 1790510443 1790510443 IN IP4 192.168.10.50
+s=Dolby E feed
+t=0 0
+m=audio 5016 RTP/AVP 98
+c=IN IP4 239.10.10.7/32
+a=source-filter: incl IN IP4 239.10.10.7 192.168.10.50
+a=rtpmap:98 AM824/48000/8
+a=fmtp:98 channel-order=SMPTE2110.(AES3,AES3,AES3,AES3)
+a=ptime:0.12
+a=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127
+a=mediaclk:direct=0
