@@ -1,6 +1,9 @@
-//! `st2110`: check SMPTE ST 2110 SDP files and NMOS registries from the command line.
+//! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries and PTP messages from the
+//! command line, and work out ST 2059-1 timing.
 
 mod nmos;
+mod ptp;
+mod timing;
 
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -12,7 +15,11 @@ use serde::Serialize;
 use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 
 #[derive(Parser)]
-#[command(name = "st2110", version, about = "Check SMPTE ST 2110 SDP files and NMOS registries against the standards")]
+#[command(
+    name = "st2110",
+    version,
+    about = "Check SMPTE ST 2110 SDP files, NMOS registries and PTP messages against the standards"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -66,6 +73,72 @@ enum Command {
         #[arg(long)]
         no_sdp: bool,
     },
+    /// Decode PTP messages and check them against the ST 2059-2 profile.
+    ///
+    /// Each FILE holds one message per line in hex, as `tshark -T fields -e udp.payload`
+    /// writes them (`#` starts a comment), or a single message in binary. Exits with 0
+    /// when no message has an error, 1 when one does or cannot be decoded (or has a
+    /// warning, with --deny-warnings), and 2 when a file cannot be read.
+    Ptp {
+        /// Files of messages; `-` reads standard input.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        /// Print only warnings, errors and messages that cannot be decoded (text output).
+        #[arg(short, long)]
+        quiet: bool,
+        /// Exit with status 1 on warnings too.
+        #[arg(long)]
+        deny_warnings: bool,
+    },
+    /// Work out where a PTP time falls, by ST 2059-1: each video frame rate's frame,
+    /// RTP timestamps and time code, and each audio rate's RTP timestamp and AES3 block.
+    ///
+    /// Without --video or --audio, shows 50 and 60000/1001 video and 48 kHz audio.
+    Time {
+        /// The time: PTP seconds, such as 1790510437.123456789 (or IS-04's
+        /// 1790510437:123456789), or UTC, such as 2026-09-27T12:00:00Z. Now, by the
+        /// system clock, when omitted.
+        #[arg(long, value_name = "TIME")]
+        at: Option<String>,
+        /// A video frame rate, such as 50, 60000/1001 or 59.94; give it more than once
+        /// for several.
+        #[arg(long, value_name = "RATE")]
+        video: Vec<String>,
+        /// An audio sampling rate in Hz, such as 48000; give it more than once for several.
+        #[arg(long, value_name = "HZ", value_parser = clap::value_parser!(u32).range(1..))]
+        audio: Vec<u32>,
+        /// Seconds from PTP time to Local Time: ST 2059-2's currentLocalOffset, such as
+        /// 3563 for UTC+1. UTC (minus TAI − UTC) when omitted.
+        #[arg(long, value_name = "SECONDS", allow_negative_numbers = true, value_parser = offset())]
+        local_offset: Option<i32>,
+        /// TAI − UTC in seconds.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = st2110_ptp::TAI_UTC_2017,
+            allow_negative_numbers = true,
+            value_parser = offset()
+        )]
+        tai_utc: i32,
+        /// The last daily jam, a whole second of PTP or UTC time, such as a grandmaster's
+        /// timeOfPreviousJam. The last Local Time midnight when omitted.
+        #[arg(long, value_name = "TIME")]
+        jam: Option<String>,
+        /// The local offset when the jam happened: ST 2059-2's previousJamLocalOffset.
+        /// Time code keeps it until the next jam, so give it when the offset has changed
+        /// since, as at a daylight saving change. --local-offset when omitted.
+        #[arg(long, value_name = "SECONDS", allow_negative_numbers = true, value_parser = offset())]
+        jam_local_offset: Option<i32>,
+        /// Count 30000/1001 time code without dropping frames.
+        #[arg(long)]
+        non_drop: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
     /// List the rules, or show the ones named.
     Rules {
         /// Rule identifiers, such as mediaclk-offset; every rule when none is given.
@@ -74,6 +147,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = RulesFormat::Text)]
         format: RulesFormat,
     },
+}
+
+/// Reads an offset in seconds of at most a day either way, beyond any real one.
+fn offset() -> clap::builder::RangedI64ValueParser<i32> {
+    clap::value_parser!(i32).range(-86_400..=86_400)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -96,6 +174,11 @@ fn main() -> ExitCode {
         Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp } => {
             let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp };
             nmos::run(&target, &fetch, format, quiet, deny_warnings)
+        }
+        Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
+        Command::Time { at, video, audio, local_offset, tai_utc, jam, jam_local_offset, non_drop, format } => {
+            let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
+            timing::run(&args, format)
         }
         Command::Rules { ids, format } => list_rules(&ids, format),
     };
@@ -158,17 +241,21 @@ fn lint(files: &[PathBuf], format: Format, quiet: bool, deny_warnings: bool) -> 
     })
 }
 
-/// Reads a file, or standard input for `-`. Bytes that are not UTF-8, as in a
-/// Latin-1 session name, become U+FFFD rather than stopping the check.
-pub(crate) fn read(path: &Path) -> io::Result<String> {
-    let bytes = if path.as_os_str() == "-" {
+/// Reads a file, or standard input for `-`.
+pub(crate) fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    if path.as_os_str() == "-" {
         let mut bytes = Vec::new();
         io::stdin().read_to_end(&mut bytes)?;
-        bytes
+        Ok(bytes)
     } else {
-        fs::read(path)?
-    };
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        fs::read(path)
+    }
+}
+
+/// Reads a text file, or standard input for `-`. Bytes that are not UTF-8, as in a
+/// Latin-1 session name, become U+FFFD rather than stopping the check.
+pub(crate) fn read(path: &Path) -> io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_bytes(path)?).into_owned())
 }
 
 /// ANSI colours, used only when writing to a terminal and `NO_COLOR` is unset.
@@ -264,12 +351,17 @@ pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
 }
 
-/// Looks a rule up in either catalogue.
-fn find_rule(id: &str) -> Option<&'static Rule> {
-    st2110_sdp::rules::find(id).or_else(|| st2110_nmos::rules::find(id))
+/// Every rule: the SDP, NMOS and PTP catalogues in turn.
+fn all_rules() -> impl Iterator<Item = &'static Rule> {
+    st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).chain(st2110_ptp::rules::ALL).copied()
 }
 
-/// Both catalogues as the Markdown page published in `docs/rules.md`.
+/// Looks a rule up in any catalogue.
+fn find_rule(id: &str) -> Option<&'static Rule> {
+    all_rules().find(|rule| rule.id == id)
+}
+
+/// The catalogues as the Markdown page published in `docs/rules.md`.
 fn rules_markdown() -> String {
     format!(
         "# Rules\n\n\
@@ -279,9 +371,12 @@ fn rules_markdown() -> String {
          ## SDP files\n\n\
          `st2110 lint` checks these in each SDP file, and `st2110 nmos` in each Sender's.\n\n{}\n\
          ## NMOS registries\n\n\
-         `st2110 nmos` checks these across a registry's resources and against each Sender's SDP file.\n\n{}",
+         `st2110 nmos` checks these across a registry's resources and against each Sender's SDP file.\n\n{}\n\
+         ## PTP messages\n\n\
+         `st2110 ptp` checks these in each message against the ST 2059-2 profile.\n\n{}",
         st2110_sdp::rules::markdown_table(st2110_sdp::rules::ALL),
-        st2110_sdp::rules::markdown_table(st2110_nmos::rules::ALL)
+        st2110_sdp::rules::markdown_table(st2110_nmos::rules::ALL),
+        st2110_sdp::rules::markdown_table(st2110_ptp::rules::ALL)
     )
 }
 
@@ -297,7 +392,7 @@ fn list_rules(ids: &[String], format: RulesFormat) -> io::Result<ExitCode> {
         }
     }
     if ids.is_empty() {
-        selected = st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).copied().collect();
+        selected = all_rules().collect();
     }
     let mut out = io::stdout().lock();
     match format {

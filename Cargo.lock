@@ -605,6 +605,7 @@ dependencies = [
  "serde",
  "serde_json",
  "st2110-nmos",
+ "st2110-ptp",
  "st2110-sdp",
 ]
 
@@ -616,6 +617,14 @@ dependencies = [
  "serde_json",
  "st2110-sdp",
  "ureq",
+]
+
+[[package]]
+name = "st2110-ptp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "st2110-sdp",
 ]
 
 [[package]]
@@ -631,7 +640,9 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "st2110-nmos",
+ "st2110-ptp",
  "st2110-sdp",
  "wasm-bindgen",
 ]
