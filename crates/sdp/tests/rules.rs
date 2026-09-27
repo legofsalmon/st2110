@@ -333,5 +333,8 @@ fn messages_suggest_the_fix() {
 #[test]
 fn docs_list_every_rule() {
     let docs = include_str!("../../../docs/rules.md");
-    assert_eq!(docs, rules::markdown(), "docs/rules.md is stale: run `st2110 rules --format markdown > docs/rules.md`");
+    assert!(
+        docs.contains(&rules::markdown_table(rules::ALL)),
+        "docs/rules.md is stale: run `st2110 rules --format markdown > docs/rules.md`"
+    );
 }

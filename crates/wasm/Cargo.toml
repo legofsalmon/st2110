@@ -1,6 +1,6 @@
 [package]
 name = "st2110-wasm"
-description = "WebAssembly bindings for the ST 2110 SDP linter"
+description = "WebAssembly bindings for the ST 2110 SDP linter and NMOS registry checks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
+st2110-nmos.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
 wasm-bindgen.workspace = true

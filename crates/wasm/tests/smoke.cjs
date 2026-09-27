@@ -4,7 +4,7 @@
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
-const { lint, rules } = require("../pkg/st2110_wasm.js");
+const { lint, rules, checkRegistry } = require("../pkg/st2110_wasm.js");
 
 const fixture = (name) => readFileSync(path.join(__dirname, "../../sdp/tests/fixtures", name), "utf8");
 
@@ -34,6 +34,31 @@ assert.deepEqual(
 );
 
 const all = rules();
-assert.ok(all.length > 90);
+assert.ok(all.length > 110);
 assert.equal(all.find((r) => r.id === "mediaclk-offset").reference, "ST 2110-10:2022 §7.3");
-console.log(`ok: ${all.length} rules`);
+assert.equal(all.find((r) => r.id === "receiver-caps").severity, "warning");
+
+// The registry checks, from an object and from JSON text.
+const facilityText = readFileSync(path.join(__dirname, "../../nmos/tests/fixtures/facility.json"), "utf8");
+const facility = JSON.parse(facilityText);
+const registry = checkRegistry(facility);
+assert.deepEqual(registry.findings, []);
+assert.equal(registry.summary.senders, 2);
+assert.deepEqual(registry.summary.grandmasters, [{ id: "08-00-11-ff-fe-21-e1-b0", clocks: 2 }]);
+assert.equal(registry.senders[1].streams[1].mid, "secondary");
+assert.deepEqual(registry.receivers.map((r) => r.sender_label), ["CAM 1 audio", "CAM 1 video"]);
+assert.deepEqual(checkRegistry(facilityText), registry);
+
+facility.flows[0].frame_width = 1280;
+facility.nodes[1].clocks[0].locked = false;
+const flagged = checkRegistry(facility);
+assert.deepEqual(
+  flagged.findings.map((f) => [f.rule, f.severity, f.resource.kind, f.resource.label]),
+  [
+    ["ptp-unlocked", "warning", "node", "Monitor 1"],
+    ["flow-sdp", "warning", "sender", "CAM 1 video"],
+    ["receiver-caps", "warning", "receiver", "MON 1 video"],
+  ],
+);
+assert.throws(() => checkRegistry("v=0"), /not a registry snapshot/);
+console.log(`ok: ${all.length} rules, ${registry.summary.senders} senders`);

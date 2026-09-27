@@ -1,0 +1,451 @@
+{
+  "source": "two-node test facility",
+  "api_version": "v1.3",
+  "nodes": [
+    {
+      "id": "a0de0001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "Camera 1",
+      "description": "Camera 1",
+      "tags": {},
+      "href": "http://192.168.10.21/",
+      "hostname": "cam1.studio.example",
+      "api": {
+        "versions": [
+          "v1.3"
+        ],
+        "endpoints": [
+          {
+            "host": "192.168.10.21",
+            "port": 80,
+            "protocol": "http"
+          }
+        ]
+      },
+      "caps": {},
+      "services": [],
+      "clocks": [
+        {
+          "name": "clk0",
+          "ref_type": "ptp",
+          "traceable": false,
+          "version": "IEEE1588-2008",
+          "gmid": "08-00-11-ff-fe-21-e1-b0",
+          "locked": true
+        }
+      ],
+      "interfaces": [
+        {
+          "chassis_id": "c8-00-84-10-00-00",
+          "port_id": "c8-00-84-10-00-01",
+          "name": "eth0"
+        },
+        {
+          "chassis_id": "c8-00-84-10-00-00",
+          "port_id": "c8-00-84-10-00-02",
+          "name": "eth1"
+        }
+      ]
+    },
+    {
+      "id": "a0de0002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "Monitor 1",
+      "description": "Monitor 1",
+      "tags": {},
+      "href": "http://192.168.10.31/",
+      "hostname": "mon1.studio.example",
+      "api": {
+        "versions": [
+          "v1.3"
+        ],
+        "endpoints": [
+          {
+            "host": "192.168.10.31",
+            "port": 80,
+            "protocol": "http"
+          }
+        ]
+      },
+      "caps": {},
+      "services": [],
+      "clocks": [
+        {
+          "name": "clk0",
+          "ref_type": "ptp",
+          "traceable": false,
+          "version": "IEEE1588-2008",
+          "gmid": "08-00-11-ff-fe-21-e1-b0",
+          "locked": true
+        }
+      ],
+      "interfaces": [
+        {
+          "chassis_id": "c8-00-84-10-01-00",
+          "port_id": "c8-00-84-10-01-01",
+          "name": "eth0"
+        },
+        {
+          "chassis_id": "c8-00-84-10-01-00",
+          "port_id": "c8-00-84-10-01-02",
+          "name": "eth1"
+        }
+      ]
+    }
+  ],
+  "devices": [
+    {
+      "id": "de710001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "Camera 1",
+      "description": "Camera 1",
+      "tags": {},
+      "type": "urn:x-nmos:device:generic",
+      "node_id": "a0de0001-0000-4000-8000-000000000001",
+      "senders": [],
+      "receivers": [],
+      "controls": [
+        {
+          "href": "http://192.168.10.21/x-nmos/connection/v1.1/",
+          "type": "urn:x-nmos:control:sr-ctrl/v1.1"
+        }
+      ]
+    },
+    {
+      "id": "de710002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "Monitor 1",
+      "description": "Monitor 1",
+      "tags": {},
+      "type": "urn:x-nmos:device:generic",
+      "node_id": "a0de0002-0000-4000-8000-000000000002",
+      "senders": [],
+      "receivers": [],
+      "controls": [
+        {
+          "href": "http://192.168.10.31/x-nmos/connection/v1.1/",
+          "type": "urn:x-nmos:control:sr-ctrl/v1.1"
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "50c00001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "CAM 1 video",
+      "description": "CAM 1 video",
+      "tags": {},
+      "caps": {},
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "parents": [],
+      "clock_name": "clk0",
+      "format": "urn:x-nmos:format:video",
+      "grain_rate": {
+        "numerator": 50
+      }
+    },
+    {
+      "id": "50c00002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "CAM 1 audio",
+      "description": "CAM 1 audio",
+      "tags": {},
+      "caps": {},
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "parents": [],
+      "clock_name": "clk0",
+      "format": "urn:x-nmos:format:audio",
+      "channels": [
+        {
+          "label": "Left",
+          "symbol": "L"
+        },
+        {
+          "label": "Right",
+          "symbol": "R"
+        },
+        {
+          "label": "Centre",
+          "symbol": "C"
+        },
+        {
+          "label": "LFE",
+          "symbol": "LFE"
+        },
+        {
+          "label": "Left surround",
+          "symbol": "Ls"
+        },
+        {
+          "label": "Right surround",
+          "symbol": "Rs"
+        },
+        {
+          "label": "Stereo left",
+          "symbol": "L"
+        },
+        {
+          "label": "Stereo right",
+          "symbol": "R"
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "f10e0001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "CAM 1 video",
+      "description": "CAM 1 video",
+      "tags": {},
+      "source_id": "50c00001-0000-4000-8000-000000000001",
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "parents": [],
+      "format": "urn:x-nmos:format:video",
+      "grain_rate": {
+        "numerator": 50
+      },
+      "frame_width": 1920,
+      "frame_height": 1080,
+      "interlace_mode": "progressive",
+      "colorspace": "BT709",
+      "transfer_characteristic": "SDR",
+      "media_type": "video/raw",
+      "components": [
+        {
+          "name": "Y",
+          "width": 1920,
+          "height": 1080,
+          "bit_depth": 10
+        },
+        {
+          "name": "Cb",
+          "width": 960,
+          "height": 1080,
+          "bit_depth": 10
+        },
+        {
+          "name": "Cr",
+          "width": 960,
+          "height": 1080,
+          "bit_depth": 10
+        }
+      ]
+    },
+    {
+      "id": "f10e0002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "CAM 1 audio",
+      "description": "CAM 1 audio",
+      "tags": {},
+      "source_id": "50c00002-0000-4000-8000-000000000002",
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "parents": [],
+      "format": "urn:x-nmos:format:audio",
+      "sample_rate": {
+        "numerator": 48000
+      },
+      "media_type": "audio/L24",
+      "bit_depth": 24
+    }
+  ],
+  "senders": [
+    {
+      "id": "5e0d0001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "CAM 1 video",
+      "description": "CAM 1 video",
+      "tags": {},
+      "caps": {},
+      "flow_id": "f10e0001-0000-4000-8000-000000000001",
+      "transport": "urn:x-nmos:transport:rtp.mcast",
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "manifest_href": "http://192.168.10.21/x-nmos/connection/v1.1/single/senders/5e0d0001-0000-4000-8000-000000000001/transportfile",
+      "interface_bindings": [
+        "eth0",
+        "eth1"
+      ],
+      "subscription": {
+        "receiver_id": null,
+        "active": true
+      },
+      "st2110_21_sender_type": "2110TPN"
+    },
+    {
+      "id": "5e0d0002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "CAM 1 audio",
+      "description": "CAM 1 audio",
+      "tags": {},
+      "caps": {},
+      "flow_id": "f10e0002-0000-4000-8000-000000000002",
+      "transport": "urn:x-nmos:transport:rtp.mcast",
+      "device_id": "de710001-0000-4000-8000-000000000001",
+      "manifest_href": "http://192.168.10.21/x-nmos/connection/v1.1/single/senders/5e0d0002-0000-4000-8000-000000000002/transportfile",
+      "interface_bindings": [
+        "eth0"
+      ],
+      "subscription": {
+        "receiver_id": null,
+        "active": true
+      }
+    }
+  ],
+  "receivers": [
+    {
+      "id": "7ecf0001-0000-4000-8000-000000000001",
+      "version": "1790510437:0",
+      "label": "MON 1 video",
+      "description": "MON 1 video",
+      "tags": {},
+      "device_id": "de710002-0000-4000-8000-000000000002",
+      "transport": "urn:x-nmos:transport:rtp.mcast",
+      "interface_bindings": [
+        "eth0",
+        "eth1"
+      ],
+      "subscription": {
+        "sender_id": "5e0d0001-0000-4000-8000-000000000001",
+        "active": true
+      },
+      "format": "urn:x-nmos:format:video",
+      "caps": {
+        "media_types": [
+          "video/raw"
+        ],
+        "constraint_sets": [
+          {
+            "urn:x-nmos:cap:meta:label": "1080p",
+            "urn:x-nmos:cap:format:frame_width": {
+              "enum": [
+                1920
+              ]
+            },
+            "urn:x-nmos:cap:format:frame_height": {
+              "enum": [
+                1080
+              ]
+            },
+            "urn:x-nmos:cap:format:interlace_mode": {
+              "enum": [
+                "progressive"
+              ]
+            },
+            "urn:x-nmos:cap:format:grain_rate": {
+              "enum": [
+                {
+                  "numerator": 50
+                },
+                {
+                  "numerator": 60000,
+                  "denominator": 1001
+                }
+              ]
+            },
+            "urn:x-nmos:cap:format:color_sampling": {
+              "enum": [
+                "YCbCr-4:2:2"
+              ]
+            },
+            "urn:x-nmos:cap:format:component_depth": {
+              "enum": [
+                10
+              ]
+            },
+            "urn:x-nmos:cap:transport:st2110_21_sender_type": {
+              "enum": [
+                "2110TPN"
+              ]
+            }
+          },
+          {
+            "urn:x-nmos:cap:meta:label": "720p",
+            "urn:x-nmos:cap:format:frame_width": {
+              "enum": [
+                1280
+              ]
+            },
+            "urn:x-nmos:cap:format:frame_height": {
+              "enum": [
+                720
+              ]
+            },
+            "urn:x-nmos:cap:format:grain_rate": {
+              "minimum": {
+                "numerator": 25
+              },
+              "maximum": {
+                "numerator": 60
+              }
+            }
+          }
+        ],
+        "version": "1790510437:0"
+      }
+    },
+    {
+      "id": "7ecf0002-0000-4000-8000-000000000002",
+      "version": "1790510437:0",
+      "label": "MON 1 audio",
+      "description": "MON 1 audio",
+      "tags": {},
+      "device_id": "de710002-0000-4000-8000-000000000002",
+      "transport": "urn:x-nmos:transport:rtp.mcast",
+      "interface_bindings": [
+        "eth0"
+      ],
+      "subscription": {
+        "sender_id": "5e0d0002-0000-4000-8000-000000000002",
+        "active": true
+      },
+      "format": "urn:x-nmos:format:audio",
+      "caps": {
+        "media_types": [
+          "audio/L24",
+          "audio/L16"
+        ],
+        "constraint_sets": [
+          {
+            "urn:x-nmos:cap:format:channel_count": {
+              "minimum": 1,
+              "maximum": 16
+            },
+            "urn:x-nmos:cap:format:sample_rate": {
+              "enum": [
+                {
+                  "numerator": 48000
+                }
+              ]
+            },
+            "urn:x-nmos:cap:format:sample_depth": {
+              "enum": [
+                16,
+                24
+              ]
+            },
+            "urn:x-nmos:cap:transport:packet_time": {
+              "enum": [
+                0.125,
+                1
+              ]
+            }
+          }
+        ],
+        "version": "1790510437:0"
+      }
+    }
+  ],
+  "manifests": {
+    "5e0d0001-0000-4000-8000-000000000001": {
+      "url": "http://192.168.10.21/x-nmos/connection/v1.1/single/senders/5e0d0001-0000-4000-8000-000000000001/transportfile",
+      "status": 200,
+      "sdp": "v=0\no=- 1790510437 1790510437 IN IP4 192.168.10.21\ns=CAM 1 video\nt=0 0\na=group:DUP primary secondary\nm=video 5004 RTP/AVP 96\nc=IN IP4 239.10.10.1/32\na=source-filter: incl IN IP4 239.10.10.1 192.168.10.21\na=rtpmap:96 raw/90000\na=fmtp:96 sampling=YCbCr-4:2:2; width=1920; height=1080; exactframerate=50; depth=10; TCS=SDR; colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN; TSMODE=SAMP\na=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127\na=mediaclk:direct=0\na=mid:primary\nm=video 5004 RTP/AVP 96\nc=IN IP4 239.20.10.1/32\na=source-filter: incl IN IP4 239.20.10.1 192.168.20.21\na=rtpmap:96 raw/90000\na=fmtp:96 sampling=YCbCr-4:2:2; width=1920; height=1080; exactframerate=50; depth=10; TCS=SDR; colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN; TSMODE=SAMP\na=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127\na=mediaclk:direct=0\na=mid:secondary\n"
+    },
+    "5e0d0002-0000-4000-8000-000000000002": {
+      "url": "http://192.168.10.21/x-nmos/connection/v1.1/single/senders/5e0d0002-0000-4000-8000-000000000002/transportfile",
+      "status": 200,
+      "sdp": "v=0\no=- 1790510438 1790510438 IN IP4 192.168.10.22\ns=CAM 1 audio\nt=0 0\nm=audio 5006 RTP/AVP 97\nc=IN IP4 239.10.10.2/32\na=source-filter: incl IN IP4 239.10.10.2 192.168.10.22\na=rtpmap:97 L24/48000/8\na=fmtp:97 channel-order=SMPTE2110.(51,ST); TSMODE=SAMP\na=ptime:1\na=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:127\na=mediaclk:direct=0\n"
+    }
+  }
+}

@@ -102,12 +102,113 @@ fn unreadable_file_exits_two() {
 fn rules_lists_and_explains() {
     let all = stdout(&st2110(&["rules"]));
     assert!(all.contains("mediaclk-offset error (ST 2110-10:2022 §7.3)"), "{all}");
+    assert!(all.contains("ptp-unlocked warning (IS-04 v1.3 schemas)"), "{all}");
     let one = stdout(&st2110(&["rules", "tp-wide"]));
     assert_eq!(one.lines().count(), 2, "{one}");
+    let registry = stdout(&st2110(&["rules", "receiver-caps"]));
+    assert!(registry.starts_with("receiver-caps warning (BCP-004-01 v1.0"), "{registry}");
     let markdown = stdout(&st2110(&["rules", "--format", "markdown"]));
     assert_eq!(markdown, include_str!("../../../docs/rules.md"));
     let json: serde_json::Value =
         serde_json::from_slice(&st2110(&["rules", "--format", "json", "ssn"]).stdout).unwrap();
     assert_eq!(json[0]["severity"], "error");
     assert_eq!(st2110(&["rules", "no-such-rule"]).status.code(), Some(2));
+}
+
+const FACILITY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../nmos/tests/fixtures/facility.json");
+
+/// The test facility with an unlocked clock on the monitor and an SDP error in the
+/// audio Sender's file.
+fn broken_facility() -> String {
+    let mut facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    facility["nodes"][1]["clocks"][0]["locked"] = false.into();
+    let sdp = &mut facility["manifests"]["5e0d0002-0000-4000-8000-000000000002"]["sdp"];
+    *sdp = sdp.as_str().unwrap().replace("direct=0", "direct=5").into();
+    facility.to_string()
+}
+
+#[test]
+fn nmos_lists_a_clean_registry() {
+    let output = st2110(&["nmos", FACILITY]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    for line in [
+        "two-node test facility (IS-04 v1.3)",
+        "  2 nodes, 2 devices, 2 sources, 2 flows, 2 senders (2 active), 2 receivers (2 active)",
+        "  PTP: 2 clocks locked to 08-00-11-ff-fe-21-e1-b0",
+        "  \"CAM 1 video\" (5e0d0001) on Camera 1: active, rtp.mcast, video/raw, 1 receiver",
+        "    stream 1 (line 14, ST 2110-20, mid secondary) 239.20.10.1:5004: 1920x1080 progressive",
+        "  \"MON 1 audio\" (7ecf0002) on Monitor 1: active, rtp.mcast, audio, from \"CAM 1 audio\" (5e0d0002)",
+        "registry: no problems found",
+    ] {
+        assert!(text.contains(line), "no {line:?} in\n{text}");
+    }
+}
+
+#[test]
+fn nmos_reports_findings_and_quotes_sdp_lines() {
+    let output = with_stdin(&["nmos", "-"], &broken_facility());
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(text.contains("  PTP: 1 clock locked to 08-00-11-ff-fe-21-e1-b0; 1 clock unlocked"), "{text}");
+    assert!(
+        text.contains("node \"Monitor 1\" (a0de0002): warning[ptp-unlocked]: PTP clock clk0 is not locked"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sender \"CAM 1 audio\" (5e0d0002), SDP line 12: error[mediaclk-offset]: RTP clock offset 5"),
+        "{text}"
+    );
+    assert!(text.contains("    12 | a=mediaclk:direct=5"), "{text}");
+    assert!(text.ends_with("registry: 1 error, 1 warning, 0 notes\n"), "{text}");
+
+    let quiet = stdout(&with_stdin(&["nmos", "--quiet", "-"], &broken_facility()));
+    assert!(!quiet.contains("senders:"), "{quiet}");
+    assert!(quiet.starts_with("node \"Monitor 1\""), "{quiet}");
+}
+
+#[test]
+fn nmos_json_and_exit_codes() {
+    let output = with_stdin(&["nmos", "--format", "json", "-"], &broken_facility());
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["summary"]["unlocked_clocks"], 1);
+    assert_eq!(json["senders"][1]["streams"][0]["mid"], "primary");
+    let rules: Vec<&str> = json["findings"].as_array().unwrap().iter().map(|f| f["rule"].as_str().unwrap()).collect();
+    assert_eq!(rules, ["ptp-unlocked", "mediaclk-offset"]);
+    assert_eq!(json["findings"][1]["resource"]["kind"], "sender");
+    assert_eq!(json["findings"][1]["line"], 12);
+
+    // A warning alone fails only when warnings are denied.
+    let warning = broken_facility().replace("direct=5", "direct=0");
+    assert_eq!(with_stdin(&["nmos", "-"], &warning).status.code(), Some(0));
+    assert_eq!(with_stdin(&["nmos", "--deny-warnings", "-"], &warning).status.code(), Some(1));
+
+    let missing = st2110(&["nmos", "no-such-snapshot.json"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no-such-snapshot.json"));
+    let not_json = with_stdin(&["nmos", "-"], "v=0");
+    assert_eq!(not_json.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&not_json.stderr).contains("not a registry snapshot"));
+}
+
+#[test]
+fn nmos_saves_what_it_read() {
+    let saved = std::env::temp_dir().join(format!("st2110-nmos-{}.json", std::process::id()));
+    let output = st2110(&["nmos", "--quiet", "--save", saved.to_str().unwrap(), FACILITY]);
+    assert_eq!(output.status.code(), Some(0));
+    let original: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    let copy: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&saved).unwrap()).unwrap();
+    std::fs::remove_file(&saved).unwrap();
+    assert_eq!(copy, original);
+}
+
+#[test]
+fn nmos_unreachable_registry_exits_two() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let output = st2110(&["nmos", "--timeout", "2", &format!("http://127.0.0.1:{port}")]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("http://127.0.0.1:{port}/x-nmos/query/")), "{stderr}");
+    assert_eq!(st2110(&["nmos", "--timeout", "0", "http://127.0.0.1:1"]).status.code(), Some(2));
 }

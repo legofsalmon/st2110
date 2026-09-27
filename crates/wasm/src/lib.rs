@@ -1,20 +1,25 @@
-//! WebAssembly bindings for the ST 2110 SDP linter, for browsers and Node.
+//! WebAssembly bindings for the ST 2110 SDP linter and the NMOS registry checks, for
+//! browsers and Node.
 //!
 //! Build with `wasm-pack build crates/wasm --target web` (or `--target nodejs`), then:
 //!
 //! ```js
-//! import init, { lint, rules } from "./pkg/st2110_wasm.js";
+//! import init, { lint, checkRegistry } from "./pkg/st2110_wasm.js";
 //!
 //! await init();
 //! const report = lint(sdpText);
 //! for (const d of report.diagnostics) console.log(d.line, d.severity, d.rule, d.message);
+//! const registry = checkRegistry(snapshot);
+//! for (const f of registry.findings) console.log(f.resource?.label, f.severity, f.rule, f.message);
 //! ```
 //!
 //! Results are plain objects shaped like the Rust types; the TypeScript declarations
-//! below describe them.
+//! below describe them. The registry checks read a snapshot the caller assembles from
+//! the Query API (or one saved by `st2110 nmos --save`); fetching is left to the page.
 
 use serde::Serialize;
 use serde_wasm_bindgen::Serializer;
+use st2110_nmos::Snapshot;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -84,6 +89,102 @@ export interface Rule {
   reference: string;
   summary: string;
 }
+
+/** What a Sender's manifest_href returned. */
+export interface Manifest {
+  url: string;
+  status?: number;
+  sdp?: string;
+  error?: string;
+}
+
+/** Resources as the IS-04 Query API returned them, and each Sender's SDP file by Sender id. */
+export interface Snapshot {
+  source?: string;
+  api_version?: string;
+  nodes?: object[];
+  devices?: object[];
+  sources?: object[];
+  flows?: object[];
+  senders?: object[];
+  receivers?: object[];
+  manifests?: Record<string, Manifest>;
+}
+
+export type ResourceKind = "node" | "device" | "source" | "flow" | "sender" | "receiver";
+
+/** `index` is the resource's position in its Snapshot list. */
+export interface ResourceRef {
+  kind: ResourceKind;
+  id: string | null;
+  label: string;
+  index: number;
+}
+
+/** One registry finding. `line` is set for findings in a Sender's SDP file. */
+export interface Finding {
+  rule: string;
+  severity: Severity;
+  message: string;
+  reference: string;
+  resource: ResourceRef | null;
+  line: number | null;
+}
+
+export interface SenderView {
+  id: string | null;
+  label: string;
+  node: string | null;
+  device: string | null;
+  transport: string | null;
+  active: boolean | null;
+  flow_id: string | null;
+  media_type: string | null;
+  manifest_href: string | null;
+  /** The streams in its SDP file, when the file was fetched. */
+  streams: Stream[];
+  /** Ids of the Receivers taking its stream. */
+  receivers: string[];
+}
+
+export interface ReceiverView {
+  id: string | null;
+  label: string;
+  node: string | null;
+  device: string | null;
+  transport: string | null;
+  format: string | null;
+  active: boolean;
+  sender_id: string | null;
+  sender_label: string | null;
+}
+
+export interface Grandmaster {
+  id: string;
+  clocks: number;
+}
+
+export interface RegistrySummary {
+  nodes: number;
+  devices: number;
+  sources: number;
+  flows: number;
+  senders: number;
+  receivers: number;
+  active_senders: number;
+  active_receivers: number;
+  grandmasters: Grandmaster[];
+  unlocked_clocks: number;
+}
+
+export interface RegistryReport {
+  source: string | null;
+  api_version: string | null;
+  summary: RegistrySummary;
+  senders: SenderView[];
+  receivers: ReceiverView[];
+  findings: Finding[];
+}
 "#;
 
 fn to_js(value: &impl Serialize) -> Result<JsValue, JsError> {
@@ -96,8 +197,23 @@ pub fn lint(sdp: &str) -> Result<JsValue, JsError> {
     to_js(&st2110_sdp::lint(sdp))
 }
 
-/// Every lint rule, in catalogue order.
+/// Checks a registry snapshot: its resources, PTP clocks, connections and every
+/// Sender's SDP file. Takes the snapshot as an object or as JSON text.
+#[wasm_bindgen(js_name = checkRegistry, unchecked_return_type = "RegistryReport")]
+pub fn check_registry(
+    #[wasm_bindgen(unchecked_param_type = "Snapshot | string")] snapshot: JsValue,
+) -> Result<JsValue, JsError> {
+    let snapshot = match snapshot.as_string() {
+        Some(text) => Snapshot::from_json(&text).map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?,
+        None => serde_wasm_bindgen::from_value(snapshot)
+            .map_err(|e| JsError::new(&format!("not a registry snapshot: {e}")))?,
+    };
+    to_js(&st2110_nmos::check(&snapshot))
+}
+
+/// Every rule: the SDP file rules, then the registry rules.
 #[wasm_bindgen(unchecked_return_type = "Rule[]")]
 pub fn rules() -> Result<JsValue, JsError> {
-    to_js(&st2110_sdp::rules::ALL)
+    let all: Vec<&st2110_sdp::Rule> = st2110_sdp::rules::ALL.iter().chain(st2110_nmos::rules::ALL).copied().collect();
+    to_js(&all)
 }
