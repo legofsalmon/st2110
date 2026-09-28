@@ -3,7 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -431,50 +431,82 @@ impl Sink for Saver {
 
 /// What `st2110 receive` found.
 #[derive(Serialize)]
-struct Received {
-    file: String,
+pub(crate) struct Received {
+    pub(crate) file: String,
     /// How the SDP file's legs were read.
-    sdp_notes: Vec<String>,
+    pub(crate) sdp_notes: Vec<String>,
     /// Where the packets came from: the network or a capture.
-    input: String,
+    pub(crate) input: String,
     /// When reading a capture: how its clock was moved onto PTP time, in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
-    capture_shift: Option<i32>,
+    pub(crate) capture_shift: Option<i32>,
     #[serde(flatten)]
-    report: Report,
+    pub(crate) report: Report,
+}
+
+/// A stream to receive: its SDP file read, and a session that receives it.
+pub(crate) struct Opened {
+    pub(crate) file: String,
+    pub(crate) description: Description,
+    pub(crate) sdp_notes: Vec<String>,
+    pub(crate) session: Session,
+}
+
+/// Reads a stream's SDP file and makes a session that waits up to `max_skew`
+/// milliseconds for a missing packet, to receive on `interfaces`, or says why not and
+/// gives the exit code.
+pub(crate) fn open(sdp: &Path, max_skew: f64, interfaces: &[Ipv4Addr]) -> Result<Opened, ExitCode> {
+    let file = sdp.display().to_string();
+    let failed = |e: &dyn std::fmt::Display| {
+        eprintln!("st2110: {file}: {e}");
+        ExitCode::from(2)
+    };
+    let text = read(sdp).map_err(|e| failed(&e))?;
+    let (description, sdp_notes) = Description::parse(&text).map_err(|e| failed(&e))?;
+    if !(0.0..=1000.0).contains(&max_skew) {
+        eprintln!("st2110: --max-skew {max_skew} is not 0 to 1000 ms");
+        return Err(ExitCode::from(2));
+    }
+    let session = Session::with_max_skew(&description, (max_skew * 1e6).round() as i64).map_err(|e| failed(&e))?;
+    if interfaces.len() > description.legs.len() {
+        eprintln!("st2110: give --interface no more times than the stream has legs ({})", description.legs.len());
+        return Err(ExitCode::from(2));
+    }
+    Ok(Opened { file, description, sdp_notes, session })
+}
+
+/// Opens a socket for each of the stream's legs on `interfaces`, once for every leg or
+/// once for each, or says why not and gives the exit code.
+pub(crate) fn sockets(description: &Description, interfaces: &[Ipv4Addr]) -> Result<Vec<UdpSocket>, ExitCode> {
+    let mut sockets = Vec::new();
+    for (i, leg) in description.legs.iter().enumerate() {
+        match net::listen(leg, interfaces.get(i).or(interfaces.last()).copied()) {
+            Ok((socket, buffer)) => {
+                if matches!(description.media, Media::Video(_)) && buffer < 4 << 20 {
+                    eprintln!(
+                        "st2110: the system gave leg {} a receive buffer of {} KiB, which a burst of video \
+                         overflows; raise {}",
+                        i + 1,
+                        buffer / 1024,
+                        net::buffer_limit()
+                    );
+                }
+                sockets.push(socket);
+            }
+            Err(e) => {
+                eprintln!("st2110: cannot receive {leg}: {e}");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(sockets)
 }
 
 pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
-    let file = args.sdp.display().to_string();
-    let text = match read(&args.sdp) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("st2110: {file}: {e}");
-            return Ok(ExitCode::from(2));
-        }
+    let Opened { file, description, sdp_notes, mut session } = match open(&args.sdp, args.max_skew, &args.interface) {
+        Ok(opened) => opened,
+        Err(code) => return Ok(code),
     };
-    let (description, sdp_notes) = match Description::parse(&text) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!("st2110: {file}: {e}");
-            return Ok(ExitCode::from(2));
-        }
-    };
-    if !(0.0..=1000.0).contains(&args.max_skew) {
-        eprintln!("st2110: --max-skew {} is not 0 to 1000 ms", args.max_skew);
-        return Ok(ExitCode::from(2));
-    }
-    let mut session = match Session::with_max_skew(&description, (args.max_skew * 1e6).round() as i64) {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!("st2110: {file}: {e}");
-            return Ok(ExitCode::from(2));
-        }
-    };
-    if args.interface.len() > description.legs.len() {
-        eprintln!("st2110: give --interface no more times than the stream has legs ({})", description.legs.len());
-        return Ok(ExitCode::from(2));
-    }
     let mut saver = Saver { wav: None, error: None };
     if let Some(path) = &args.wav {
         let Media::Audio(format) = &description.media else {
@@ -496,7 +528,7 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
     let mut capture_shift = None;
     let input = match &args.pcap {
         Some(path) => {
-            let shift = from_capture(&mut session, path, args.tai_utc, &mut saver)?;
+            let shift = from_capture(&mut session, capture(path)?, path, args.tai_utc, &mut saver, |_| true)?;
             capture_shift = shift;
             format!("capture {}", path.display())
         }
@@ -508,27 +540,10 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             };
-            let mut sockets = Vec::new();
-            for (i, leg) in description.legs.iter().enumerate() {
-                match net::listen(leg, args.interface.get(i).or(args.interface.last()).copied()) {
-                    Ok((socket, buffer)) => {
-                        if matches!(description.media, Media::Video(_)) && buffer < 4 << 20 {
-                            eprintln!(
-                                "st2110: the system gave leg {} a receive buffer of {} KiB, which a burst of video \
-                                 overflows; raise {}",
-                                i + 1,
-                                buffer / 1024,
-                                net::buffer_limit()
-                            );
-                        }
-                        sockets.push(socket);
-                    }
-                    Err(e) => {
-                        eprintln!("st2110: cannot receive {leg}: {e}");
-                        return Ok(ExitCode::from(2));
-                    }
-                }
-            }
+            let sockets = match sockets(&description, &args.interface) {
+                Ok(sockets) => sockets,
+                Err(code) => return Ok(code),
+            };
             let until = net::tai_now(args.tai_utc) + duration.as_nanos() as i128;
             net::receive(&mut session, sockets, until, args.tai_utc, &mut saver)?;
             "network".to_string()
@@ -574,18 +589,34 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
-/// Feeds a capture's datagrams to the session, each to the leg whose destination (and
-/// source, where two legs share a destination) it matches. A capture on UTC is moved
-/// onto PTP time by `tai_utc`, and one already on PTP time is not: whichever puts the
-/// first packet nearer its RTP timestamp. Gives the shift, once one packet has decided it.
-fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut impl Sink) -> io::Result<Option<i32>> {
-    let input: Box<dyn io::Read> = if path.as_os_str() == "-" {
-        Box::new(io::stdin().lock())
+/// A capture being read.
+pub(crate) type CaptureReader = st2110_pcap::Reader<BufReader<Box<dyn io::Read + Send>>>;
+
+/// Opens a capture file, or standard input for `-`, and reads its header.
+pub(crate) fn capture(path: &Path) -> io::Result<CaptureReader> {
+    let input: Box<dyn io::Read + Send> = if path.as_os_str() == "-" {
+        Box::new(io::stdin())
     } else {
         Box::new(File::open(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?)
     };
-    let mut reader = st2110_pcap::Reader::new(BufReader::new(input))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+    st2110_pcap::Reader::new(BufReader::new(input))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))
+}
+
+/// Feeds a capture's datagrams to the session, each to the leg whose destination (and
+/// source, where two legs share a destination) it matches. A capture on UTC is moved
+/// onto PTP time by `tai_utc`, and one already on PTP time is not: whichever puts the
+/// first packet nearer its RTP timestamp. Before each datagram, `pace` has its time in
+/// the capture, and stops reading when it gives false. Gives the shift, once one packet
+/// has decided it.
+pub(crate) fn from_capture(
+    session: &mut Session,
+    mut reader: CaptureReader,
+    path: &Path,
+    tai_utc: i32,
+    sink: &mut impl Sink,
+    mut pace: impl FnMut(i128) -> bool,
+) -> io::Result<Option<i32>> {
     let legs = session.description().legs.clone();
     let clock_rate = session.description().media.clock_rate();
     let mut shift: Option<i32> = None;
@@ -611,6 +642,9 @@ fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut imp
         if !datagram.complete() {
             continue;
         }
+        if !pace(frame.time) {
+            break;
+        }
         let shift = *shift.get_or_insert_with(|| match st2110_pcap::rtp::header(datagram.payload, true) {
             Some(h) => {
                 let off = |s: i32| {
@@ -627,7 +661,12 @@ fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut imp
     Ok(shift)
 }
 
-fn write_text(out: &mut impl Write, r: &Received, description: &Description, style: Style) -> io::Result<()> {
+pub(crate) fn write_text(
+    out: &mut impl Write,
+    r: &Received,
+    description: &Description,
+    style: Style,
+) -> io::Result<()> {
     let report = &r.report;
     writeln!(out, "{}: {}, from the {}", style.paint("1", &r.file), report.stream, r.input)?;
     if let Some(shift) = r.capture_shift.filter(|&s| s != 0) {

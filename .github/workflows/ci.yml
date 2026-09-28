@@ -19,6 +19,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `st2110 view` and its window are a default feature, and the rest builds without.
+      - run: cargo clippy -p st2110-cli --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --workspace --locked
 
   # The bench and vizz run st2110 on Macs. The tests include a send and receive over the

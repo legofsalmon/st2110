@@ -232,6 +232,9 @@ $ wait
 $ st2110 pcap bm.pcap --sdp sdp/VIDEO.sdp --sdp sdp/AUDIO.sdp
 ```
 
+To watch the picture as it arrives instead, `st2110 view sdp/VIDEO.sdp --interface 10.21.10.100`
+opens it in a window, and Escape closes it and prints the same report.
+
 Look for:
 
 - **From `receive`:** both streams arrived whole, `bm.png` is the SDI source's picture, and `bm.wav` its sound. Level C audio, at 8000 packets a second, is the hard case for a software receiver.
