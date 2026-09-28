@@ -499,6 +499,8 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 These are the first six steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, the IS-05 controller, and senders and receivers on ordinary sockets. Next, the same senders and receivers on Intel MTL, behind the same interface, for UHD rates and a narrow sender's pace.
 
+None of it has yet met another maker's equipment. [docs/bench.md](docs/bench.md) is the plan for the first bench test, with two Blackmagic converters, a grandmaster and a Mac.
+
 ## Licence
 
 st2110 is source available under the [Elastic License 2.0](LICENSE), with
