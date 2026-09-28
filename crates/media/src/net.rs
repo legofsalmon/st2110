@@ -19,6 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
+pub use st2110_ptp::TAI_UTC_2017;
+
 use crate::describe::Leg;
 use crate::receive::{Session, Sink};
 use crate::send::Output;
