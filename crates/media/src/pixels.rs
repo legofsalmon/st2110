@@ -13,7 +13,9 @@
 //! Packing adds up what tables say each 8-bit value of R', G' and B' gives each sample,
 //! in fixed point, which is fast enough to send a renderer's pictures live. Pictures may
 //! come with their octets in another [`Order`], and with their rows padded, as GPUs read
-//! them back.
+//! them back. Unpacking adds up what tables say each code gives R', G' and B', which is
+//! fast enough to watch a stream as it arrives, in R'G'B' triplets or in the 0RGB words
+//! that windows show.
 
 use std::fmt;
 
@@ -23,6 +25,9 @@ use crate::format::{Range, VideoFormat};
 
 /// Fraction bits of the packing tables' fixed-point values.
 const FRACTION: u32 = 24;
+
+/// Fraction bits of the unpacking tables' fixed-point values, which are 8-bit levels.
+const LEVEL_FRACTION: u32 = 16;
 
 /// What each pixel's samples are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +146,84 @@ impl fmt::Debug for Tables {
     }
 }
 
+/// What each code gives the 8-bit levels of R', G' and B', with [`LEVEL_FRACTION`] bits of
+/// fraction, so that unpacking a pixel takes additions and no more.
+#[derive(Clone)]
+struct Levels {
+    /// Each code of Y', of R', G' or B', or of the key: its level, and a half to round with.
+    value: Vec<i32>,
+    /// What each code of C'B adds to G' and to B'.
+    cb: Vec<[i32; 2]>,
+    /// What each code of C'R adds to R' and to G'.
+    cr: Vec<[i32; 2]>,
+}
+
+impl Levels {
+    fn new(kind: Kind, bits: u32, range: Range, kr: f64, kb: f64) -> Self {
+        let codes = 1u32 << bits;
+        let top = f64::from(codes - 1);
+        let scale = f64::from(1u32 << (bits - 8));
+        let one = 255.0 * f64::from(1u32 << LEVEL_FRACTION);
+        let level = |v: f64| (v * one).round() as i32;
+        // Y' and R'G'B' from 0 to 1, and the colour differences from −½ to ½.
+        let value = |code: u32| match range {
+            Range::Narrow => (f64::from(code) / scale - 16.0) / 219.0,
+            Range::Full | Range::FullProtect => f64::from(code) / top,
+        };
+        let difference = |code: u32| match range {
+            Range::Narrow => (f64::from(code) / scale - 128.0) / 224.0,
+            Range::Full | Range::FullProtect => (f64::from(code) - f64::from(codes / 2)) / top,
+        };
+        // R' = Y' + 2(1 − K_R) C'R, B' = Y' + 2(1 − K_B) C'B, and G' what is left of Y'.
+        let kg = 1.0 - kr - kb;
+        fn table<T>(codes: u32, f: impl Fn(u32) -> T) -> Vec<T> {
+            (0..codes).map(f).collect()
+        }
+        let ycc = matches!(kind, Kind::Ycc422 | Kind::Ycc444);
+        let differences =
+            |to: [f64; 2]| table(codes, |c| if ycc { to.map(|k| level(k * difference(c))) } else { [0; 2] });
+        Self {
+            value: table(codes, |c| level(value(c)) + (1 << (LEVEL_FRACTION - 1))),
+            cb: differences([-2.0 * kb * (1.0 - kb) / kg, 2.0 * (1.0 - kb)]),
+            cr: differences([2.0 * (1.0 - kr), -2.0 * kr * (1.0 - kr) / kg]),
+        }
+    }
+}
+
+impl fmt::Debug for Levels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Levels").field("codes", &self.value.len()).finish_non_exhaustive()
+    }
+}
+
+/// A pixel that rows unpack into.
+trait Pixel {
+    fn new(r: u8, g: u8, b: u8) -> Self;
+}
+
+impl Pixel for [u8; 3] {
+    fn new(r: u8, g: u8, b: u8) -> Self {
+        [r, g, b]
+    }
+}
+
+/// 0RGB.
+impl Pixel for u32 {
+    fn new(r: u8, g: u8, b: u8) -> Self {
+        u32::from_be_bytes([0, r, g, b])
+    }
+}
+
+/// An 8-bit level, from a fixed-point one that holds a half to round with.
+fn level(v: i32) -> u8 {
+    (v >> LEVEL_FRACTION).clamp(0, 255) as u8
+}
+
+/// A pixel from the level of Y' and what the colour differences add to R', G' and B'.
+fn pixel<P: Pixel>(y: i32, [r, g, b]: [i32; 3]) -> P {
+    P::new(level(y + r), level(y + g), level(y + b))
+}
+
 /// Converts rows of 8-bit R'G'B' to and from one format's pixel groups.
 #[derive(Clone, Debug)]
 pub struct Converter {
@@ -149,11 +232,8 @@ pub struct Converter {
     group: PixelGroup,
     width: usize,
     height: usize,
-    /// Luma coefficients K_R and K_B.
-    kr: f32,
-    kb: f32,
-    range: Range,
     tables: Box<Tables>,
+    levels: Levels,
 }
 
 impl Converter {
@@ -181,10 +261,8 @@ impl Converter {
             group,
             width: format.width as usize,
             height: format.height as usize,
-            kr: kr as f32,
-            kb: kb as f32,
-            range: format.range,
             tables: Box::new(Tables::new(kind, bits, format.range, kr, kb)),
+            levels: Levels::new(kind, bits, format.range, kr, kb),
         })
     }
 
@@ -283,98 +361,100 @@ impl Converter {
     }
 
     /// Unpacks one row of pixel groups into R'G'B' triplets, `3 × width` octets.
+    ///
+    /// # Panics
+    ///
+    /// If `row` is shorter than a row of pixel groups or `rgb` than `width` pixels.
     pub fn unpack_row(&self, row: &[u8], rgb: &mut [u8]) {
-        let per_group = self.samples_per_group();
-        let mut samples = vec![0u16; self.width / self.group.pixels as usize * per_group];
-        for (group, chunk) in row.chunks_exact(self.group.octets as usize).zip(samples.chunks_exact_mut(per_group)) {
-            read_group(group, chunk, self.bits);
-        }
-        self.to_rgb(&samples, rgb);
+        self.unpack(row, rgb.as_chunks_mut::<3>().0);
     }
 
-    fn samples_per_group(&self) -> usize {
-        let pixels = self.group.pixels as usize;
-        match self.kind {
-            Kind::Ycc422 => 4,
-            Kind::Ycc444 | Kind::Rgb => 3 * pixels,
-            Kind::Key => pixels,
+    /// Unpacks one row of pixel groups into `width` pixels of 0RGB, `0x00RRGGBB`, as
+    /// windows show pictures.
+    ///
+    /// # Panics
+    ///
+    /// If `row` is shorter than a row of pixel groups or `out` than `width` pixels.
+    pub fn unpack_row_0rgb(&self, row: &[u8], out: &mut [u32]) {
+        self.unpack(row, out);
+    }
+
+    fn unpack<P: Pixel>(&self, row: &[u8], out: &mut [P]) {
+        let (w, bytes) = (self.width, self.row_bytes());
+        assert!(row.len() >= bytes, "{} octets is not a row of {bytes} octets of pixel groups", row.len());
+        assert!(out.len() >= w, "{} pixels is not a row of {w}", out.len());
+        let (row, out) = (&row[..bytes], &mut out[..w]);
+        // Each pixel group's octets and samples, known when compiling, so that reading
+        // the samples takes shifts.
+        match (self.kind, self.bits) {
+            (Kind::Ycc422, 8) => self.unpack_422::<_, 4>(row, out),
+            (Kind::Ycc422, 10) => self.unpack_422::<_, 5>(row, out),
+            (Kind::Ycc422, 12) => self.unpack_422::<_, 6>(row, out),
+            (Kind::Ycc422, _) => self.unpack_422::<_, 8>(row, out),
+            (Kind::Ycc444 | Kind::Rgb, 8) => self.unpack_pixels::<_, 3, 3>(row, out),
+            (Kind::Ycc444 | Kind::Rgb, 10) => self.unpack_pixels::<_, 15, 12>(row, out),
+            (Kind::Ycc444 | Kind::Rgb, 12) => self.unpack_pixels::<_, 9, 6>(row, out),
+            (Kind::Ycc444 | Kind::Rgb, _) => self.unpack_pixels::<_, 6, 3>(row, out),
+            (Kind::Key, 8) => self.unpack_pixels::<_, 1, 1>(row, out),
+            (Kind::Key, 10) => self.unpack_pixels::<_, 5, 4>(row, out),
+            (Kind::Key, 12) => self.unpack_pixels::<_, 3, 2>(row, out),
+            (Kind::Key, _) => self.unpack_pixels::<_, 2, 1>(row, out),
         }
     }
 
-    fn to_rgb(&self, samples: &[u16], rgb: &mut [u8]) {
-        let w = self.width;
-        let mut put = |x: usize, (r, g, b): (f32, f32, f32)| {
-            rgb[3 * x] = to_u8(r);
-            rgb[3 * x + 1] = to_u8(g);
-            rgb[3 * x + 2] = to_u8(b);
-        };
-        match self.kind {
-            Kind::Rgb => {
-                for x in 0..w {
-                    let s = &samples[3 * x..3 * x + 3];
-                    put(x, (self.value(s[0]), self.value(s[1]), self.value(s[2])));
-                }
+    /// Unpacks 4:2:2 pixel groups of `OCTETS` octets.
+    fn unpack_422<P: Pixel, const OCTETS: usize>(&self, row: &[u8], out: &mut [P]) {
+        let t = &self.levels;
+        // Chroma is co-sited with each pair's first pixel; the second's lies halfway to the
+        // next pair's, and the last pixel's is its own pair's.
+        let mut second: Option<(&mut P, i32, [i32; 3])> = None;
+        for (group, [p0, p1]) in row.as_chunks::<OCTETS>().0.iter().zip(out.as_chunks_mut::<2>().0) {
+            let [cb, y0, cr, y1] = samples(group);
+            let ([cb_g, cb_b], [cr_r, cr_g]) = (t.cb[cb], t.cr[cr]);
+            let chroma = [cr_r, cr_g + cb_g, cb_b];
+            if let Some((p, y, before)) = second.take() {
+                *p = pixel(y, [0, 1, 2].map(|i| (before[i] + chroma[i]) >> 1));
             }
-            Kind::Key => {
-                for (x, &sample) in samples.iter().enumerate().take(w) {
-                    let k = self.value(sample);
-                    put(x, (k, k, k));
-                }
-            }
-            Kind::Ycc444 => {
-                for x in 0..w {
-                    let s = &samples[3 * x..3 * x + 3];
-                    put(x, self.rgb(self.value(s[1]), self.chroma_value(s[0]), self.chroma_value(s[2])));
-                }
-            }
-            Kind::Ycc422 => {
-                let pairs = w / 2;
-                let chroma = |i: usize| {
-                    let s = &samples[4 * i..4 * i + 4];
-                    (self.chroma_value(s[0]), self.chroma_value(s[2]))
+            *p0 = pixel(t.value[y0], chroma);
+            second = Some((p1, t.value[y1], chroma));
+        }
+        if let Some((p, y, chroma)) = second {
+            *p = pixel(y, chroma);
+        }
+    }
+
+    /// Unpacks pixel groups of `OCTETS` octets and `N` samples, with a sample of each
+    /// component for every pixel: 4:4:4, R'G'B' or the key.
+    fn unpack_pixels<P: Pixel, const OCTETS: usize, const N: usize>(&self, row: &[u8], out: &mut [P]) {
+        let t = &self.levels;
+        let per_pixel = if self.kind == Kind::Key { 1 } else { 3 };
+        for (group, run) in row.as_chunks::<OCTETS>().0.iter().zip(out.chunks_exact_mut(N / per_pixel)) {
+            let samples: [usize; N] = samples(group);
+            for (p, s) in run.iter_mut().zip(samples.chunks_exact(per_pixel)) {
+                *p = match self.kind {
+                    Kind::Ycc444 => {
+                        let ([cb_g, cb_b], [cr_r, cr_g]) = (t.cb[s[0]], t.cr[s[2]]);
+                        pixel(t.value[s[1]], [cr_r, cr_g + cb_g, cb_b])
+                    }
+                    Kind::Rgb => P::new(level(t.value[s[0]]), level(t.value[s[1]]), level(t.value[s[2]])),
+                    Kind::Key | Kind::Ycc422 => pixel(t.value[s[0]], [0; 3]),
                 };
-                for i in 0..pairs {
-                    let s = &samples[4 * i..4 * i + 4];
-                    let (cb, cr) = chroma(i);
-                    put(2 * i, self.rgb(self.value(s[1]), cb, cr));
-                    // The odd pixel's chroma lies halfway to the next pair's.
-                    let (cb2, cr2) = if i + 1 < pairs { chroma(i + 1) } else { (cb, cr) };
-                    put(2 * i + 1, self.rgb(self.value(s[3]), (cb + cb2) / 2.0, (cr + cr2) / 2.0));
-                }
             }
-        }
-    }
-
-    fn rgb(&self, y: f32, cb: f32, cr: f32) -> (f32, f32, f32) {
-        let r = y + 2.0 * (1.0 - self.kr) * cr;
-        let b = y + 2.0 * (1.0 - self.kb) * cb;
-        let g = (y - self.kr * r - self.kb * b) / (1.0 - self.kr - self.kb);
-        (r, g, b)
-    }
-
-    fn value(&self, code: u16) -> f32 {
-        let code = f32::from(code);
-        let top = ((1u32 << self.bits) - 1) as f32;
-        let scale = (1u32 << (self.bits - 8)) as f32;
-        match self.range {
-            Range::Narrow => (code / scale - 16.0) / 219.0,
-            Range::Full | Range::FullProtect => code / top,
-        }
-    }
-
-    fn chroma_value(&self, code: u16) -> f32 {
-        let code = f32::from(code);
-        let top = ((1u32 << self.bits) - 1) as f32;
-        let scale = (1u32 << (self.bits - 8)) as f32;
-        match self.range {
-            Range::Narrow => (code / scale - 128.0) / 224.0,
-            Range::Full | Range::FullProtect => (code - (1u32 << (self.bits - 1)) as f32) / top,
         }
     }
 }
 
-fn to_u8(v: f32) -> u8 {
-    (v * 255.0).round().clamp(0.0, 255.0) as u8
+/// The `N` samples of a pixel group of `OCTETS` octets, most significant bit first.
+fn samples<const OCTETS: usize, const N: usize>(group: &[u8; OCTETS]) -> [usize; N] {
+    let bits = 8 * OCTETS / N;
+    // Most groups fit in 64 bits, and those go faster so.
+    if OCTETS <= 8 {
+        let word = group.iter().fold(0u64, |word, &octet| (word << 8) | u64::from(octet));
+        std::array::from_fn(|i| ((word >> (bits * (N - 1 - i))) & ((1 << bits) - 1)) as usize)
+    } else {
+        let word = group.iter().fold(0u128, |word, &octet| (word << 8) | u128::from(octet));
+        std::array::from_fn(|i| ((word >> (bits * (N - 1 - i))) & ((1 << bits) - 1)) as usize)
+    }
 }
 
 /// Writes samples of `bits` each into a pixel group, most significant bit first.
@@ -392,18 +472,6 @@ fn write_group(group: &mut [u8], samples: &[u16], bits: u32) {
             acc = (acc << bits) | u128::from(s);
         }
         group.copy_from_slice(&acc.to_be_bytes()[16 - group.len()..]);
-    }
-}
-
-/// Reads samples of `bits` each from a pixel group, most significant bit first.
-fn read_group(group: &[u8], samples: &mut [u16], bits: u32) {
-    let mut bytes = [0u8; 16];
-    bytes[16 - group.len()..].copy_from_slice(group);
-    let acc = u128::from_be_bytes(bytes);
-    let mask = (1u128 << bits) - 1;
-    let n = samples.len();
-    for (i, s) in samples.iter_mut().enumerate() {
-        *s = ((acc >> (bits as usize * (n - 1 - i))) & mask) as u16;
     }
 }
 
@@ -440,6 +508,18 @@ mod tests {
     use st2110_sdp::video::Depth;
 
     use super::*;
+
+    /// Reads samples of `bits` each from a pixel group, most significant bit first.
+    fn read_group(group: &[u8], samples: &mut [u16], bits: u32) {
+        let mut bytes = [0u8; 16];
+        bytes[16 - group.len()..].copy_from_slice(group);
+        let acc = u128::from_be_bytes(bytes);
+        let mask = (1u128 << bits) - 1;
+        let n = samples.len();
+        for (i, s) in samples.iter_mut().enumerate() {
+            *s = ((acc >> (bits as usize * (n - 1 - i))) & mask) as u16;
+        }
+    }
 
     fn format(sampling: Sampling, depth: Depth) -> VideoFormat {
         let mut f = VideoFormat::new(16, 2, Rational::new(25, 1).unwrap());
@@ -529,17 +609,17 @@ mod tests {
 
     /// The code values the formulas give, before rounding, worked out in double
     /// precision from R'G'B' each time: how this crate packed pictures before the tables.
-    fn by_formula(c: &Converter, rgb: &[u8], (kr, kb): (f64, f64)) -> Vec<f64> {
+    fn by_formula(c: &Converter, range: Range, rgb: &[u8], (kr, kb): (f64, f64)) -> Vec<f64> {
         let (bits, w) = (c.bits, c.width);
         let top = f64::from((1u32 << bits) - 1);
         let scale = f64::from(1u32 << (bits - 8));
-        let reserved = if c.range == Range::Full { 0.0 } else { scale };
+        let reserved = if range == Range::Full { 0.0 } else { scale };
         let clamp = |code: f64| code.clamp(reserved, top - reserved);
-        let code = |v: f64| match c.range {
+        let code = |v: f64| match range {
             Range::Narrow => clamp((219.0 * v + 16.0) * scale),
             _ => clamp(v * top),
         };
-        let chroma = |v: f64| match c.range {
+        let chroma = |v: f64| match range {
             Range::Narrow => clamp((224.0 * v + 128.0) * scale),
             _ => clamp(v * top + f64::from(1u32 << (bits - 1))),
         };
@@ -596,7 +676,7 @@ mod tests {
                         let Ok(c) = Converter::new(&f) else { continue };
                         let mut row = vec![0; c.row_bytes()];
                         c.pack_row(&rgb, &mut row);
-                        let values = by_formula(&c, &rgb, k);
+                        let values = by_formula(&c, range, &rgb, k);
                         let mut packed = vec![0u16; values.len()];
                         let per_group = packed.len() / (row.len() / c.group.octets as usize);
                         for (group, chunk) in
@@ -620,6 +700,107 @@ mod tests {
             }
         }
         assert!(samples > 100_000 && halves < samples / 1000, "{halves} of {samples} samples on halves");
+    }
+
+    /// The 8-bit levels of R', G' and B' that the formulas give a row's codes, before
+    /// rounding and clamping, worked out in double precision.
+    fn unpacked_by_formula(c: &Converter, range: Range, row: &[u8], (kr, kb): (f64, f64)) -> Vec<[f64; 3]> {
+        let bits = c.bits;
+        let per_group = match c.kind {
+            Kind::Ycc422 => 4,
+            Kind::Ycc444 | Kind::Rgb => 3 * c.group.pixels as usize,
+            Kind::Key => c.group.pixels as usize,
+        };
+        let mut codes = vec![0u16; row.len() / c.group.octets as usize * per_group];
+        for (group, chunk) in row.chunks_exact(c.group.octets as usize).zip(codes.chunks_exact_mut(per_group)) {
+            read_group(group, chunk, bits);
+        }
+        let (top, scale) = (f64::from((1u32 << bits) - 1), f64::from(1u32 << (bits - 8)));
+        let value = |code: u16| match range {
+            Range::Narrow => (f64::from(code) / scale - 16.0) / 219.0,
+            _ => f64::from(code) / top,
+        };
+        let difference = |code: u16| match range {
+            Range::Narrow => (f64::from(code) / scale - 128.0) / 224.0,
+            _ => (f64::from(code) - f64::from(1u32 << (bits - 1))) / top,
+        };
+        let rgb = |y: f64, cb: f64, cr: f64| {
+            let (r, b) = (y + 2.0 * (1.0 - kr) * cr, y + 2.0 * (1.0 - kb) * cb);
+            [r, (y - kr * r - kb * b) / (1.0 - kr - kb), b].map(|v| 255.0 * v)
+        };
+        match c.kind {
+            Kind::Rgb => codes.as_chunks::<3>().0.iter().map(|s| s.map(|v| 255.0 * value(v))).collect(),
+            Kind::Key => codes.iter().map(|&k| [255.0 * value(k); 3]).collect(),
+            Kind::Ycc444 => codes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|&[cb, y, cr]| rgb(value(y), difference(cb), difference(cr)))
+                .collect(),
+            Kind::Ycc422 => {
+                let pairs = codes.as_chunks::<4>().0;
+                (0..pairs.len())
+                    .flat_map(|i| {
+                        let [cb, y0, cr, y1] = pairs[i];
+                        let [cb2, _, cr2, _] = pairs[(i + 1).min(pairs.len() - 1)];
+                        let (cb, cr, cb2, cr2) = (difference(cb), difference(cr), difference(cb2), difference(cr2));
+                        [rgb(value(y0), cb, cr), rgb(value(y1), (cb + cb2) / 2.0, (cr + cr2) / 2.0)]
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    #[test]
+    fn unpacks_to_the_levels_the_formulas_give() {
+        // Every sampling, depth, range and set of luma coefficients this crate unpacks, on
+        // rows of codes from an xorshift, many of them out of range, against the formulas:
+        // each level is the value rounded and clamped, or for a value that lies within a
+        // thousandth of a half, either level beside it.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let (mut levels, mut halves) = (0, 0);
+        for sampling in [Sampling::YCbCr422, Sampling::YCbCr444, Sampling::Rgb, Sampling::Key] {
+            for depth in [Depth::Bits8, Depth::Bits10, Depth::Bits12, Depth::Bits16] {
+                for range in [Range::Narrow, Range::FullProtect, Range::Full] {
+                    for (colorimetry, k) in
+                        [("BT601", (0.299, 0.114)), ("BT709", (0.2126, 0.0722)), ("BT2020", (0.2627, 0.0593))]
+                    {
+                        let mut f = VideoFormat::new(484, 1, Rational::new(25, 1).unwrap());
+                        (f.sampling, f.depth, f.range, f.colorimetry) = (sampling, depth, range, colorimetry.into());
+                        let Ok(c) = Converter::new(&f) else { continue };
+                        let row: Vec<u8> = (0..c.row_bytes())
+                            .map(|_| {
+                                state ^= state << 13;
+                                state ^= state >> 7;
+                                state ^= state << 17;
+                                (state >> 32) as u8
+                            })
+                            .collect();
+                        let (mut rgb, mut words) = (vec![0; 3 * 484], vec![0; 484]);
+                        c.unpack_row(&row, &mut rgb);
+                        c.unpack_row_0rgb(&row, &mut words);
+                        let expected = unpacked_by_formula(&c, range, &row, k);
+                        assert_eq!(expected.len(), 484);
+                        for (x, (values, got)) in expected.iter().zip(rgb.as_chunks::<3>().0).enumerate() {
+                            assert_eq!(words[x], u32::from_be_bytes([0, got[0], got[1], got[2]]), "{f}: pixel {x}");
+                            for (&value, &level) in values.iter().zip(got) {
+                                let near = |v: f64| v.clamp(0.0, 255.0);
+                                let half = (value - value.floor() - 0.5).abs() < 1e-3;
+                                let fits = if half {
+                                    near(value.floor()) <= level.into() && near(value.ceil()) >= level.into()
+                                } else {
+                                    f64::from(level) == near(value.round())
+                                };
+                                assert!(fits, "{f}: pixel {x} has {got:?}, and {values:?} by the formulas");
+                                halves += usize::from(half);
+                            }
+                            levels += 3;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(levels > 100_000 && halves < levels / 100, "{halves} of {levels} levels on halves");
     }
 
     #[test]
