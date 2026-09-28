@@ -498,3 +498,10 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 ## Roadmap
 
 These are the first six steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, the IS-05 controller, and senders and receivers on ordinary sockets. Next, the same senders and receivers on Intel MTL, behind the same interface, for UHD rates and a narrow sender's pace.
+
+## Licence
+
+st2110 is source available under the [Elastic License 2.0](LICENSE), with
+LeTissier Creative Studios Ltd as the licensor. You can read, build and
+modify it, but you may not offer it to others as a hosted service. The
+third-party crates it depends on keep their own licences.
