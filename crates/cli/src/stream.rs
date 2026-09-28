@@ -13,8 +13,8 @@ use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::files::{Capture, UNKNOWN_SOURCE, WavWriter, write_png};
 use st2110_media::format::{AudioFormat, Packing, Range, SenderType, VideoFormat};
 use st2110_media::net::{self, Transmitter};
-use st2110_media::receive::{self as session, Report, Session, Sink};
-use st2110_media::send::{SendCounts, Sender};
+use st2110_media::receive::{self as session, DEFAULT_MAX_SKEW_NS, Report, Session, Sink};
+use st2110_media::send::{SendCounts, Sender, default_sender_type};
 use st2110_media::video::FrameInfo;
 
 use crate::{Format, Style, read, seconds};
@@ -66,9 +66,10 @@ pub(crate) struct VideoArgs {
     #[arg(long, value_enum, default_value_t = PackingArg::Gpm)]
     packing: PackingArg,
     /// The ST 2110-21 sender type the SDP file declares. Pacing on ordinary sockets
-    /// can keep to wide at best.
-    #[arg(long, value_enum, default_value_t = SenderArg::Wide)]
-    sender_type: SenderArg,
+    /// can keep to wide at best, which it declares below 900 000 packets a second;
+    /// ST 2110-21 defines no wide sender from there, so it declares narrow-linear.
+    #[arg(long, value_enum)]
+    sender_type: Option<SenderArg>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -102,7 +103,8 @@ pub(crate) struct AudioArgs {
     /// Bits a sample: 24 (L24) or 16 (L16).
     #[arg(long, default_value_t = 24)]
     bits: u8,
-    /// Milliseconds of audio in each packet: 1, or 0.125 as levels B and C have.
+    /// Milliseconds of audio in each packet: 1, or 0.125 as levels B and C have. At
+    /// 44.1 kHz, the nearest whole number of samples: 1 ms is 44 of them.
     #[arg(long, value_name = "MS", default_value_t = 1.0)]
     packet_time: f64,
     /// The tone's frequency in Hz.
@@ -201,26 +203,20 @@ fn video_format(args: &VideoArgs) -> Result<VideoFormat, String> {
         PackingArg::Gpm => Packing::General,
         PackingArg::Bpm => Packing::Block,
     };
-    format.sender_type = match args.sender_type {
-        SenderArg::Narrow => SenderType::Narrow,
-        SenderArg::NarrowLinear => SenderType::NarrowLinear,
-        SenderArg::Wide => SenderType::Wide,
-    };
     format.check()?;
+    format.sender_type = match args.sender_type {
+        Some(SenderArg::Narrow) => SenderType::Narrow,
+        Some(SenderArg::NarrowLinear) => SenderType::NarrowLinear,
+        Some(SenderArg::Wide) => SenderType::Wide,
+        None => default_sender_type(&format)?,
+    };
     Ok(format)
 }
 
 fn audio_format(args: &AudioArgs) -> Result<AudioFormat, String> {
-    let packet_time_us = (args.packet_time * 1000.0).round();
-    if !(1.0..=4000.0).contains(&packet_time_us) || (packet_time_us - args.packet_time * 1000.0).abs() > 1e-6 {
-        return Err(format!("--packet-time {} is not a whole number of microseconds up to 4 ms", args.packet_time));
-    }
-    let format = AudioFormat {
-        channels: args.channels,
-        sample_rate: args.sample_rate,
-        bits: args.bits,
-        packet_time_us: packet_time_us as u32,
-    };
+    let format =
+        AudioFormat { channels: args.channels, sample_rate: args.sample_rate, bits: args.bits, ..AudioFormat::new(1) }
+            .with_packet_time(args.packet_time)?;
     format.check()?;
     Ok(format)
 }
@@ -315,7 +311,7 @@ impl Ready<'_> {
             let (sent, skipped) = match &self.description.media {
                 Media::Video(_) => (plural(counts.frames, "frame"), plural(counts.skipped, "frame")),
                 Media::Audio(a) => {
-                    let time = |n: u64| format!("{:.3} s", n as f64 * f64::from(a.packet_time_us) / 1e6);
+                    let time = |n: u64| format!("{:.3} s", n as f64 * a.packet_time());
                     (time(counts.frames), time(counts.skipped))
                 }
             };
@@ -396,6 +392,11 @@ pub(crate) struct ReceiveArgs {
     /// Save the audio as a WAV file, with silence where packets were missing.
     #[arg(long, value_name = "FILE")]
     wav: Option<PathBuf>,
+    /// How long to wait for a missing packet, for its copy on a leg that runs behind or
+    /// for one that comes out of order, in milliseconds: up to 1000. The default allows
+    /// what ST 2022-7 class B receivers do.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_MAX_SKEW_NS as f64 / 1e6)]
+    max_skew: f64,
     /// TAI − UTC in seconds: how far the system clock, or a capture's, is behind PTP time.
     #[arg(
         long,
@@ -459,7 +460,11 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
-    let mut session = match Session::new(&description) {
+    if !(0.0..=1000.0).contains(&args.max_skew) {
+        eprintln!("st2110: --max-skew {} is not 0 to 1000 ms", args.max_skew);
+        return Ok(ExitCode::from(2));
+    }
+    let mut session = match Session::with_max_skew(&description, (args.max_skew * 1e6).round() as i64) {
         Ok(session) => session,
         Err(e) => {
             eprintln!("st2110: {file}: {e}");
@@ -479,9 +484,14 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
         let file = File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         saver.wav = Some(WavWriter::new(BufWriter::new(file), format.channels, format.sample_rate, format.bits)?);
     }
-    if args.png.is_some() && !matches!(description.media, Media::Video(_)) {
-        eprintln!("st2110: --png is for video streams, and {file} describes audio");
-        return Ok(ExitCode::from(2));
+    let mut png = None;
+    if let Some(path) = &args.png {
+        if !matches!(description.media, Media::Video(_)) {
+            eprintln!("st2110: --png is for video streams, and {file} describes audio");
+            return Ok(ExitCode::from(2));
+        }
+        // Now, so that a file it cannot write fails before receiving rather than after.
+        png = Some(File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?);
     }
     let mut capture_shift = None;
     let input = match &args.pcap {
@@ -504,9 +514,11 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
                     Ok((socket, buffer)) => {
                         if matches!(description.media, Media::Video(_)) && buffer < 4 << 20 {
                             eprintln!(
-                                "st2110: the system gave leg {} a receive buffer of {} KiB, which a burst of video overflows; raise net.core.rmem_max",
+                                "st2110: the system gave leg {} a receive buffer of {} KiB, which a burst of video \
+                                 overflows; raise {}",
                                 i + 1,
-                                buffer / 1024
+                                buffer / 1024,
+                                net::buffer_limit()
                             );
                         }
                         sockets.push(socket);
@@ -530,27 +542,33 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
         wav.finish()?.flush()?;
     }
     let report = session.report();
-    if let Some(path) = &args.png {
+    let failed = !report.problems.is_empty();
+    let received = Received { file, sdp_notes, input, capture_shift, report };
+    {
+        let mut out = io::stdout().lock();
+        match args.format {
+            Format::Text => write_text(&mut out, &received, &description, Style::detect())?,
+            Format::Json => {
+                serde_json::to_writer_pretty(&mut out, &received)?;
+                writeln!(out)?;
+            }
+        }
+        out.flush()?;
+    }
+    if let (Some(path), Some(file)) = (&args.png, png) {
         match (session.last_whole_frame(), &description.media) {
             (Some(frame), Media::Video(format)) => {
                 let rgb = st2110_media::pixels::to_rgb(format, frame).map_err(io::Error::other)?;
-                let mut out = BufWriter::new(
-                    File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?,
-                );
-                write_png(&mut out, format.width, format.height, &rgb)?;
-                out.flush()?;
+                let mut out = BufWriter::new(file);
+                write_png(&mut out, format.width, format.height, &rgb)
+                    .and_then(|()| out.flush())
+                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
             }
-            _ => eprintln!("st2110: no frame arrived whole, so {} was not written", path.display()),
-        }
-    }
-    let failed = !report.problems.is_empty();
-    let received = Received { file, sdp_notes, input, capture_shift, report };
-    let mut out = io::stdout().lock();
-    match args.format {
-        Format::Text => write_text(&mut out, &received, &description, Style::detect())?,
-        Format::Json => {
-            serde_json::to_writer_pretty(&mut out, &received)?;
-            writeln!(out)?;
+            _ => {
+                drop(file);
+                let _ = fs::remove_file(path);
+                eprintln!("st2110: no frame arrived whole, so {} was not written", path.display());
+            }
         }
     }
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
@@ -571,9 +589,11 @@ fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut imp
     let legs = session.description().legs.clone();
     let clock_rate = session.description().media.clock_rate();
     let mut shift: Option<i32> = None;
+    let mut end = 0;
     while let Some(frame) = reader.next_frame() {
         let frame =
             frame.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+        end = end.max(frame.time);
         let st2110_pcap::net::Packet::Udp(datagram) = st2110_pcap::net::parse(frame.link, frame.data) else {
             continue;
         };
@@ -602,7 +622,8 @@ fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut imp
         });
         session.push(leg, *source.ip(), frame.time + i128::from(shift) * NANOS, datagram.payload, sink);
     }
-    session.finish(sink);
+    // The capture stopped at its last packet, whatever it was.
+    session.finish(end + i128::from(shift.unwrap_or(0)) * NANOS, sink);
     Ok(shift)
 }
 
@@ -614,18 +635,22 @@ fn write_text(out: &mut impl Write, r: &Received, description: &Description, sty
     }
     for (i, leg) in report.legs.iter().enumerate() {
         let mut line = format!("  leg {} {}: {}", i + 1, leg.leg, plural(leg.rtp.received, "packet"));
-        if leg.rtp.lost > 0 {
-            line.push_str(&format!(", {} lost", leg.rtp.lost));
-        }
-        if leg.rtp.reordered > 0 {
-            line.push_str(&format!(", {} out of order", leg.rtp.reordered));
-        }
-        if leg.rtp.duplicates > 0 {
-            line.push_str(&format!(", {} twice", leg.rtp.duplicates));
+        for (n, what) in [
+            (leg.rtp.lost, "lost"),
+            (leg.rtp.reordered, "out of order"),
+            (leg.rtp.duplicates, "twice"),
+            (leg.rtp.too_late, "too late to merge"),
+        ] {
+            if n > 0 {
+                line.push_str(&format!(", {n} {what}"));
+            }
         }
         writeln!(out, "{line}")?;
     }
-    let lost = if report.lost == 0 { "none lost".to_string() } else { format!("{} lost", report.lost) };
+    let mut lost = if report.lost == 0 { "none lost".to_string() } else { format!("{} lost", report.lost) };
+    if report.too_late > 0 {
+        lost.push_str(&format!(", {} too late", report.too_late));
+    }
     let merged = if report.legs.len() > 1 { "merged: " } else { "" };
     writeln!(
         out,
@@ -653,13 +678,9 @@ fn write_text(out: &mut impl Write, r: &Received, description: &Description, sty
         if c.cut > 0 {
             whole.push_str(&format!(" and {} cut off by the start or end of receiving", c.cut));
         }
+        let packets = video.packets_per_frame.map(|p| format!(", {p} packets a frame")).unwrap_or_default();
         let rate = video.frame_rate.map(|r| format!(", {r:.3} frames a second")).unwrap_or_default();
-        writeln!(
-            out,
-            "  video: {}, {whole}, {} packets a frame{rate}",
-            plural(c.frames, "frame"),
-            video.packets_per_frame
-        )?;
+        writeln!(out, "  video: {}, {whole}{packets}{rate}", plural(c.frames, "frame"))?;
     }
     if let Some(audio) = &report.audio {
         let peaks: Vec<String> =

@@ -6,7 +6,9 @@
 //! wide sender's limits at HD rates on a quiet machine, but not a narrow sender's, and
 //! a busy machine will burst. The system clock stands in for PTP: it counts UTC, and
 //! TAI is taken to be `tai_utc` seconds ahead of it, as on a machine whose clock
-//! `phc2sys` keeps to PTP.
+//! `phc2sys` keeps to PTP. On Linux and macOS each datagram received carries the time
+//! the system stamped it with as it arrived, which is nearer the wire than the time a
+//! thread reads it.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -168,8 +170,12 @@ pub fn listen(leg: &Leg, interface: Option<Ipv4Addr>) -> io::Result<(UdpSocket, 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let group = *leg.destination.ip();
     let port = leg.destination.port();
-    // Room for a few milliseconds of video; Linux holds it to net.core.rmem_max.
-    let _ = socket.set_recv_buffer_size(64 << 20);
+    // Room for tens of milliseconds of video. Linux holds it to net.core.rmem_max; macOS
+    // refuses more than kern.ipc.maxsockbuf allows, so ask for less until it agrees.
+    let mut size = 64 << 20;
+    while socket.set_recv_buffer_size(size).is_err() && size > 1 << 20 {
+        size /= 2;
+    }
     if group.is_multicast() {
         socket.set_reuse_address(true)?;
         #[cfg(all(
@@ -195,8 +201,112 @@ pub fn listen(leg: &Leg, interface: Option<Ipv4Addr>) -> io::Result<(UdpSocket, 
         })?;
     }
     socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let buffer = socket.recv_buffer_size().unwrap_or(0);
+    // Linux reports twice what it allows, counting its own bookkeeping.
+    let buffer = socket.recv_buffer_size().unwrap_or(0) / if cfg!(target_os = "linux") { 2 } else { 1 };
     Ok((socket.into(), buffer))
+}
+
+/// What to raise when the system gives a socket too small a receive buffer.
+pub fn buffer_limit() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "net.core.rmem_max"
+    } else if cfg!(target_vendor = "apple") {
+        "kern.ipc.maxsockbuf"
+    } else {
+        "the system's limit on socket buffers"
+    }
+}
+
+/// Kernel receive timestamps: `SO_TIMESTAMPNS` on Linux, `SO_TIMESTAMP` on macOS.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+mod stamps {
+    use std::io::{self, IoSliceMut};
+    use std::net::{SocketAddrV4, UdpSocket};
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrIn, recvmsg, setsockopt, sockopt};
+
+    /// Room for the control message a stamp comes in.
+    pub(super) fn control() -> Vec<u8> {
+        nix::cmsg_space!(nix::sys::time::TimeSpec)
+    }
+
+    /// Asks the system to stamp each datagram as it arrives; gives whether it will.
+    #[cfg(target_os = "linux")]
+    pub(super) fn enable(socket: &UdpSocket) -> bool {
+        setsockopt(socket, sockopt::ReceiveTimestampns, &true).is_ok()
+    }
+
+    /// Asks the system to stamp each datagram as it arrives; gives whether it will.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn enable(socket: &UdpSocket) -> bool {
+        setsockopt(socket, sockopt::ReceiveTimestamp, &true).is_ok()
+    }
+
+    /// Receives a datagram into `buffer`, and gives its length, where it came from, and
+    /// the stamp in nanoseconds of UTC.
+    pub(super) fn receive(
+        socket: &UdpSocket,
+        buffer: &mut [u8],
+        control: &mut [u8],
+    ) -> io::Result<(usize, Option<SocketAddrV4>, Option<i128>)> {
+        let mut parts = [IoSliceMut::new(buffer)];
+        let message = recvmsg::<SockaddrIn>(socket.as_raw_fd(), &mut parts, Some(control), MsgFlags::empty())?;
+        let mut stamp = None;
+        for control in message.cmsgs()? {
+            match control {
+                #[cfg(target_os = "linux")]
+                ControlMessageOwned::ScmTimestampns(t) => {
+                    stamp = Some(i128::from(t.tv_sec()) * 1_000_000_000 + i128::from(t.tv_nsec()));
+                }
+                #[cfg(not(target_os = "linux"))]
+                ControlMessageOwned::ScmTimestamp(t) => {
+                    stamp = Some(i128::from(t.tv_sec()) * 1_000_000_000 + i128::from(t.tv_usec()) * 1000);
+                }
+                _ => {}
+            }
+        }
+        let from = message.address.map(|a| SocketAddrV4::new(a.ip(), a.port()));
+        Ok((message.bytes, from, stamp))
+    }
+}
+
+/// Reads a leg's datagrams, each with when it arrived: as the system stamped it, where
+/// it does, and otherwise when it was read.
+struct Reader {
+    socket: UdpSocket,
+    /// Room for the stamp, when the system stamps datagrams.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    control: Option<Vec<u8>>,
+}
+
+impl Reader {
+    fn new(socket: UdpSocket) -> Self {
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        let control = stamps::enable(&socket).then(stamps::control);
+        Self {
+            socket,
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+            control,
+        }
+    }
+
+    /// Receives a datagram into `buffer`, and gives its length, where it came from, and
+    /// when it arrived in nanoseconds of TAI.
+    fn read(&mut self, buffer: &mut [u8], tai_utc: i32) -> io::Result<(usize, Option<SocketAddrV4>, i128)> {
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        if let Some(control) = &mut self.control {
+            let (n, from, stamp) = stamps::receive(&self.socket, buffer, control)?;
+            let at = stamp.map_or_else(|| tai_now(tai_utc), |utc| utc + i128::from(tai_utc) * NANOS);
+            return Ok((n, from, at));
+        }
+        let (n, from) = self.socket.recv_from(buffer)?;
+        let from = match from {
+            SocketAddr::V4(from) => Some(from),
+            SocketAddr::V6(_) => None,
+        };
+        Ok((n, from, tai_now(tai_utc)))
+    }
 }
 
 /// A datagram as it arrived.
@@ -208,7 +318,8 @@ struct Arrival {
 }
 
 /// Receives on each leg's socket, `sockets[i]` for leg `i`, until `until` nanoseconds of
-/// TAI by the system clock, and gives each datagram to the session as it arrives.
+/// TAI by the system clock, gives each datagram to the session as it arrives, and
+/// finishes the session.
 pub fn receive(
     session: &mut Session,
     sockets: Vec<UdpSocket>,
@@ -223,11 +334,11 @@ pub fn receive(
         let (tx, stop) = (tx.clone(), Arc::clone(&stop));
         threads.push(thread::spawn(move || -> io::Result<()> {
             let mut buffer = vec![0u8; 65_536];
+            let mut reader = Reader::new(socket);
             while !stop.load(Ordering::Relaxed) {
-                match socket.recv_from(&mut buffer) {
-                    Ok((n, SocketAddr::V4(from))) => {
-                        let arrival =
-                            Arrival { leg, source: *from.ip(), at: tai_now(tai_utc), data: buffer[..n].to_vec() };
+                match reader.read(&mut buffer, tai_utc) {
+                    Ok((n, Some(from), at)) => {
+                        let arrival = Arrival { leg, source: *from.ip(), at, data: buffer[..n].to_vec() };
                         if tx.send(arrival).is_err() {
                             break;
                         }
@@ -271,6 +382,6 @@ pub fn receive(
             result = ended;
         }
     }
-    session.finish(sink);
+    session.finish(until, sink);
     result
 }

@@ -45,7 +45,7 @@
 //! // 2026-09-27 12:00:00 UTC, in nanoseconds of TAI, for 40 ms.
 //! let start = 1_790_510_437 * 1_000_000_000;
 //! let sent = sender.run(&mut Loopback(&mut session), start, start + 40_000_000).unwrap();
-//! session.finish(&mut ());
+//! session.finish(start + 40_000_000, &mut ());
 //!
 //! let report = session.report();
 //! assert_eq!((sent.frames, report.video.unwrap().counts.whole), (2, 2));

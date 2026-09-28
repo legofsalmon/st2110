@@ -12,7 +12,7 @@ use st2110_sdp::video::tro_default_progressive;
 
 use crate::audio::AudioPacketiser;
 use crate::describe::{Description, Media};
-use crate::format::VideoFormat;
+use crate::format::{SenderType, VideoFormat};
 use crate::pattern::{Bars, Tone};
 use crate::video::{Layout, Packetiser};
 
@@ -60,7 +60,7 @@ impl Schedule {
         let read_spacing = frame * active / packets as f64;
         let np_rate = packets as f64 * rate;
         // ST 2110-21:2022 §6.6.2, with MAXUDP of 1500.
-        let vrx_full = if format.sender_type == crate::format::SenderType::Wide {
+        let vrx_full = if format.sender_type == SenderType::Wide {
             (np_rate / 300.0).floor().max(720.0)
         } else {
             (np_rate / 27_000.0).floor().max(8.0)
@@ -73,6 +73,23 @@ impl Schedule {
     pub fn send_offset(&self, index: usize) -> i128 {
         (self.read_offset + index as f64 * self.read_spacing - self.lead).round() as i128
     }
+}
+
+/// The rate from which ST 2110-21:2022 §7.1 defines no wide sender, in packets a second.
+pub const WIDE_LIMIT: u64 = 900_000;
+
+/// Whether `packets` a frame of a format come to fewer than [`WIDE_LIMIT`] a second.
+fn below_wide_limit(format: &VideoFormat, packets: usize) -> bool {
+    let (num, den) = (u128::from(format.rate.numerator()), u128::from(format.rate.denominator()));
+    packets as u128 * num < u128::from(WIDE_LIMIT) * den
+}
+
+/// The sender type a format goes out as unless another is asked for: wide, which pacing
+/// on ordinary sockets can hope to keep to, below [`WIDE_LIMIT`] packets a second, and
+/// narrow linear from there, where ST 2110-21 defines no wide sender.
+pub fn default_sender_type(format: &VideoFormat) -> Result<SenderType, String> {
+    let packets = Layout::new(format)?.packets();
+    Ok(if below_wide_limit(format, packets) { SenderType::Wide } else { SenderType::NarrowLinear })
 }
 
 /// What a sender sent.
@@ -116,6 +133,13 @@ impl Sender {
         let signal = match &description.media {
             Media::Video(format) => {
                 let layout = Arc::new(Layout::new(format)?);
+                if format.sender_type == SenderType::Wide && !below_wide_limit(format, layout.packets()) {
+                    return Err(format!(
+                        "ST 2110-21 defines no wide sender (2110TPW) at {:.0} packets a second, {WIDE_LIMIT} or \
+                         more: send {format} as 2110TPN or 2110TPNL",
+                        layout.packets() as f64 * format.rate.to_f64()
+                    ));
+                }
                 Signal::Video {
                     bars: Bars::new(format)?,
                     schedule: Schedule::new(format, layout.packets()),
@@ -126,7 +150,7 @@ impl Sender {
             Media::Audio(format) => Signal::Audio {
                 tone: Tone::new(format, tone, level)?,
                 packetiser: AudioPacketiser::new(format, pt, ssrc, first_sequence as u16)?,
-                per_packet: format.samples_per_packet(),
+                per_packet: format.samples_per_packet,
                 rate: format.sample_rate,
                 samples: Vec::new(),
             },
@@ -259,6 +283,20 @@ mod tests {
         // Gapped: TRS = 20 ms × 1080/1125 ÷ 4320; VRXFULL is 8, so a lead of 4 × TRS.
         assert!((s.read_spacing - 4444.44).abs() < 0.01, "{s:?}");
         assert!((s.lead - 4.0 * s.read_spacing).abs() < 1e-6, "{s:?}");
+    }
+
+    #[test]
+    fn no_wide_sender_from_900_000_packets_a_second() {
+        let mut f = VideoFormat::from_name("2160p59.94").unwrap();
+        assert_eq!(default_sender_type(&f), Ok(SenderType::NarrowLinear));
+        let e = Sender::new(&description(Media::Video(f.clone())), 1000, -18.0, 1, 0).err().unwrap();
+        assert!(
+            e.contains("no wide sender (2110TPW) at 906294 packets a second") && e.contains("as 2110TPN or 2110TPNL"),
+            "{e}"
+        );
+        f.sender_type = SenderType::NarrowLinear;
+        assert!(Sender::new(&description(Media::Video(f)), 1000, -18.0, 1, 0).is_ok());
+        assert_eq!(default_sender_type(&VideoFormat::from_name("2160p50").unwrap()), Ok(SenderType::Wide));
     }
 
     #[test]

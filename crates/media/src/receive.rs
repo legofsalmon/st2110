@@ -1,14 +1,23 @@
-//! Receiving a stream: datagrams from each leg, merged, checked and put back together.
+//! Receiving a stream: datagrams from each leg, merged, put back in sequence order,
+//! checked and put back together.
 
 use std::net::Ipv4Addr;
 
 use crate::audio::{AudioCounts, AudioDepacketiser};
 use crate::describe::{Description, Media};
-use crate::merge::{Extender, LegCounts, Merger, Skew, Verdict, receiver_class};
+use crate::merge::{Extender, LegCounts, Merger, Pace, Playout, Released, Skew, Verdict, receiver_class};
 use crate::rtp;
 use crate::video::{Depacketiser, FrameInfo, Layout, VideoCounts};
 
 const NANOS: i128 = 1_000_000_000;
+
+/// How long a receiver waits by default for a missing packet, for its copy on a leg
+/// that runs behind or for one that comes out of order: 50 ms, as far as ST 2022-7
+/// class B receivers allow the legs to differ.
+pub const DEFAULT_MAX_SKEW_NS: i64 = 50_000_000;
+
+/// The longest a receiver will wait: a second, more than class C's 450 ms.
+pub const MOST_SKEW_NS: i64 = 1_000_000_000;
 
 /// Where received pictures and sound go.
 pub trait Sink {
@@ -92,15 +101,22 @@ pub struct LegReport {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct VideoReport {
-    /// Packets each frame should have.
-    pub packets_per_frame: usize,
+    /// Packets a frame had, as the last frame to arrive whole with no gap in its
+    /// sequence numbers had them.
+    pub packets_per_frame: Option<u32>,
     /// Frames, packets and faults the depacketiser counted.
     pub counts: VideoCounts,
     /// Frames that never arrived at all: steps of more than one frame between the RTP
-    /// timestamps of the frames either side.
+    /// timestamps of the frames either side, with the packets missing between to match.
     pub skipped: u64,
+    /// Frames the RTP timestamps skip with no packets missing between: the sender paused
+    /// or left them out, or its clock stepped on a few frames.
+    pub unsent: u64,
     /// Steps between RTP timestamps that are not a whole number of frames.
     pub irregular: u64,
+    /// Times the RTP timestamps and sequence numbers disagreed: the timestamps stood
+    /// still or stepped back, or moved on fewer frames than the packets missing between.
+    pub jumps: u64,
     /// Frames a second, by the arrival of their first packets.
     pub frame_rate: Option<f64>,
 }
@@ -127,18 +143,23 @@ pub struct Report {
     pub seconds: f64,
     /// Megabits a second of RTP that the merged stream carried.
     pub megabits_per_second: f64,
-    /// The synchronisation source of the first packet.
+    /// The synchronisation source of the stream, since it last restarted.
     pub ssrc: Option<u32>,
-    /// Times the synchronisation source changed.
-    pub ssrc_changes: u64,
-    /// Packets passed on after merging: the first copy of each.
+    /// Packets passed on after merging the legs, in sequence order.
     pub passed: u64,
-    /// Packets no leg delivered in time.
+    /// Packets no leg delivered.
     pub lost: u64,
-    /// Copies too late for the merge window.
+    /// Packets that came after the receiver had stopped waiting for them.
     pub too_late: u64,
-    /// Jumps in the sequence numbers, where the sender restarted.
-    pub jumps: u64,
+    /// How long the receiver waits for a missing packet, in milliseconds.
+    pub max_skew_ms: f64,
+    /// Times the sender restarted: a new synchronisation source, or sequence numbers or
+    /// timestamps that started again elsewhere.
+    pub restarts: u64,
+    /// Packets that fitted neither the stream nor a restart, left out.
+    pub strays: u64,
+    /// Packets from before the sender restarted that came after it, left out.
+    pub stale: u64,
     /// How far apart the legs' copies arrived, with two legs.
     pub skew: Option<Skew>,
     /// The tightest ST 2022-7 receiver class that allows the skew: D, A, B or C.
@@ -173,86 +194,138 @@ struct LegState {
 struct Frames {
     /// Ticks of the 90 kHz clock a frame.
     step: f64,
-    last_timestamp: Option<u32>,
-    /// When the first packets of the first and last frames that receiving did not cut
-    /// off arrived, and how many such frames there were.
-    first_arrival: Option<i128>,
-    last_arrival: i128,
-    timed: u64,
+    /// The last frame: its RTP timestamp and highest sequence number, and when its first
+    /// packet arrived, unless receiving cut it off.
+    last: Option<(u32, u32, Option<i128>)>,
+    /// Frame periods between frames whose first packets came, and the nanoseconds
+    /// between their arrivals.
+    periods: u64,
+    span: i128,
     skipped: u64,
+    unsent: u64,
     irregular: u64,
+    jumps: u64,
 }
 
 impl Frames {
-    fn add(&mut self, info: &FrameInfo, latency: &mut Accumulator) {
+    fn add(&mut self, info: &FrameInfo, packets_per_frame: Option<u32>, latency: &mut Accumulator) {
         // A frame cut off at the start did not arrive from its first packet.
-        if !info.cut {
-            latency.add(since_timestamp(info.timestamp, info.first_arrival, 90_000) / 1000.0);
-            self.first_arrival.get_or_insert(info.first_arrival);
-            self.last_arrival = info.first_arrival;
-            self.timed += 1;
+        let arrival = (!info.cut).then_some(info.first_arrival);
+        if let Some(at) = arrival {
+            latency.add(since_timestamp(info.timestamp, at, 90_000) / 1000.0);
         }
-        if let Some(last) = self.last_timestamp {
-            let step = f64::from(info.timestamp.wrapping_sub(last));
+        if let Some((timestamp, sequence, last_arrival)) = self.last {
+            let step = f64::from(info.timestamp.wrapping_sub(timestamp) as i32);
             let frames = (step / self.step).round();
-            if (step - frames * self.step).abs() > 1.5 || frames < 1.0 {
-                self.irregular += 1;
+            // Frames' worth of packets missing between the two: a frame lost on the way took
+            // its packets with it, and one the sender left out never had any.
+            let between = info.first_sequence.wrapping_sub(sequence).wrapping_sub(1) as i32;
+            let missing = match packets_per_frame {
+                _ if between < 0 => None,
+                Some(per) => Some(f64::from(between) / f64::from(per)),
+                None => (between == 0).then_some(0.0),
+            };
+            // Up to two frames more than the timestamps skip, for packets missing from the
+            // frames either side.
+            if frames < 1.0 || missing.is_some_and(|n| n >= frames + 1.0) {
+                self.jumps += 1;
             } else {
-                self.skipped += frames as u64 - 1;
+                if (step - frames * self.step).abs() > 1.5 {
+                    self.irregular += 1;
+                }
+                let skipped = frames - 1.0;
+                let lost = missing.map_or(skipped, |n| n.floor().min(skipped));
+                self.skipped += lost as u64;
+                self.unsent += (skipped - lost) as u64;
+                if let (Some(at), Some(last)) = (arrival, last_arrival) {
+                    self.periods += frames as u64;
+                    self.span += at - last;
+                }
             }
         }
-        self.last_timestamp = Some(info.timestamp);
+        self.last = Some((info.timestamp, info.last_sequence, arrival));
     }
 }
 
 enum Essence {
-    Video { depacketiser: Box<Depacketiser>, packets: usize, frames: Frames },
+    Video { depacketiser: Box<Depacketiser>, frames: Frames },
     Audio { depacketiser: AudioDepacketiser, extender: Extender },
 }
 
+/// A packet the merger holds until the next shows what it is.
+struct Held {
+    sequence: u32,
+    at: i128,
+    data: Vec<u8>,
+}
+
 /// Receives one stream: takes the datagrams that arrive on each leg, merges the legs,
-/// puts frames or samples back together for a [`Sink`], and reports what it found.
+/// puts the packets back in sequence order, puts frames or samples back together for a
+/// [`Sink`], and reports what it found.
 pub struct Session {
     description: Description,
+    max_skew: i64,
     legs: Vec<LegState>,
     merger: Merger,
+    playout: Playout,
     essence: Essence,
-    ssrc: Option<u32>,
-    last_ssrc: Option<u32>,
-    ssrc_changes: u64,
+    held: Option<Held>,
     first: Option<i128>,
     last: i128,
-    passed_octets: u64,
+    /// Octets of RTP passed on.
+    octets: u64,
     latency: Accumulator,
 }
 
 impl Session {
-    /// A receiver of the stream a description gives.
+    /// A receiver of the stream a description gives, that waits
+    /// [`DEFAULT_MAX_SKEW_NS`] for a missing packet.
     pub fn new(description: &Description) -> Result<Self, String> {
+        Self::with_max_skew(description, DEFAULT_MAX_SKEW_NS)
+    }
+
+    /// A receiver that waits up to `max_skew` nanoseconds for a missing packet: for its
+    /// copy on a leg that runs behind, or for one that comes out of order. The packets
+    /// after it wait too, so it holds up to that long's worth of them.
+    pub fn with_max_skew(description: &Description, max_skew: i64) -> Result<Self, String> {
         description.check()?;
-        let (essence, rate) = match &description.media {
+        if !(0..=MOST_SKEW_NS).contains(&max_skew) {
+            return Err(format!("a wait of {} ms is not 0 to {} ms", max_skew as f64 / 1e6, MOST_SKEW_NS / 1_000_000));
+        }
+        let (essence, packets_per_second, pace) = match &description.media {
             Media::Video(format) => {
-                let packets = Layout::new(format)?.packets();
-                let frames = Frames { step: 90_000.0 / format.rate.to_f64(), ..Frames::default() };
+                // As this crate's senders cut frames up: others may cut them otherwise,
+                // which the merger measures.
+                let packets = Layout::new(format)?.packets() as f64;
+                let frame = 90_000.0 / format.rate.to_f64();
                 let depacketiser = Box::new(Depacketiser::new(format)?);
-                (Essence::Video { depacketiser, packets, frames }, packets as f64 * format.rate.to_f64())
+                (
+                    Essence::Video { depacketiser, frames: Frames { step: frame, ..Frames::default() } },
+                    packets * format.rate.to_f64(),
+                    Pace { ticks_per_packet: frame / packets, slack: 2.0 * frame, clock_rate: 90_000.0 },
+                )
             }
-            Media::Audio(format) => (
-                Essence::Audio { depacketiser: AudioDepacketiser::new(format)?, extender: Extender::default() },
-                1e6 / f64::from(format.packet_time_us),
-            ),
+            Media::Audio(format) => {
+                let per = f64::from(format.samples_per_packet);
+                (
+                    Essence::Audio { depacketiser: AudioDepacketiser::new(format)?, extender: Extender::default() },
+                    f64::from(format.sample_rate) / per,
+                    Pace { ticks_per_packet: per, slack: 2.0 * per, clock_rate: f64::from(format.sample_rate) },
+                )
+            }
         };
+        let merger = Merger::new(description.legs.len(), Merger::window_for(packets_per_second, max_skew), pace);
         Ok(Self {
             legs: vec![LegState::default(); description.legs.len()],
-            merger: Merger::new(description.legs.len(), Merger::window_for(rate)),
+            playout: Playout::new(max_skew, u64::from(merger.window())),
+            merger,
             description: description.clone(),
+            max_skew,
             essence,
-            ssrc: None,
-            last_ssrc: None,
-            ssrc_changes: 0,
+            held: None,
             first: None,
             last: 0,
-            passed_octets: 0,
+            octets: 0,
             latency: Accumulator::default(),
         })
     }
@@ -280,7 +353,7 @@ impl Session {
             state.other_type += 1;
             return;
         }
-        let sequence = match &mut self.essence {
+        let sequence = match &self.essence {
             Essence::Video { .. } => match rtp::payload(datagram, &header) {
                 [high, low, ..] => (u32::from(u16::from_be_bytes([*high, *low])) << 16) | u32::from(header.sequence),
                 _ => {
@@ -292,41 +365,39 @@ impl Session {
         };
         self.first.get_or_insert(at);
         self.last = self.last.max(at);
-        self.ssrc.get_or_insert(header.ssrc);
-        if self.last_ssrc.is_some_and(|last| last != header.ssrc) {
-            self.ssrc_changes += 1;
-        }
-        self.last_ssrc = Some(header.ssrc);
-        if self.merger.push(leg, sequence, at) != Verdict::First {
-            return;
-        }
-        self.passed_octets += datagram.len() as u64;
-        match &mut self.essence {
-            Essence::Video { depacketiser, frames, .. } => {
-                let latency = &mut self.latency;
-                depacketiser.push(at, datagram, |info, pixels| {
-                    frames.add(info, latency);
-                    sink.frame(info, pixels);
-                });
+        match self.merger.push(leg, header.ssrc, sequence, header.timestamp, at) {
+            Verdict::First => self.play(sequence, at, datagram, sink),
+            Verdict::Held => self.held = Some(Held { sequence, at, data: datagram.to_vec() }),
+            Verdict::Resumed => {
+                self.play_held(sink);
+                self.play(sequence, at, datagram, sink);
             }
-            Essence::Audio { depacketiser, .. } => {
-                let rate = self.description.media.clock_rate();
-                self.latency.add(since_timestamp(header.timestamp, at, rate) / 1000.0);
-                depacketiser.push(datagram, |samples| sink.samples(samples));
+            Verdict::Restart => {
+                // What came before plays out, and the new stream starts afresh.
+                self.flush(None, sink);
+                self.playout.reset();
+                match &mut self.essence {
+                    Essence::Video { depacketiser, frames } => {
+                        depacketiser.reset();
+                        frames.last = None;
+                    }
+                    Essence::Audio { depacketiser, extender } => {
+                        depacketiser.reset();
+                        extender.reset();
+                    }
+                }
+                self.play_held(sink);
+                self.play(sequence, at, datagram, sink);
             }
+            Verdict::Copy | Verdict::TooLate | Verdict::Stale => {}
         }
     }
 
-    /// Finishes the frame being put together, if there is one: call it when no more
-    /// packets will come.
-    pub fn finish(&mut self, sink: &mut impl Sink) {
-        if let Essence::Video { depacketiser, frames, .. } = &mut self.essence {
-            let latency = &mut self.latency;
-            depacketiser.flush(|info, pixels| {
-                frames.add(info, latency);
-                sink.frame(info, pixels);
-            });
-        }
+    /// Lets go the packets still waiting for missing ones, and finishes the frame being
+    /// put together: call it when receiving stops, at `end` nanoseconds of TAI. A frame
+    /// still arriving then was cut off.
+    pub fn finish(&mut self, end: i128, sink: &mut impl Sink) {
+        self.flush(Some(end), sink);
     }
 
     /// The last video frame that arrived whole.
@@ -337,11 +408,43 @@ impl Session {
         }
     }
 
+    /// Passes a packet of the stream to the playout.
+    fn play(&mut self, sequence: u32, at: i128, data: &[u8], sink: &mut impl Sink) {
+        let Self { playout, essence, latency, octets, description, .. } = self;
+        if let Essence::Audio { extender, .. } = essence {
+            extender.take(sequence);
+        }
+        let clock_rate = description.media.clock_rate();
+        playout.push(sequence, at, data, |packet| release(essence, latency, octets, clock_rate, packet, sink));
+    }
+
+    fn play_held(&mut self, sink: &mut impl Sink) {
+        if let Some(held) = self.held.take() {
+            self.play(held.sequence, held.at, &held.data, sink);
+        }
+    }
+
+    /// Lets go every packet the playout holds, and finishes the frame being put
+    /// together: `end` when receiving stopped then, `None` when the stream did.
+    fn flush(&mut self, end: Option<i128>, sink: &mut impl Sink) {
+        let Self { playout, essence, latency, octets, description, .. } = self;
+        let clock_rate = description.media.clock_rate();
+        playout.finish(|packet| release(essence, latency, octets, clock_rate, packet, sink));
+        if let Essence::Video { depacketiser, frames } = essence {
+            let per_frame = depacketiser.packets_per_frame();
+            depacketiser.flush(end, |info, pixels| {
+                frames.add(info, per_frame, latency);
+                sink.frame(info, pixels);
+            });
+        }
+    }
+
     /// What it found so far.
     pub fn report(&self) -> Report {
         let merged = self.merger.counts();
+        let played = self.playout.counts();
         let seconds = self.first.map_or(0.0, |first| (self.last - first) as f64 / 1e9);
-        let megabits_per_second = if seconds > 0.0 { self.passed_octets as f64 * 8.0 / seconds / 1e6 } else { 0.0 };
+        let megabits_per_second = if seconds > 0.0 { self.octets as f64 * 8.0 / seconds / 1e6 } else { 0.0 };
         let legs: Vec<LegReport> = self
             .legs
             .iter()
@@ -361,12 +464,14 @@ impl Session {
             stream: self.description.media.to_string(),
             seconds,
             megabits_per_second,
-            ssrc: self.ssrc,
-            ssrc_changes: self.ssrc_changes,
-            passed: merged.passed,
+            ssrc: self.merger.ssrc(),
+            passed: played.released,
             lost: merged.lost,
-            too_late: merged.too_late,
-            jumps: merged.jumps,
+            too_late: played.too_late,
+            max_skew_ms: self.max_skew as f64 / 1e6,
+            restarts: merged.restarts,
+            strays: merged.strays,
+            stale: merged.stale,
             skew: merged.skew,
             class: merged.skew.and_then(|s| receiver_class(s.max_ns, megabits_per_second * 1e6)).map(|c| c.to_string()),
             latency: self.latency.spread(),
@@ -374,16 +479,16 @@ impl Session {
             ..Report::default()
         };
         match &self.essence {
-            Essence::Video { depacketiser, packets, frames } => {
-                let frame_rate = frames
-                    .first_arrival
-                    .filter(|&first| frames.timed > 1 && frames.last_arrival > first)
-                    .map(|first| (frames.timed - 1) as f64 * 1e9 / (frames.last_arrival - first) as f64);
+            Essence::Video { depacketiser, frames } => {
+                let frame_rate =
+                    (frames.periods > 0 && frames.span > 0).then(|| frames.periods as f64 * 1e9 / frames.span as f64);
                 report.video = Some(VideoReport {
-                    packets_per_frame: *packets,
+                    packets_per_frame: depacketiser.packets_per_frame(),
                     counts: depacketiser.counts(),
                     skipped: frames.skipped,
+                    unsent: frames.unsent,
                     irregular: frames.irregular,
+                    jumps: frames.jumps,
                     frame_rate,
                 });
             }
@@ -405,20 +510,31 @@ impl Session {
         }
         for (i, leg) in r.legs.iter().enumerate() {
             let name = format!("leg {} ({})", i + 1, leg.leg);
-            if leg.rtp.received == 0 {
-                problems
-                    .push(format!("{name} received none of the stream's packets, so it has no ST 2022-7 protection"));
-            } else if two && leg.rtp.lost > 0 {
-                notes.push(format!("{name} lost {}", count(leg.rtp.lost, "packet")));
+            let rtp = &leg.rtp;
+            if rtp.received == 0 {
+                let protection = if two { ", so the stream has no ST 2022-7 protection" } else { "" };
+                problems.push(format!("{name} received none of the stream's packets{protection}"));
+            } else if two && rtp.lost > 0 {
+                notes.push(format!("{name} lost {}", count(rtp.lost, "packet")));
             }
-            let left_out = [
-                (leg.other_source, "from other sources"),
-                (leg.other_payload_type, "of other payload types"),
-                (leg.not_rtp, "that are not the stream's RTP"),
+            if rtp.too_late > 0 {
+                problems.push(format!(
+                    "{name} ran more than {} behind the other: {} came too late to merge",
+                    count(u64::from(self.merger.window()), "packet"),
+                    count(rtp.too_late, "packet")
+                ));
+            }
+            let seen = [
+                (rtp.reordered, "arrived out of order"),
+                (rtp.duplicates, "arrived twice"),
+                (leg.other_source, "from other sources left out"),
+                (leg.other_payload_type, "of other payload types left out"),
+                (leg.not_rtp, "that are not the stream's RTP left out"),
             ];
-            for (n, what) in left_out {
+            for (n, what) in seen {
                 if n > 0 {
-                    notes.push(format!("{name}: {} {what} left out", count(n, "datagram")));
+                    let noun = if what.ends_with("left out") { "datagram" } else { "packet" };
+                    notes.push(format!("{name}: {} {what}", count(n, noun)));
                 }
             }
         }
@@ -427,13 +543,25 @@ impl Session {
             problems.push(format!("{} lost{after}", count(r.lost, "packet")));
         }
         if r.too_late > 0 {
-            notes.push(format!("{} came too late to merge", count(r.too_late, "packet")));
+            problems.push(format!(
+                "{} came too late to play, after the receiver had waited {} ms for {}",
+                count(r.too_late, "packet"),
+                r.max_skew_ms,
+                if r.too_late == 1 { "it" } else { "them" }
+            ));
         }
-        if r.jumps > 0 {
-            notes.push(format!("the sequence numbers jumped {}: the sender restarted", count(r.jumps, "time")));
+        if r.restarts > 0 {
+            problems.push(format!(
+                "the stream restarted {}: a new synchronisation source, or sequence numbers or timestamps that \
+                 started again elsewhere",
+                times(r.restarts)
+            ));
         }
-        if r.ssrc_changes > 0 {
-            notes.push(format!("the synchronisation source changed {}", count(r.ssrc_changes, "time")));
+        if r.strays > 0 {
+            notes.push(format!("{} fitted neither the stream nor a restart, left out", count(r.strays, "packet")));
+        }
+        if r.stale > 0 {
+            notes.push(format!("{} from before the restart came after it, left out", count(r.stale, "packet")));
         }
         if let Some(video) = &r.video {
             let c = video.counts;
@@ -444,37 +572,101 @@ impl Session {
             if video.skipped > 0 {
                 problems.push(format!("{} never arrived", count(video.skipped, "frame")));
             }
+            if video.unsent > 0 {
+                let them = if video.unsent == 1 { "it" } else { "them" };
+                problems.push(format!(
+                    "{} never sent: the RTP timestamps skip {them}, with no packets missing to match, so the sender \
+                     left {them} out or its clock stepped",
+                    count(video.unsent, "frame")
+                ));
+            }
+            if video.jumps > 0 {
+                problems.push(format!(
+                    "the RTP timestamps and sequence numbers disagreed {}: the timestamps stood still or stepped \
+                     back, or moved on fewer frames than the packets missing",
+                    times(video.jumps)
+                ));
+            }
             if c.malformed > 0 {
                 problems
                     .push(format!("{} had payload headers that do not fit the format", count(c.malformed, "packet")));
             }
             if c.late > 0 {
-                notes.push(format!("{} came after their frame was finished", count(c.late, "packet")));
+                notes.push(format!(
+                    "{} came after {} frame was finished",
+                    count(c.late, "packet"),
+                    if c.late == 1 { "its" } else { "their" }
+                ));
             }
             if video.irregular > 0 {
-                notes.push(format!("{} between RTP timestamps are not whole frames", count(video.irregular, "step")));
+                notes.push(format!(
+                    "{} between RTP timestamps {} not a whole number of frames",
+                    count(video.irregular, "step"),
+                    if video.irregular == 1 { "is" } else { "are" }
+                ));
             }
         }
         if let (Some(audio), Media::Audio(format)) = (&r.audio, &self.description.media) {
             let c = audio.counts;
+            let ms = |samples: u64| samples as f64 * 1000.0 / f64::from(format.sample_rate);
             if c.missing > 0 {
-                let ms = c.missing as f64 * 1000.0 / f64::from(format.sample_rate);
-                problems.push(format!("{ms:.3} ms of audio missing, filled with silence"));
+                problems.push(format!("{:.3} ms of audio missing, filled with silence", ms(c.missing)));
+            }
+            if c.unsent > 0 {
+                problems.push(format!(
+                    "{:.3} ms of audio never sent, filled with silence: the RTP timestamps skip it, with no packets \
+                     missing to match",
+                    ms(c.unsent)
+                ));
             }
             if c.malformed > 0 {
-                problems.push(format!("{} are not whole sampling instants", count(c.malformed, "packet")));
-            }
-            if c.late > 0 {
-                notes.push(format!("{} came after later ones had been played", count(c.late, "packet")));
-            }
-            if c.odd_sized > 0 {
-                notes.push(format!("{} differ from the packet time", count(c.odd_sized, "packet")));
+                let does = if c.malformed == 1 { "does" } else { "do" };
+                problems.push(format!("{} {does} not hold whole sampling instants", count(c.malformed, "packet")));
             }
             if c.jumps > 0 {
-                notes.push(format!("the RTP timestamps jumped {}", count(c.jumps, "time")));
+                problems.push(format!(
+                    "the RTP timestamps and sequence numbers disagreed {}: the timestamps stood still or stepped \
+                     back, or moved on less than the packets missing",
+                    times(c.jumps)
+                ));
+            }
+            if c.odd_sized > 0 {
+                let differ = if c.odd_sized == 1 { "differs" } else { "differ" };
+                notes.push(format!("{} {differ} from the packet time", count(c.odd_sized, "packet")));
             }
         }
     }
+}
+
+/// Passes a packet the playout let go to the depacketiser.
+fn release(
+    essence: &mut Essence,
+    latency: &mut Accumulator,
+    octets: &mut u64,
+    clock_rate: u32,
+    packet: Released<'_>,
+    sink: &mut impl Sink,
+) {
+    *octets += packet.data.len() as u64;
+    match essence {
+        Essence::Video { depacketiser, frames } => {
+            let per_frame = depacketiser.packets_per_frame();
+            depacketiser.push(packet.at, packet.data, |info, pixels| {
+                frames.add(info, per_frame, latency);
+                sink.frame(info, pixels);
+            });
+        }
+        Essence::Audio { depacketiser, .. } => {
+            if let Some(header) = rtp::read_header(packet.data) {
+                latency.add(since_timestamp(header.timestamp, packet.at, clock_rate) / 1000.0);
+            }
+            depacketiser.push(packet.data, packet.missing, |samples| sink.samples(samples));
+        }
+    }
+}
+
+fn times(n: u64) -> String {
+    if n == 1 { "once".into() } else { format!("{n} times") }
 }
 
 fn count(n: u64, noun: &str) -> String {
@@ -573,7 +765,7 @@ mod tests {
         }
         // A stranger on leg 2, and a packet from elsewhere.
         session.push(1, a, T, &out.0[0].0, &mut sink);
-        session.finish(&mut sink);
+        session.finish(T + 5 * 20_000_000, &mut sink);
         let r = session.report();
         assert_eq!(sink.frames.len(), 5);
         assert!(sink.frames.iter().all(|f| f.whole), "{:?}", sink.frames);
@@ -607,11 +799,11 @@ mod tests {
         for (packet, at) in out.0.iter().enumerate().filter(|(i, _)| i / packets != 1).map(|(_, p)| p) {
             session.push(0, Ipv4Addr::new(10, 0, 0, 1), *at, packet, &mut ());
         }
-        session.finish(&mut ());
+        session.finish(T + 4 * 40_000_000, &mut ());
         let r = session.report();
         let video = r.video.unwrap();
         assert_eq!((video.skipped, video.counts.frames, video.counts.whole), (1, 3, 3));
-        assert_eq!((r.lost, video.counts.missing), (packets as u64, packets as u64));
+        assert_eq!((r.lost, video.counts.missing, video.packets_per_frame), (packets as u64, 0, Some(packets as u32)));
         assert_eq!(r.problems, [format!("{packets} packets lost"), "1 frame never arrived".to_string()]);
 
         let mut d = two_legs(Media::Audio(AudioFormat::new(2)));
@@ -625,6 +817,9 @@ mod tests {
                 session.push(0, Ipv4Addr::new(10, 0, 0, 1), *at, packet, &mut sink);
             }
         }
+        // The packets after the gap wait for it, until receiving stops.
+        assert_eq!(sink.samples, 4 * 96);
+        session.finish(T + 10_000_000, &mut sink);
         let r = session.report();
         assert_eq!(sink.samples, 10 * 96);
         let audio = r.audio.unwrap();

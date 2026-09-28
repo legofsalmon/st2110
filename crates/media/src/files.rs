@@ -108,9 +108,15 @@ impl<W: Write + Seek> WavWriter<W> {
 
     /// Fills in the sizes, which WAV counts in 32 bits, and hands back the file.
     pub fn finish(mut self) -> io::Result<W> {
-        let data = u32::try_from(self.written).unwrap_or(u32::MAX - 36);
+        // A chunk of odd length has a pad octet after it, which RIFF counts but the chunk
+        // does not.
+        let pad = (self.written % 2) as u32;
+        if pad == 1 {
+            self.out.write_all(&[0])?;
+        }
+        let data = self.written.min(u64::from(u32::MAX - 37)) as u32;
         self.out.seek(SeekFrom::Start(4))?;
-        self.out.write_all(&(data + 36).to_le_bytes())?;
+        self.out.write_all(&(data + pad + 36).to_le_bytes())?;
         self.out.seek(SeekFrom::Start(40))?;
         self.out.write_all(&data.to_le_bytes())?;
         self.out.seek(SeekFrom::End(0))?;
@@ -261,6 +267,13 @@ mod tests {
         assert_eq!(u32::from_le_bytes(file[28..32].try_into().unwrap()), 48_000 * 6);
         assert_eq!(u32::from_le_bytes(file[40..44].try_into().unwrap()), 12);
         assert_eq!(&file[44..], [1, 0, 0, 0xFF, 0xFF, 0xFF, 0x56, 0x34, 0x12, 0xAA, 0xCB, 0xED]);
+        // One 24-bit sample: three octets of data, and a pad octet.
+        let mut w = WavWriter::new(Cursor::new(Vec::new()), 1, 48_000, 24).unwrap();
+        w.write(&[7]).unwrap();
+        let file = w.finish().unwrap().into_inner();
+        assert_eq!(file.len(), 44 + 4);
+        assert_eq!(u32::from_le_bytes(file[4..8].try_into().unwrap()), 36 + 4);
+        assert_eq!(u32::from_le_bytes(file[40..44].try_into().unwrap()), 3);
     }
 
     #[test]

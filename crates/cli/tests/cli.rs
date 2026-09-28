@@ -885,8 +885,10 @@ fn audio_goes_through_a_capture_into_a_wav_file() {
 
 #[test]
 fn sends_and_receives_over_the_loopback_interface() {
-    let free_port = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let (one, two) = (format!("127.0.0.1:{}", free_port()), format!("127.0.0.1:{}", free_port()));
+    // Two free ports: both stay taken until both are read, so they differ.
+    let probes = [0; 2].map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let [one, two] = probes.each_ref().map(|p| format!("127.0.0.1:{}", p.local_addr().unwrap().port()));
+    drop(probes);
     let mut sender = Command::new(env!("CARGO_BIN_EXE_st2110"))
         .args(["send", "audio", "--to", &one, "--to", &two, "--clock", "traceable", "--duration", "1.5"])
         .stdout(Stdio::piped())
@@ -935,7 +937,25 @@ fn send_and_receive_refuse_what_they_cannot_do() {
     );
     refused(
         &["send", "audio", "--to", "239.1.1.1:5004", "--packet-time", "0.3", "--clock", "traceable"],
-        "300 µs is not a packet time",
+        "0.3 ms is 14.40 samples at 48 kHz: give a whole number of samples, such as 0.292 or 0.312 ms",
+    );
+    refused(
+        &[
+            "send",
+            "video",
+            "2160p59.94",
+            "--sender-type",
+            "wide",
+            "--to",
+            "239.1.1.1:5004",
+            "--clock",
+            "traceable",
+            "--pcap",
+            "x",
+            "--duration",
+            "1",
+        ],
+        "ST 2110-21 defines no wide sender (2110TPW) at 906294 packets a second",
     );
     refused(&["receive", "no-such-file.sdp"], "st2110: no-such-file.sdp: ");
     let audio = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=tone\r\nt=0 0\r\nm=audio 5004 RTP/AVP 97\r\n\
@@ -944,4 +964,41 @@ fn send_and_receive_refuse_what_they_cannot_do() {
     let output = with_stdin(&["receive", "-", "--png", "x.png"], audio);
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("--png is for video streams"), "{}", stderr(&output));
+    let output = with_stdin(&["receive", "-", "--max-skew", "2000"], audio);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--max-skew 2000 is not 0 to 1000 ms"), "{}", stderr(&output));
+}
+
+#[test]
+fn audio_at_44_1_khz_keeps_whole_samples_a_packet() {
+    let dir = Scratch::new("audio-44k");
+    let (sdp, pcap) = (dir.path("a.sdp"), dir.path("a.pcap"));
+    let output = st2110(&[
+        "send",
+        "audio",
+        "--sample-rate",
+        "44100",
+        "--to",
+        "239.10.4.1:5004",
+        "--clock",
+        "traceable",
+        "--duration",
+        "0.1",
+        "--sdp",
+        &sdp,
+        "--pcap",
+        &pcap,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("of L24 44.1 kHz, 2 channels, 997.7 µs ("), "{}", stderr(&output));
+    // 1 ms is 44 samples, which ptime=1 gives back to a receiver that rounds.
+    let text = std::fs::read_to_string(&sdp).unwrap();
+    assert!(text.contains("a=rtpmap:97 L24/44100/2\r\n") && text.contains("a=ptime:1\r\n"), "{text}");
+    let output = st2110(&["receive", &sdp, "--pcap", &pcap, "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let (packets, samples) = (&json["audio"]["counts"]["packets"], &json["audio"]["counts"]["samples"]);
+    assert_eq!(samples.as_u64(), packets.as_u64().map(|p| p * 44), "{json}");
+    assert!(packets.as_u64().is_some_and(|p| (100..=101).contains(&p)), "{json}");
+    assert_eq!(json["problems"], serde_json::json!([]));
 }

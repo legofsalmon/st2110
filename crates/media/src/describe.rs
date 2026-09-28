@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use st2110_sdp::{ClockIdentity, Fmtp, RefClock, Section, parse_connection, parse_media_line, parse_rtpmap};
 
-use crate::format::{AudioFormat, VideoFormat};
+use crate::format::{AudioFormat, VideoFormat, samples_in};
 
 /// What a stream carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,11 +141,17 @@ impl Description {
             [] => return Err("the stream has no destination".into()),
             [_] => {}
             [a, b] => {
-                // ST 2110-10:2022 §8.5 and RFC 7104.
-                if a.destination == b.destination && a.source == b.source {
+                // ST 2110-10:2022 §8.5 and RFC 7104: a multicast group is one path, whatever
+                // the port.
+                let same = if a.destination.ip().is_multicast() {
+                    a.destination.ip() == b.destination.ip()
+                } else {
+                    a.destination == b.destination
+                };
+                if same && a.source == b.source {
                     return Err(format!(
                         "both legs go to {} from the same source: ST 2022-7 legs need different destination or source addresses",
-                        a.destination
+                        a.destination.ip()
                     ));
                 }
             }
@@ -160,10 +166,13 @@ impl Description {
     }
 
     /// The SDP file, following ST 2110-10 §8 and, for two legs, RFC 7104's separate
-    /// destination or source addresses with `a=group:DUP`.
+    /// destination or source addresses with `a=group:DUP`. The session name goes on one
+    /// line, `-` when it is empty.
     pub fn sdp(&self, session_id: u64) -> String {
         let origin = self.legs.first().and_then(|l| l.source).unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let mut text = format!("v=0\r\no=- {session_id} {session_id} IN IP4 {origin}\r\ns={}\r\nt=0 0\r\n", self.name);
+        let name = self.name.replace(['\r', '\n'], " ");
+        let name = if name.trim().is_empty() { "-" } else { name.trim() };
+        let mut text = format!("v=0\r\no=- {session_id} {session_id} IN IP4 {origin}\r\ns={name}\r\nt=0 0\r\n");
         let mids = ["primary", "secondary"];
         if self.legs.len() > 1 {
             text.push_str(&format!("a=group:DUP {}\r\n", mids[..self.legs.len()].join(" ")));
@@ -300,7 +309,7 @@ fn media(section: &Section) -> Result<(Media, u8), String> {
             if rtpmap.clock_rate != 90_000 {
                 return Err(format!("raw video at {} Hz: ST 2110-20 uses a 90 kHz clock", rtpmap.clock_rate));
             }
-            Media::Video(VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string))?)
+            Media::Video(VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name))?)
         }
         ("audio", "L24" | "L16") => {
             let channels = match rtpmap.params.as_deref() {
@@ -308,12 +317,16 @@ fn media(section: &Section) -> Result<(Media, u8), String> {
                 Some(n) => n.trim().parse().map_err(|_| format!("{n} is not a channel count"))?,
             };
             let ptime = section.attribute("ptime").map(|a| a.text()).unwrap_or("1");
-            let ms: f64 = ptime.parse().map_err(|_| format!("a=ptime:{ptime} is not a packet time"))?;
+            let ms: f64 = ptime
+                .parse()
+                .ok()
+                .filter(|ms: &f64| *ms > 0.0 && *ms <= 4.0)
+                .ok_or_else(|| format!("a=ptime:{ptime} is not a packet time up to 4 ms"))?;
             let format = AudioFormat {
                 channels,
                 sample_rate: rtpmap.clock_rate,
                 bits: if encoding == "L16" { 16 } else { 24 },
-                packet_time_us: (ms * 1000.0).round() as u32,
+                samples_per_packet: samples_in(rtpmap.clock_rate, ms),
             };
             format.check()?;
             Media::Audio(format)
@@ -366,7 +379,7 @@ mod tests {
 
         let audio = Description {
             name: "Tone".into(),
-            media: Media::Audio(AudioFormat { packet_time_us: 125, ..AudioFormat::new(8) }),
+            media: Media::Audio(AudioFormat::new(8).with_packet_time(0.125).unwrap()),
             payload_type: 97,
             legs: vec![leg("10.0.0.2:5006", None)],
             clock: Some(Clock::Traceable),
@@ -395,10 +408,29 @@ mod tests {
     }
 
     #[test]
+    fn names_go_on_one_line() {
+        let mut d = video();
+        d.name = "Bars\r\na=tool:evil".into();
+        assert!(d.sdp(1).contains("\r\ns=Bars  a=tool:evil\r\n"));
+        d.name = " \n ".into();
+        let text = d.sdp(1);
+        assert!(text.contains("\r\ns=-\r\n"), "{text}");
+        assert!(!st2110_sdp::lint(&text).has_errors(), "{text}");
+    }
+
+    #[test]
     fn refuses_what_it_cannot_receive() {
         let mut d = video();
         d.legs[1] = d.legs[0];
         assert!(d.check().unwrap_err().contains("different destination or source"));
+        // A multicast group is one path, whatever the port.
+        d.legs[1].destination.set_port(5006);
+        assert!(d.check().unwrap_err().contains("different destination or source"));
+        d.legs[1].source = Some(Ipv4Addr::new(192, 168, 2, 10));
+        assert!(d.check().is_ok());
+        // Unicast to one address can take two ports.
+        d.legs = vec![leg("10.0.0.2:5004", Some("10.0.0.1")), leg("10.0.0.2:5006", Some("10.0.0.1"))];
+        assert!(d.check().is_ok());
         d.legs.truncate(1);
         d.payload_type = 33;
         assert!(d.check().unwrap_err().contains("dynamic"));

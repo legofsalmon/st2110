@@ -18,8 +18,8 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
 - a sender and receiver on ordinary UDP sockets, which send colour bars as ST 2110-20
   video or tone as ST 2110-30 audio, paced by ST 2110-21 and lined up with the SMPTE
   Epoch, on one leg or an ST 2022-7 pair, and receive a stream from its SDP file,
-  merging the legs, putting frames and samples back together and reporting what
-  arrived.
+  merging the legs, putting the packets back in order and the frames and samples back
+  together, and reporting what arrived.
 
 Every finding cites the clause behind it.
 
@@ -30,7 +30,7 @@ Every finding cites the clause behind it.
 | [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
-| [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
+| [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
 | [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send` and `st2110 receive`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
@@ -240,17 +240,18 @@ bars.sdp: 1920x1080p50 YCbCr-4:2:2 10-bit, from the capture bars.pcap
 bars.sdp: arrived whole
 ```
 
-- `st2110 send video [FORMAT]` sends EBU colour bars, with a box that moves along the black strip beneath them, as ST 2110-20 video. FORMAT is 1080p50 unless it names another, such as 2160p59.94 or 1280x720p25; video is progressive. `--sampling`, `--depth`, `--colorimetry`, `--tcs`, `--range` and `--packing` choose the rest. `st2110 send audio` sends a 1 kHz tone at −18 dBFS as ST 2110-30 audio; `--channels`, `--sample-rate`, `--bits`, `--packet-time`, `--tone` and `--level` choose it.
-- Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, `wide` unless it says `narrow` or `narrow-linear`, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Each audio packet goes as its last sample falls due.
+- `st2110 send video [FORMAT]` sends EBU colour bars, with a box that moves along the black strip beneath them, as ST 2110-20 video. FORMAT is 1080p50 unless it names another, such as 2160p59.94 or 1280x720p25; video is progressive. `--sampling`, `--depth`, `--colorimetry`, `--tcs`, `--range` and `--packing` choose the rest. `st2110 send audio` sends a 1 kHz tone at −18 dBFS as ST 2110-30 audio; `--channels`, `--sample-rate`, `--bits`, `--packet-time`, `--tone` and `--level` choose it. A packet holds a whole number of samples, so at 44.1 kHz `--packet-time 1` gives 44 of them, 997.7 µs, which the SDP file writes as `a=ptime:1` and a receiver rounds back to 44.
+- Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Unless it says `narrow`, `narrow-linear` or `wide`, that is `wide` below 900 000 packets a second and `narrow-linear` from there, where ST 2110-21 defines no wide sender. Each audio packet goes as its last sample falls due.
 - `--to` gives the destination, a multicast group or a unicast address; give it twice for the two legs of an ST 2022-7 pair, which carry the same packets. `--interface` gives the address to send from, once for every leg or once for each; otherwise the routing table picks. `--ttl` sets the multicast time to live and `--dscp` the DSCP, AF41 by default, as AES67 marks media.
 - It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it.
 - It times packets by the system clock, taking TAI to be 37 s ahead of it (`--tai-utc` changes that). On a machine whose clock `phc2sys` keeps to PTP, name the grandmaster with `--clock <grandmaster>:<domain>` or `--clock traceable`, and its streams line up with every other sender's. Otherwise the SDP file names this machine's MAC address as `localmac`, which only Linux can find; elsewhere give `--clock`.
 - `--duration` sends for that many seconds, and without it the sender runs until it is stopped. With `--pcap FILE` it writes the packets into a capture instead, as fast as it can make them, each at the time it would have gone out, on UTC as a capture made with the system clock is. `st2110 pcap` measures such a capture, and `st2110 receive --pcap` reads it.
-- `st2110 receive SDP` joins each leg's group, from the SDP file's source only when it has a source filter, or takes a unicast leg on its address; `--interface` gives the interface. It merges the legs as ST 2022-7 does, passing on the first copy of each packet, and puts the frames or samples back together. It reports what each leg lost and what was lost after merging, how far apart the legs' copies arrived and the tightest ST 2022-7 receiver class that allows it, which frames arrived whole, the frame rate, and the latency from each frame's RTP timestamp, which is the sender's and the network's delay when both clocks follow PTP. A frame cut off by the start or end of receiving is not a fault.
-- `--duration` receives for that many seconds, 5 by default. `--pcap FILE` reads a capture instead of the network, and works out whether its clock is PTP time or UTC. `--png FILE` saves the last frame that arrived whole, and `--wav FILE` the audio, with silence where packets were lost. `--format json` gives everything the report holds.
+- `st2110 receive SDP` joins each leg's group, from the SDP file's source only when it has a source filter, or takes a unicast leg on its address; `--interface` gives the interface. It merges the legs as ST 2022-7 does, passing on the first copy of each packet, puts the packets back in sequence order and the frames or samples back together. When a packet is missing it waits for it, for a copy on a leg that runs behind or one out of order, for up to `--max-skew` milliseconds: 50 by default, as far as ST 2022-7 class B receivers allow the legs to differ, and up to 1000.
+- It reports what each leg lost and what was lost after merging, how far apart the legs' copies arrived and the tightest ST 2022-7 receiver class that allows it, which frames arrived whole, the frame rate, and the latency from each frame's RTP timestamp, which is the sender's and the network's delay when both clocks follow PTP. It follows a sender that restarts, with a new synchronisation source or with sequence numbers or timestamps that start again elsewhere, and leaves out stray packets that fit neither the stream nor a restart. It follows a sender that pauses, too, and counts the frames or audio it never sent. A frame cut off by the start or end of receiving is not a fault.
+- `--duration` receives for that many seconds, 5 by default. `--pcap FILE` reads a capture instead of the network, and works out whether its clock is PTP time or UTC. `--png FILE` saves the last frame that arrived whole, and `--wav FILE` the audio, with silence where packets were lost or never sent, up to 10 s a gap. `--format json` gives everything the report holds.
 - `receive` exits with 0 when the stream arrived whole, 1 when something was lost or incomplete, and 2 when it cannot receive. `send` exits with 0 when it has sent, and 2 when it cannot.
 
-Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. A receiver needs a large socket buffer for video: on Linux, raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=67108864`); `receive` says when the system allows less than 4 MiB.
+Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. The receiver times each datagram by the kernel's receive timestamp on Linux and macOS, and by when it reads it elsewhere. It needs a large socket buffer for video: raise `net.core.rmem_max` on Linux (`sysctl -w net.core.rmem_max=67108864`) or `kern.ipc.maxsockbuf` on macOS; `receive` says when the system allows less than 4 MiB.
 
 ## What it checks
 
@@ -382,13 +383,12 @@ for f in &report.findings {
 
 `st2110_pcap::Analyser` takes one frame at a time instead, for captures that arrive some other way.
 
-To send a stream, describe it, write its SDP file and send it (the `net` feature); to receive one, read its SDP file:
+To send a stream, describe it, write its SDP file and send it (the `net` feature). This sends ten seconds of bars from 192.168.10.21:
 
 ```rust
 use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::format::VideoFormat;
 use st2110_media::net::{self, Transmitter};
-use st2110_media::receive::Session;
 use st2110_media::send::Sender;
 
 let stream = Description {
@@ -403,6 +403,14 @@ std::fs::write("bars.sdp", stream.sdp(1))?;
 let mut transmitter = Transmitter::new(&stream.legs, &["192.168.10.21".parse().ok()], 32, 34, 37)?;
 let start = net::tai_now(37) + 100_000_000;
 Sender::new(&stream, 1000, -18.0, 0x1234_5678, 0)?.run(&mut transmitter, start, start + 10_000_000_000)?;
+```
+
+To receive one, read its SDP file and listen on each leg. This receives two seconds of it, on another machine or in another process while it sends:
+
+```rust
+use st2110_media::describe::Description;
+use st2110_media::net;
+use st2110_media::receive::Session;
 
 let (stream, _notes) = Description::parse(&std::fs::read_to_string("bars.sdp")?)?;
 let mut session = Session::new(&stream)?;
@@ -411,7 +419,7 @@ net::receive(&mut session, sockets, net::tai_now(37) + 2_000_000_000, 37, &mut (
 println!("{:?}", session.report().problems);
 ```
 
-`Sender` sends to any `send::Output`, and `receive::Session` takes datagrams from anywhere, so without the `net` feature the crate works on captures and in tests. `video::Packetiser` and `video::Depacketiser`, `audio::AudioPacketiser` and `audio::AudioDepacketiser`, and `merge::Merger` work on their own too.
+`Sender` sends to any `send::Output`, and `receive::Session` takes datagrams from anywhere, so without the `net` feature the crate works on captures and in tests. `video::Packetiser` and `video::Depacketiser`, `audio::AudioPacketiser` and `audio::AudioDepacketiser`, `merge::Merger` and `merge::Playout` work on their own too.
 
 To make connections, read the registry without the SDP files, which are fetched as they are needed, and give the controller the routes (the `client` feature):
 

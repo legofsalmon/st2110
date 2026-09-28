@@ -189,23 +189,27 @@ pub struct FrameInfo {
     pub timestamp: u32,
     /// Packets that arrived.
     pub packets: u32,
-    /// Packets that never did: gaps in the sequence numbers from the one after the
-    /// previous frame's last packet to its own last, which include the packets of any
-    /// frames between that never arrived.
+    /// Packets that never did: those short of the packets a frame had when one last
+    /// arrived whole, or before any has, the gaps in its sequence numbers and the
+    /// packet with the marker bit.
     pub missing: u32,
-    /// Octets of pixel groups that arrived.
+    /// Octets of the frame that its packets covered.
     pub filled: usize,
-    /// Whether every packet arrived, the last with the marker bit.
+    /// Whether its packets covered every pixel group, and the last with the marker bit
+    /// arrived.
     pub whole: bool,
-    /// Whether receiving cut it off, so that it could not arrive whole: it is the first
-    /// frame, and the packet with its first pixels never came, as when a receiver
-    /// starts partway through a frame; or it is the last, and receiving stopped before
-    /// its marker came.
+    /// Whether receiving cut it off, so that it could not arrive whole: the first frame
+    /// since receiving started, or the sender restarted, whose first packet never came;
+    /// or the last, still arriving when receiving stopped.
     pub cut: bool,
-    /// When its first and last packets arrived, in nanoseconds.
+    /// When its first packet arrived, in nanoseconds.
     pub first_arrival: i128,
     /// When its last packet arrived.
     pub last_arrival: i128,
+    /// The lowest and the highest 32-bit sequence numbers of its packets.
+    pub first_sequence: u32,
+    /// The highest.
+    pub last_sequence: u32,
 }
 
 /// What the depacketiser has counted.
@@ -231,34 +235,41 @@ pub struct VideoCounts {
 
 struct Assembly {
     timestamp: u32,
-    /// The sequence number the frame should start at: the one after the last frame's
-    /// last packet.
-    expected_first: Option<u32>,
     lowest: u32,
     highest: u32,
-    marker: Option<u32>,
+    marker: bool,
     /// Whether a packet brought the frame's first pixels.
     starts: bool,
     packets: u32,
-    filled: usize,
     first_arrival: i128,
     last_arrival: i128,
 }
 
 /// Puts ST 2110-20 packets back together into frames of pixel groups.
 ///
-/// A new RTP timestamp or the marker bit finishes a frame. A frame's missing packets
-/// leave the pixels of an older frame where they would have gone.
+/// Packets should come in sequence order, as a [`crate::merge::Playout`] lets them go;
+/// within a frame, any order will do. The marker bit, or a packet with another RTP
+/// timestamp and a later sequence number, finishes a frame, and one with another
+/// timestamp and an earlier sequence number is late. A frame is whole when its packets
+/// covered every pixel group; its missing packets leave the pixels of an older frame
+/// where they would have gone.
 pub struct Depacketiser {
     format: VideoFormat,
     group: PixelGroup,
     row_bytes: usize,
+    row_groups: usize,
+    frame_ns: f64,
     assembly: Option<Assembly>,
     building: Vec<u8>,
+    /// A bit for each pixel group of the frame being built that a packet covered.
+    coverage: Vec<u64>,
     whole: Vec<u8>,
     has_whole: bool,
-    last_timestamp: Option<u32>,
-    next_first: Option<u32>,
+    /// The sequence number after the last frame's last packet.
+    after_last: Option<u32>,
+    /// Whether a frame has finished since receiving started, or the stream restarted.
+    started: bool,
+    packets_per_frame: Option<u32>,
     counts: VideoCounts,
 }
 
@@ -266,17 +277,23 @@ impl Depacketiser {
     /// A depacketiser for one format.
     pub fn new(format: &VideoFormat) -> Result<Self, String> {
         format.check()?;
+        let group = format.pixel_group().expect("checked");
         let size = format.frame_bytes();
+        let groups = size / group.octets as usize;
         Ok(Self {
-            group: format.pixel_group().expect("checked"),
+            group,
             row_bytes: format.row_bytes(),
+            row_groups: (format.width / group.pixels) as usize,
+            frame_ns: 1e9 / format.rate.to_f64(),
             format: format.clone(),
             assembly: None,
             building: vec![0; size],
+            coverage: vec![0; groups.div_ceil(64)],
             whole: vec![0; size],
             has_whole: false,
-            last_timestamp: None,
-            next_first: None,
+            after_last: None,
+            started: false,
+            packets_per_frame: None,
             counts: VideoCounts::default(),
         })
     }
@@ -291,6 +308,12 @@ impl Depacketiser {
         self.has_whole.then_some(&self.whole[..])
     }
 
+    /// Packets a frame, as the last frame that arrived whole with no gap in its
+    /// sequence numbers had them.
+    pub fn packets_per_frame(&self) -> Option<u32> {
+        self.packets_per_frame
+    }
+
     /// Takes one RTP packet that arrived at `at` nanoseconds, and calls `done` with each
     /// frame it finishes and its pixel groups.
     pub fn push(&mut self, at: i128, packet: &[u8], mut done: impl FnMut(&FrameInfo, &[u8])) {
@@ -298,7 +321,7 @@ impl Depacketiser {
             self.counts.malformed += 1;
             return;
         };
-        let payload = &packet[header.length..packet.len() - header.padding];
+        let payload = rtp::payload(packet, &header);
         let Some((extended, segments, data)) = self.parse(payload) else {
             self.counts.malformed += 1;
             return;
@@ -307,40 +330,40 @@ impl Depacketiser {
         if let Some(a) = &self.assembly
             && a.timestamp != header.timestamp
         {
-            if (header.timestamp.wrapping_sub(a.timestamp) as i32) < 0 {
+            if (sequence.wrapping_sub(a.highest) as i32) <= 0 {
                 self.counts.late += 1;
                 return;
             }
-            self.finish(&mut done, false);
+            self.finish(&mut done, None);
         }
         if self.assembly.is_none() {
-            if self.last_timestamp.is_some_and(|last| (header.timestamp.wrapping_sub(last) as i32) <= 0) {
+            if self.after_last.is_some_and(|after| (sequence.wrapping_sub(after) as i32) < 0) {
                 self.counts.late += 1;
                 return;
             }
+            self.coverage.fill(0);
             self.assembly = Some(Assembly {
                 timestamp: header.timestamp,
-                expected_first: self.next_first,
                 lowest: sequence,
                 highest: sequence,
-                marker: None,
+                marker: false,
                 starts: false,
                 packets: 0,
-                filled: 0,
                 first_arrival: at,
                 last_arrival: at,
             });
         }
+        let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
         let mut offset = 0;
         for (row, pixel, length) in segments.into_iter().flatten() {
-            let start = row * self.row_bytes + pixel / self.group.pixels as usize * self.group.octets as usize;
+            let start = row * self.row_bytes + pixel / pixels * octets;
             self.building[start..start + length].copy_from_slice(&data[offset..offset + length]);
             offset += length;
+            cover(&mut self.coverage, row * self.row_groups + pixel / pixels, length / octets);
         }
         let a = self.assembly.as_mut().expect("started");
         a.starts |= segments.iter().flatten().any(|&(row, pixel, _)| row == 0 && pixel == 0);
         a.packets += 1;
-        a.filled += offset;
         if (sequence.wrapping_sub(a.lowest) as i32) < 0 {
             a.lowest = sequence;
         }
@@ -351,17 +374,25 @@ impl Depacketiser {
         a.last_arrival = a.last_arrival.max(at);
         self.counts.packets += 1;
         if header.marker {
-            a.marker = Some(sequence);
-            self.finish(&mut done, false);
+            a.marker = true;
+            self.finish(&mut done, None);
         }
     }
 
     /// Finishes the frame being put together, if there is one: call it when receiving
-    /// stops.
-    pub fn flush(&mut self, mut done: impl FnMut(&FrameInfo, &[u8])) {
+    /// stops at `end` nanoseconds, or with `None` when the stream stopped. A frame still
+    /// arriving within a frame's time of the end was cut off.
+    pub fn flush(&mut self, end: Option<i128>, mut done: impl FnMut(&FrameInfo, &[u8])) {
         if self.assembly.is_some() {
-            self.finish(&mut done, true);
+            self.finish(&mut done, end);
         }
+    }
+
+    /// Forgets where the stream was, after [`Depacketiser::flush`], for one that
+    /// starts again: its first frame may be cut off.
+    pub fn reset(&mut self) {
+        self.after_last = None;
+        self.started = false;
     }
 
     /// Reads the payload header: the extended sequence number and up to three row
@@ -404,35 +435,40 @@ impl Depacketiser {
         (data.len() >= total).then_some((extended, segments, data))
     }
 
-    /// Finishes the frame being put together; `end` when receiving has stopped.
-    fn finish(&mut self, done: &mut impl FnMut(&FrameInfo, &[u8]), end: bool) {
+    /// Finishes the frame being put together; `end` when receiving has stopped then.
+    fn finish(&mut self, done: &mut impl FnMut(&FrameInfo, &[u8]), end: Option<i128>) {
         let a = self.assembly.take().expect("a frame to finish");
-        let first = a.expected_first.filter(|&f| (a.lowest.wrapping_sub(f) as i32) >= 0).unwrap_or(a.lowest);
-        let last = a.marker.unwrap_or(a.highest);
-        let span = |from: u32| last.wrapping_sub(from).saturating_add(1).min(1 << 24);
-        let missing = span(first).saturating_sub(a.packets);
-        // Packets missing before the lowest that came may be whole frames that never
-        // arrived; the frame is whole when its own are all here.
-        let whole = a.marker.is_some()
-            && span(a.lowest).saturating_sub(a.packets) == 0
-            && a.filled == self.format.frame_bytes();
-        // The first frame may have begun before receiving did, and the last ended after it.
-        let cut = !whole && ((a.expected_first.is_none() && !a.starts) || (end && a.marker.is_none()));
+        let covered: usize = self.coverage.iter().map(|w| w.count_ones() as usize).sum();
+        let filled = covered * self.group.octets as usize;
+        let whole = a.marker && filled == self.format.frame_bytes();
+        let gaps = a.highest.wrapping_sub(a.lowest).saturating_add(1).saturating_sub(a.packets);
+        if whole && gaps == 0 {
+            self.packets_per_frame = Some(a.packets);
+        }
+        let missing = match self.packets_per_frame {
+            _ if whole => 0,
+            Some(per_frame) => per_frame.saturating_sub(a.packets).max(gaps),
+            None => gaps + u32::from(!a.marker),
+        };
+        let still_arriving = end.is_some_and(|end| !a.marker && ((end - a.last_arrival) as f64) <= self.frame_ns);
+        let cut = !whole && ((!self.started && !a.starts) || still_arriving);
         let info = FrameInfo {
             timestamp: a.timestamp,
             packets: a.packets,
             missing,
-            filled: a.filled,
+            filled,
             whole,
             cut,
             first_arrival: a.first_arrival,
             last_arrival: a.last_arrival,
+            first_sequence: a.lowest,
+            last_sequence: a.highest,
         };
         self.counts.frames += 1;
         self.counts.cut += u64::from(cut);
         self.counts.missing += u64::from(missing);
-        self.last_timestamp = Some(a.timestamp);
-        self.next_first = Some(last.wrapping_add(1));
+        self.started = true;
+        self.after_last = Some(a.highest.wrapping_add(1));
         if whole {
             self.counts.whole += 1;
             std::mem::swap(&mut self.building, &mut self.whole);
@@ -441,6 +477,17 @@ impl Depacketiser {
         } else {
             done(&info, &self.building);
         }
+    }
+}
+
+/// Sets `count` bits from bit `first`.
+fn cover(words: &mut [u64], first: usize, count: usize) {
+    let (mut at, end) = (first, first + count);
+    while at < end {
+        let bit = at % 64;
+        let n = (64 - bit).min(end - at);
+        words[at / 64] |= (u64::MAX >> (64 - n)) << bit;
+        at += n;
     }
 }
 
@@ -588,14 +635,20 @@ mod tests {
             (infos[0].whole, infos[0].cut, infos[0].missing, infos[0].packets),
             (false, true, 0, first.len() as u32 - 1)
         );
-        assert_eq!((infos[1].whole, infos[1].cut, infos[1].missing), (false, false, 0));
+        assert_eq!((infos[0].first_sequence, infos[0].last_sequence), (u32::MAX - 2, 19));
+        assert_eq!((infos[1].whole, infos[1].cut, infos[1].missing), (false, false, 1));
         let counts = d.counts();
         assert_eq!((counts.frames, counts.whole, counts.cut, counts.late), (2, 0, 1, 1));
         assert!(d.last_whole().is_none());
-        // Receiving stops partway through frame 3.
+        // Receiving stops partway through frame 3, while it is still arriving.
         d.push(0, &third[1], |_, _| panic!("not finished"));
-        d.flush(|info, _| infos.push(*info));
+        d.flush(Some(1_000_000), |info, _| infos.push(*info));
         assert_eq!((infos[2].whole, infos[2].cut, infos[2].packets), (false, true, 2));
+        // The stream stopped partway through frame 4, long before receiving did.
+        let fourth = packets(&f, &frame, 5400, 2000);
+        d.push(0, &fourth[0], |_, _| panic!("not finished"));
+        d.flush(Some(1_000_000_000), |info, _| infos.push(*info));
+        assert_eq!((infos[3].whole, infos[3].cut), (false, false));
     }
 
     #[test]
@@ -609,10 +662,11 @@ mod tests {
             d.push(0, p, |info, _| infos.push(*info));
         }
         assert_eq!((infos[0].whole, infos[0].cut, infos[0].missing), (false, false, 1));
+        assert_eq!(d.packets_per_frame(), None);
     }
 
     #[test]
-    fn a_lost_first_packet_counts_as_missing_once_the_previous_frame_ended() {
+    fn a_lost_first_packet_counts_as_missing_once_a_frame_came_whole() {
         let f = format(320, 24);
         let frame = frame_of(&f);
         let one = packets(&f, &frame, 0, 100);
@@ -624,7 +678,46 @@ mod tests {
         }
         assert_eq!(infos.len(), 2);
         assert!(infos[0].whole);
+        assert_eq!(d.packets_per_frame(), Some(24));
         assert_eq!((infos[1].whole, infos[1].missing), (false, 1));
+    }
+
+    #[test]
+    fn overlapping_packets_leave_a_frame_short() {
+        // A faulty sender writes packet 1's row header as packet 0's, so row 1 never comes.
+        let f = format(320, 8);
+        let frame = frame_of(&f);
+        let mut all = packets(&f, &frame, 0, 0);
+        let header = all[0][12 + 2..12 + 8].to_vec();
+        all[1][12 + 2..12 + 8].copy_from_slice(&header);
+        let mut d = Depacketiser::new(&f).unwrap();
+        let mut got = Vec::new();
+        for p in &all {
+            d.push(0, p, |info, _| got.push(*info));
+        }
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].whole);
+        assert_eq!(got[0].filled, f.frame_bytes() - f.row_bytes());
+    }
+
+    #[test]
+    fn timestamps_that_step_back_start_a_new_frame() {
+        // The sender's clock steps back a second between frames; its sequence numbers go on.
+        let f = format(320, 24);
+        let frame = frame_of(&f);
+        let one = packets(&f, &frame, 900_000, 0);
+        let two = packets(&f, &frame, 810_000, one.len() as u32);
+        let three = packets(&f, &frame, 811_800, 2 * one.len() as u32);
+        let mut d = Depacketiser::new(&f).unwrap();
+        let mut infos = Vec::new();
+        for p in one.iter().chain(&two).chain(&three) {
+            d.push(0, p, |info, _| infos.push(*info));
+        }
+        assert_eq!(
+            infos.iter().map(|i| (i.timestamp, i.whole)).collect::<Vec<_>>(),
+            [(900_000, true), (810_000, true), (811_800, true)]
+        );
+        assert_eq!(d.counts().late, 0);
     }
 
     #[test]

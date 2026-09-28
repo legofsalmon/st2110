@@ -9,7 +9,7 @@ publish.workspace = true
 
 [features]
 # Senders and receivers on UDP sockets.
-net = ["dep:socket2"]
+net = ["dep:socket2", "dep:nix"]
 serde = ["dep:serde"]
 
 [dependencies]
@@ -19,6 +19,10 @@ st2110-pcap.workspace = true
 st2110-connect.workspace = true
 serde = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
+
+# Kernel receive timestamps.
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+nix = { workspace = true, optional = true }
 
 [lints]
 workspace = true

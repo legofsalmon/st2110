@@ -114,7 +114,7 @@ impl Tone {
     /// scale: EBU R 68 lines up at −18 dBFS.
     pub fn new(format: &AudioFormat, frequency: u32, level: f64) -> Result<Self, String> {
         format.check()?;
-        if frequency == 0 || 2 * frequency >= format.sample_rate {
+        if frequency == 0 || 2 * u64::from(frequency) >= u64::from(format.sample_rate) {
             return Err(format!("{frequency} Hz is not a tone below {} Hz", format.sample_rate / 2));
         }
         if level.is_nan() || level > 0.0 {
@@ -201,6 +201,7 @@ mod tests {
         assert_eq!(peak, 1_056_063);
         assert_eq!(a[0], a[1]);
         assert!(Tone::new(&format, 24_000, -18.0).is_err());
+        assert!(Tone::new(&format, 1 << 31, -18.0).is_err());
         assert!(Tone::new(&format, 1000, 3.0).is_err());
     }
 }

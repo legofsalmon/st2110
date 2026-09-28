@@ -54,7 +54,7 @@ fn send(stream: &Description, nanoseconds: i128) -> (SendCounts, st2110_pcap::Re
     let mut sender = Sender::new(stream, 1000, -18.0, 0x5eed, 65_000).unwrap();
     let sent = sender.run(&mut both, NOON, NOON + nanoseconds).unwrap();
     let bytes = both.capture.into_inner();
-    session.finish(&mut ());
+    session.finish(NOON + nanoseconds, &mut ());
     let options = Options { sdp: vec![SdpFile { name: "test.sdp".into(), text: stream.sdp(1) }], ..Options::default() };
     let analysed = st2110_pcap::analyse(&bytes[..], &options).unwrap();
     (sent, analysed, session.report())
@@ -116,7 +116,7 @@ fn video_keeps_to_its_sender_type_and_arrives_whole() {
 fn audio_keeps_its_packet_time() {
     let formats = [
         AudioFormat::new(2),
-        AudioFormat { bits: 16, packet_time_us: 125, ..AudioFormat::new(8) },
+        AudioFormat { bits: 16, ..AudioFormat::new(8).with_packet_time(0.125).unwrap() },
         AudioFormat { sample_rate: 96_000, ..AudioFormat::new(4) },
     ];
     for format in formats {
@@ -129,10 +129,11 @@ fn audio_keeps_its_packet_time() {
             assert_eq!((flow.packets, flow.lost), (sent.packets, 0), "{name}");
             let audio = flow.audio.as_ref().unwrap();
             assert_eq!(audio.channels, Some(format.channels), "{name}");
-            assert_eq!(audio.packet_time_us, Some(f64::from(format.packet_time_us)), "{name}");
+            let packet_time_us = format.packet_time() * 1e6;
+            assert!(audio.packet_time_us.is_some_and(|t| (t - packet_time_us).abs() < 1e-6), "{name}: {audio:?}");
             // Each packet goes as its last sample falls due.
             let latency = audio.latency.as_ref().unwrap();
-            assert!((latency.min - f64::from(format.packet_time_us)).abs() < 0.001, "{name}: {latency:?}");
+            assert!((latency.min - packet_time_us).abs() < 0.001, "{name}: {latency:?}");
         }
         let audio = received.audio.unwrap();
         assert_eq!(audio.counts.samples, u64::from(format.sample_rate) / 10, "{name}");

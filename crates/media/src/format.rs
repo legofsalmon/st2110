@@ -50,6 +50,15 @@ impl Packing {
     }
 }
 
+/// Checks an ST 2110-30 sampling rate.
+fn check_rate(rate: u32) -> Result<(), String> {
+    if [44_100, 48_000, 96_000].contains(&rate) {
+        Ok(())
+    } else {
+        Err(format!("{rate} Hz is not 48 000, 96 000 or 44 100"))
+    }
+}
+
 /// An ST 2110-21 sender type, the `TP` value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SenderType {
@@ -296,10 +305,12 @@ impl VideoFormat {
         text
     }
 
-    /// Reads the format from an SDP file's `a=fmtp` parameters.
-    pub fn from_fmtp(value: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    /// Reads the format from an SDP file's `a=fmtp` parameters: `value` gives a
+    /// parameter's value, and `has` says whether it is there at all, as a flag such as
+    /// `interlace` is.
+    pub fn from_fmtp(value: impl Fn(&str) -> Option<String>, has: impl Fn(&str) -> bool) -> Result<Self, String> {
         let need = |name: &str| value(name).ok_or_else(|| format!("the SDP file gives no {name}"));
-        if value("interlace").is_some() {
+        if has("interlace") || has("segmented") {
             return Err("interlaced and PsF video are not supported yet".into());
         }
         let number = |name: &str| -> Result<u32, String> {
@@ -355,20 +366,40 @@ pub struct AudioFormat {
     pub sample_rate: u32,
     /// Bits per sample: 24 (`L24`) or 16 (`L16`).
     pub bits: u8,
-    /// Microseconds of audio in each packet: 1000, or 125 for the short packets of
-    /// levels B and C.
-    pub packet_time_us: u32,
+    /// Samples per channel in each packet: 48 for the 1 ms packets of level A at 48 kHz,
+    /// or 6 for the 125 µs of levels B and C.
+    pub samples_per_packet: u32,
 }
 
 impl AudioFormat {
     /// Level A: 48 kHz, 24 bits, 1 ms packets.
     pub fn new(channels: u16) -> Self {
-        Self { channels, sample_rate: 48_000, bits: 24, packet_time_us: 1000 }
+        Self { channels, sample_rate: 48_000, bits: 24, samples_per_packet: 48 }
     }
 
-    /// Samples per channel in each packet.
-    pub fn samples_per_packet(&self) -> u32 {
-        (u64::from(self.sample_rate) * u64::from(self.packet_time_us) / 1_000_000) as u32
+    /// The format with packets of `ms` milliseconds, which must come within 1% of a
+    /// whole number of samples: at 44.1 kHz, 1 ms is 44 samples and 1.09 ms is 48.
+    pub fn with_packet_time(mut self, ms: f64) -> Result<Self, String> {
+        check_rate(self.sample_rate)?;
+        let khz = f64::from(self.sample_rate) / 1000.0;
+        let exact = khz * ms;
+        let samples = exact.round();
+        if !(1.0..=1e6).contains(&samples) || ((samples - exact) / exact).abs() > 0.01 {
+            let fewer = exact.floor().max(1.0);
+            return Err(format!(
+                "{ms} ms is {exact:.2} samples at {khz} kHz: give a whole number of samples, such as {:.3} or {:.3} ms",
+                fewer / khz,
+                (fewer + 1.0) / khz
+            ));
+        }
+        self.samples_per_packet = samples as u32;
+        self.check()?;
+        Ok(self)
+    }
+
+    /// Seconds of audio in each packet.
+    pub fn packet_time(&self) -> f64 {
+        f64::from(self.samples_per_packet) / f64::from(self.sample_rate)
     }
 
     /// Octets per sample.
@@ -378,7 +409,7 @@ impl AudioFormat {
 
     /// Octets of samples in each packet.
     pub fn payload_bytes(&self) -> usize {
-        self.samples_per_packet() as usize * usize::from(self.channels) * self.sample_bytes()
+        self.samples_per_packet as usize * usize::from(self.channels) * self.sample_bytes()
     }
 
     /// The `a=rtpmap` encoding: `L24` or `L16`.
@@ -386,10 +417,27 @@ impl AudioFormat {
         if self.bits == 16 { "L16" } else { "L24" }
     }
 
-    /// The `a=ptime` value in milliseconds: `1` or `0.125`.
+    /// The `a=ptime` value in milliseconds: exact when the packet time is a whole number
+    /// of microseconds, `1` or `0.125`, and otherwise the shortest within 1% that gives
+    /// back the samples when a receiver rounds, such as `1.09` for 48 samples at 44.1 kHz.
     pub fn ptime(&self) -> String {
-        let ms = f64::from(self.packet_time_us) / 1000.0;
-        format!("{ms}")
+        let trim = |text: String| {
+            if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text }
+        };
+        let (samples, rate) = (u64::from(self.samples_per_packet), u64::from(self.sample_rate));
+        if (samples * 1_000_000).is_multiple_of(rate) {
+            let us = samples * 1_000_000 / rate;
+            return trim(format!("{}.{:03}", us / 1000, us % 1000));
+        }
+        let ms = self.packet_time() * 1000.0;
+        (0..=6)
+            .map(|decimals| format!("{ms:.decimals$}"))
+            .find(|text| {
+                text.parse().is_ok_and(|v: f64| {
+                    ((v - ms) / ms).abs() <= 0.01 && samples_in(self.sample_rate, v) == self.samples_per_packet
+                })
+            })
+            .map_or_else(|| format!("{ms}"), trim)
     }
 
     /// The `channel-order` value: mono, stereo or undefined channels.
@@ -406,26 +454,21 @@ impl AudioFormat {
         if !(1..=64).contains(&self.channels) {
             return Err(format!("{} channels is not 1 to 64", self.channels));
         }
-        if ![44_100, 48_000, 96_000].contains(&self.sample_rate) {
-            return Err(format!("{} Hz is not 48 000, 96 000 or 44 100", self.sample_rate));
-        }
+        check_rate(self.sample_rate)?;
         if self.bits != 16 && self.bits != 24 {
             return Err(format!("{}-bit samples are not 16 or 24 bits", self.bits));
         }
-        if self.packet_time_us == 0
-            || self.packet_time_us > 4000
-            || u64::from(self.sample_rate) * u64::from(self.packet_time_us) % 1_000_000 != 0
-        {
+        if self.samples_per_packet == 0 || u64::from(self.samples_per_packet) * 250 > u64::from(self.sample_rate) {
             return Err(format!(
-                "{} µs is not a packet time up to 4 ms of whole samples at {} Hz",
-                self.packet_time_us, self.sample_rate
+                "{} samples a packet is not a packet time up to 4 ms at {} Hz",
+                self.samples_per_packet, self.sample_rate
             ));
         }
         if self.payload_bytes() > PAYLOAD_LIMIT {
             return Err(format!(
-                "{} channels of {} µs make {} octets a packet, over the {PAYLOAD_LIMIT} the standard UDP size limit allows; use 125 µs packets",
+                "{} channels of {} ms make {} octets a packet, over the {PAYLOAD_LIMIT} the standard UDP size limit allows; use 0.125 ms packets",
                 self.channels,
-                self.packet_time_us,
+                self.ptime(),
                 self.payload_bytes()
             ));
         }
@@ -433,15 +476,24 @@ impl AudioFormat {
     }
 }
 
+/// Samples in a packet of `ms` milliseconds at `sample_rate`, rounded, as a receiver
+/// reads `a=ptime`.
+pub fn samples_in(sample_rate: u32, ms: f64) -> u32 {
+    st2110_sdp::audio::samples_per_packet(sample_rate, ms)
+}
+
 impl fmt::Display for AudioFormat {
-    /// `L24 48 kHz, 2 channels, 1 ms`.
+    /// `L24 48 kHz, 2 channels, 1 ms`, or `125 µs` for packets shorter than 1 ms.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let khz = f64::from(self.sample_rate) / 1000.0;
         let channels = if self.channels == 1 { "1 channel".to_string() } else { format!("{} channels", self.channels) };
-        let time = if self.packet_time_us.is_multiple_of(1000) {
-            format!("{} ms", self.packet_time_us / 1000)
+        let us = self.packet_time() * 1e6;
+        let time = if us >= 999.5 {
+            format!("{} ms", self.ptime())
+        } else if (us - us.round()).abs() < 1e-6 {
+            format!("{us:.0} µs")
         } else {
-            format!("{} µs", self.packet_time_us)
+            format!("{us:.1} µs")
         };
         write!(f, "{} {khz} kHz, {channels}, {time}", self.encoding())
     }
@@ -484,8 +536,13 @@ mod tests {
              PM=2110BPM; SSN=ST2110-20:2017; TP=2110TPN; RANGE=FULL;"
         );
         let (fmtp, _) = st2110_sdp::Fmtp::parse(&text);
-        let back = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string)).unwrap();
+        let back = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name)).unwrap();
         assert_eq!(back, f);
+        for flag in ["interlace", "segmented", "interlace=1"] {
+            let (fmtp, _) = st2110_sdp::Fmtp::parse(&format!("{text} {flag};"));
+            let read = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name));
+            assert!(read.unwrap_err().contains("interlaced"), "{flag}");
+        }
         let mut key = f.clone();
         key.sampling = Sampling::Key;
         key.colorimetry = "ALPHA".into();
@@ -495,14 +552,35 @@ mod tests {
     #[test]
     fn audio() {
         let a = AudioFormat::new(2);
-        assert_eq!((a.samples_per_packet(), a.payload_bytes(), a.ptime()), (48, 288, "1".to_string()));
+        assert_eq!((a.samples_per_packet, a.payload_bytes(), a.ptime()), (48, 288, "1".to_string()));
         assert_eq!(a.to_string(), "L24 48 kHz, 2 channels, 1 ms");
-        let c = AudioFormat { channels: 64, packet_time_us: 125, ..AudioFormat::new(64) };
-        assert_eq!((c.samples_per_packet(), c.payload_bytes(), c.ptime()), (6, 1152, "0.125".to_string()));
+        let c = AudioFormat::new(64).with_packet_time(0.125).unwrap();
+        assert_eq!((c.samples_per_packet, c.payload_bytes(), c.ptime()), (6, 1152, "0.125".to_string()));
+        assert_eq!(c.to_string(), "L24 48 kHz, 64 channels, 125 µs");
         assert_eq!(c.channel_order(), "SMPTE2110.(U64)");
-        assert!(c.check().is_ok());
-        assert!(AudioFormat::new(16).check().unwrap_err().contains("use 125 µs packets"));
-        let odd = AudioFormat { sample_rate: 44_100, ..AudioFormat::new(2) };
-        assert!(odd.check().unwrap_err().contains("whole samples"));
+        assert!(AudioFormat::new(16).check().unwrap_err().contains("use 0.125 ms packets"));
+        let e = AudioFormat::new(2).with_packet_time(0.3).unwrap_err();
+        assert!(e.contains("0.3 ms is 14.40 samples at 48 kHz") && e.contains("such as 0.292 or 0.312 ms"), "{e}");
+        let f = AudioFormat::new(2).with_packet_time(0.292).unwrap();
+        assert_eq!((f.samples_per_packet, f.ptime()), (14, "0.29".to_string()));
+        assert!(AudioFormat::new(2).with_packet_time(5.0).unwrap_err().contains("up to 4 ms"));
+    }
+
+    #[test]
+    fn audio_at_44_1_khz() {
+        let base = AudioFormat { sample_rate: 44_100, ..AudioFormat::new(2) };
+        // 1 ms is 44 samples, which a receiver rounding ptime=1 finds again.
+        let one = base.clone().with_packet_time(1.0).unwrap();
+        assert_eq!((one.samples_per_packet, one.ptime()), (44, "1".to_string()));
+        assert_eq!(one.to_string(), "L24 44.1 kHz, 2 channels, 997.7 µs");
+        // 48 samples, as ST 2110-31 writes it.
+        let long = base.clone().with_packet_time(1.09).unwrap();
+        assert_eq!((long.samples_per_packet, long.ptime()), (48, "1.09".to_string()));
+        assert_eq!(long.to_string(), "L24 44.1 kHz, 2 channels, 1.09 ms");
+        assert!(base.with_packet_time(0.125).is_err());
+        for (rate, samples) in [(44_100, 6), (44_100, 12), (96_000, 12), (96_000, 96), (48_000, 1), (48_000, 192)] {
+            let f = AudioFormat { sample_rate: rate, samples_per_packet: samples, ..AudioFormat::new(1) };
+            assert_eq!(samples_in(rate, f.ptime().parse().unwrap()), samples, "{rate} {samples} {}", f.ptime());
+        }
     }
 }
