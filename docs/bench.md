@@ -76,9 +76,9 @@ $ sudo sysctl -w kern.ipc.maxsockbuf=16777216
 ```
 
 The last line lets `st2110 receive` have an 8 MiB socket buffer; it says when it has
-less than 4 MiB. CI builds st2110 on Linux only. Its sockets compile for macOS, since
-vizz builds them there, but this is the first build of the command line on a Mac, so a
-problem there is the bench's first finding.
+less than 4 MiB. CI builds and tests st2110 on macOS as well as Linux, sending and
+receiving over the loopback interface. [Check 6](#6-the-converters-streams-on-the-mac)
+is the first time it joins a multicast group on a Mac's network port.
 
 - Update both converters with Blackmagic's utility, and write down the firmware versions: every result is for that firmware.
 - If macOS asks whether `st2110` may accept incoming network connections, allow it.
