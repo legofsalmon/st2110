@@ -705,3 +705,300 @@ fn pcap_exit_codes_for_files_it_cannot_read_to_the_end() {
     assert!(text.contains("-: error: the file ends partway through a packet; the analysis stops there\n"), "{text}");
     assert!(text.ends_with("-: 1 flow, 1 error, 0 warnings, 0 notes\n\n"), "{text}");
 }
+
+/// A directory for one test's files, removed when the test ends.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("st2110-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        Self(dir)
+    }
+
+    fn path(&self, file: &str) -> String {
+        self.0.join(file).to_str().expect("UTF-8").to_string()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("UTF-8")
+}
+
+/// A pcap file with only the packets `keep` chooses, given each one's destination
+/// address and its place among the packets to that address.
+fn filter_capture(pcap: &[u8], keep: impl Fn([u8; 4], usize) -> bool) -> Vec<u8> {
+    let mut out = pcap[..24].to_vec();
+    let mut seen = std::collections::HashMap::new();
+    let mut at = 24;
+    while at + 16 <= pcap.len() {
+        let length = u32::from_le_bytes(pcap[at + 8..at + 12].try_into().unwrap()) as usize;
+        let record = &pcap[at..at + 16 + length];
+        let destination: [u8; 4] = record[16 + 30..16 + 34].try_into().unwrap();
+        let place = seen.entry(destination).or_insert(0);
+        if keep(destination, *place) {
+            out.extend_from_slice(record);
+        }
+        *place += 1;
+        at += 16 + length;
+    }
+    out
+}
+
+#[test]
+fn send_writes_a_capture_the_analyser_and_linter_pass() {
+    let dir = Scratch::new("send-video");
+    let (sdp, pcap) = (dir.path("v.sdp"), dir.path("v.pcap"));
+    let output = st2110(&[
+        "send",
+        "video",
+        "320x180p50",
+        "--to",
+        "239.10.1.1:5004",
+        "--to",
+        "239.10.2.1:5004",
+        "--clock",
+        "traceable",
+        "--duration",
+        "0.2",
+        "--sdp",
+        &sdp,
+        "--pcap",
+        &pcap,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!("st2110: sent 10 frames of 320x180p50 YCbCr-4:2:2 10-bit (1800 packets) on 2 legs into {pcap}\n")
+    );
+    let text = std::fs::read_to_string(&sdp).unwrap();
+    assert!(text.contains("a=group:DUP primary secondary\r\n"), "{text}");
+    assert!(text.contains("a=source-filter: incl IN IP4 239.10.2.1 192.0.2.1\r\n"), "{text}");
+    assert!(text.contains("a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n"), "{text}");
+    let lint = st2110(&["lint", &sdp]);
+    assert_eq!(lint.status.code(), Some(0), "{}", stdout(&lint));
+    assert!(stdout(&lint).contains("0 errors, 0 warnings"), "{}", stdout(&lint));
+    let analysed = st2110(&["pcap", &pcap, "--sdp", &sdp]);
+    let report = stdout(&analysed);
+    assert_eq!(analysed.status.code(), Some(0), "{report}");
+    assert!(report.contains("2 flows, no problems found"), "{report}");
+}
+
+#[test]
+fn receive_merges_two_legs_that_each_lost_packets() {
+    let dir = Scratch::new("receive-video");
+    let (sdp, pcap, png) = (dir.path("v.sdp"), dir.path("v.pcap"), dir.path("v.png"));
+    let args = [
+        "send",
+        "video",
+        "320x180p50",
+        "--to",
+        "239.10.1.1:5004",
+        "--to",
+        "239.10.2.1:5004",
+        "--clock",
+        "traceable",
+        "--duration",
+        "0.2",
+        "--sdp",
+        &sdp,
+        "--pcap",
+        &pcap,
+    ];
+    assert_eq!(st2110(&args).status.code(), Some(0));
+    let capture = std::fs::read(&pcap).unwrap();
+    // Leg 1 loses every tenth packet from the fourth, and leg 2 every tenth from the eighth.
+    let lost = |to: [u8; 4], i: usize| i % 10 == if to == [239, 10, 1, 1] { 3 } else { 7 };
+    let lossy = filter_capture(&capture, |to, i| !lost(to, i));
+    let output = with_stdin_bytes(&["receive", &sdp, "--pcap", "-", "--png", &png], &lossy);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("  leg 1 239.10.1.1:5004 from 192.0.2.1: 1620 packets, 180 lost\n"), "{text}");
+    assert!(text.contains("  merged: 1800 packets in 0.200 s, 59.1 Mb/s of RTP, none lost\n"), "{text}");
+    assert!(text.contains("  video: 10 frames, all whole, 180 packets a frame"), "{text}");
+    assert!(text.contains("note: leg 2 (239.10.2.1:5004 from 192.0.2.1) lost 180 packets\n"), "{text}");
+    assert!(text.ends_with(": arrived whole\n"), "{text}");
+    let picture = std::fs::read(&png).unwrap();
+    assert_eq!(picture[..8], [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
+    // IHDR: 320 by 180.
+    assert_eq!(picture[16..24], [0, 0, 1, 64, 0, 0, 0, 180]);
+    // The same packet lost on both legs is lost for good.
+    let both = filter_capture(&capture, |to, i| !lost(to, i) && i != 500);
+    let output = with_stdin_bytes(&["receive", &sdp, "--pcap", "-", "--format", "json"], &both);
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["lost"], 1);
+    assert_eq!(json["video"]["counts"]["whole"], 9);
+    assert_eq!(
+        json["problems"],
+        serde_json::json!(["1 packet lost after merging the legs", "1 frame of 10 arrived incomplete"])
+    );
+}
+
+#[test]
+fn audio_goes_through_a_capture_into_a_wav_file() {
+    let dir = Scratch::new("audio");
+    let (sdp, pcap, wav) = (dir.path("a.sdp"), dir.path("a.pcap"), dir.path("a.wav"));
+    let output = st2110(&[
+        "send",
+        "audio",
+        "--channels",
+        "2",
+        "--to",
+        "239.10.3.1:5004",
+        "--clock",
+        "traceable",
+        "--duration",
+        "0.1",
+        "--sdp",
+        &sdp,
+        "--pcap",
+        &pcap,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("sent 0.100 s of L24 48 kHz, 2 channels, 1 ms (100 packets) on 1 leg"));
+    let output = st2110(&["receive", &sdp, "--pcap", &pcap, "--wav", &wav, "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["audio"]["counts"]["samples"], 4800);
+    for peak in json["audio"]["peaks"].as_array().unwrap() {
+        assert!((peak.as_f64().unwrap() + 18.0).abs() < 0.01, "{peak}");
+    }
+    // The capture's clock is UTC, and the receiver moves it onto PTP time.
+    assert_eq!(json["capture_shift"], 37);
+    let latency = json["latency"]["max"].as_f64().unwrap();
+    assert!((1000.0..1001.0).contains(&latency), "{latency}");
+    let audio = std::fs::read(&wav).unwrap();
+    assert_eq!((&audio[..4], &audio[8..16]), (&b"RIFF"[..], &b"WAVEfmt "[..]));
+    // Two channels of 24 bits at 48 kHz, then 0.1 s of them.
+    assert_eq!(audio[22..24], [2, 0]);
+    assert_eq!(audio[24..28], 48_000u32.to_le_bytes());
+    assert_eq!(audio[34..36], [24, 0]);
+    assert_eq!(audio.len(), 44 + 4800 * 2 * 3);
+}
+
+#[test]
+fn sends_and_receives_over_the_loopback_interface() {
+    // Two free ports: both stay taken until both are read, so they differ.
+    let probes = [0; 2].map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let [one, two] = probes.each_ref().map(|p| format!("127.0.0.1:{}", p.local_addr().unwrap().port()));
+    drop(probes);
+    let mut sender = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["send", "audio", "--to", &one, "--to", &two, "--clock", "traceable", "--duration", "1.5"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    // The sender writes its SDP file first, and sends from a tenth of a second later.
+    let mut sdp = String::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(sender.stdout.take().unwrap())) {
+        let line = line.unwrap();
+        sdp.push_str(&line);
+        sdp.push('\n');
+        if line.trim_end() == "a=mid:secondary" {
+            break;
+        }
+    }
+    let output = with_stdin(&["receive", "-", "--duration", "0.5", "--format", "json"], &sdp);
+    let sent = sender.wait_with_output().unwrap();
+    assert_eq!(sent.status.code(), Some(0), "{}", stderr(&sent));
+    assert_eq!(output.status.code(), Some(0), "{}\n{}", stdout(&output), stderr(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["input"], "network");
+    assert!(json["passed"].as_u64().unwrap() > 300, "{json}");
+    assert_eq!((json["lost"].as_u64(), json["legs"].as_array().map(Vec::len)), (Some(0), Some(2)));
+    assert_eq!(json["problems"], serde_json::json!([]));
+}
+
+#[test]
+fn send_and_receive_refuse_what_they_cannot_do() {
+    let refused = |args: &[&str], message: &str| {
+        let output = st2110(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains(message), "{args:?}: {}", stderr(&output));
+    };
+    refused(
+        &["send", "video", "641x360p25", "--to", "239.1.1.1:5004", "--clock", "traceable"],
+        "pixel groups of 2 pixels",
+    );
+    refused(
+        &["send", "audio", "--to", "239.1.1.1:5004", "--to", "239.1.1.2:5004", "--to", "239.1.1.3:5004"],
+        "give --to once, or twice for an ST 2022-7 pair",
+    );
+    refused(
+        &["send", "audio", "--to", "239.1.1.1:5004", "--to", "239.1.1.1:5004", "--clock", "traceable", "--pcap", "x"],
+        "--duration",
+    );
+    refused(
+        &["send", "audio", "--to", "239.1.1.1:5004", "--packet-time", "0.3", "--clock", "traceable"],
+        "0.3 ms is 14.40 samples at 48 kHz: give a whole number of samples, such as 0.292 or 0.312 ms",
+    );
+    refused(
+        &[
+            "send",
+            "video",
+            "2160p59.94",
+            "--sender-type",
+            "wide",
+            "--to",
+            "239.1.1.1:5004",
+            "--clock",
+            "traceable",
+            "--pcap",
+            "x",
+            "--duration",
+            "1",
+        ],
+        "ST 2110-21 defines no wide sender (2110TPW) at 906294 packets a second",
+    );
+    refused(&["receive", "no-such-file.sdp"], "st2110: no-such-file.sdp: ");
+    let audio = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=tone\r\nt=0 0\r\nm=audio 5004 RTP/AVP 97\r\n\
+                 c=IN IP4 239.1.1.1/32\r\na=rtpmap:97 L24/48000/2\r\na=ptime:1\r\n\
+                 a=ts-refclk:ptp=IEEE1588-2008:traceable\r\na=mediaclk:direct=0\r\n";
+    let output = with_stdin(&["receive", "-", "--png", "x.png"], audio);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--png is for video streams"), "{}", stderr(&output));
+    let output = with_stdin(&["receive", "-", "--max-skew", "2000"], audio);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--max-skew 2000 is not 0 to 1000 ms"), "{}", stderr(&output));
+}
+
+#[test]
+fn audio_at_44_1_khz_keeps_whole_samples_a_packet() {
+    let dir = Scratch::new("audio-44k");
+    let (sdp, pcap) = (dir.path("a.sdp"), dir.path("a.pcap"));
+    let output = st2110(&[
+        "send",
+        "audio",
+        "--sample-rate",
+        "44100",
+        "--to",
+        "239.10.4.1:5004",
+        "--clock",
+        "traceable",
+        "--duration",
+        "0.1",
+        "--sdp",
+        &sdp,
+        "--pcap",
+        &pcap,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("of L24 44.1 kHz, 2 channels, 997.7 µs ("), "{}", stderr(&output));
+    // 1 ms is 44 samples, which ptime=1 gives back to a receiver that rounds.
+    let text = std::fs::read_to_string(&sdp).unwrap();
+    assert!(text.contains("a=rtpmap:97 L24/44100/2\r\n") && text.contains("a=ptime:1\r\n"), "{text}");
+    let output = st2110(&["receive", &sdp, "--pcap", &pcap, "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let (packets, samples) = (&json["audio"]["counts"]["packets"], &json["audio"]["counts"]["samples"]);
+    assert_eq!(samples.as_u64(), packets.as_u64().map(|p| p * 44), "{json}");
+    assert!(packets.as_u64().is_some_and(|p| (100..=101).contains(&p)), "{json}");
+    assert_eq!(json["problems"], serde_json::json!([]));
+}
