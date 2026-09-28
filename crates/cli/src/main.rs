@@ -1,11 +1,12 @@
 //! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet
-//! captures from the command line, connect Receivers to Senders through IS-05, and work
-//! out ST 2059-1 timing.
+//! captures from the command line, connect Receivers to Senders through IS-05, work out
+//! ST 2059-1 timing, and send and receive streams.
 
 mod connect;
 mod nmos;
 mod pcap;
 mod ptp;
+mod stream;
 mod timing;
 
 use std::fs;
@@ -22,7 +23,7 @@ use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 #[command(
     name = "st2110",
     version,
-    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards, and connect Receivers to Senders"
+    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards, connect Receivers to Senders, and send and receive streams"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -262,6 +263,32 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
+    /// Send colour bars or a tone as an ST 2110-20 video or ST 2110-30 audio stream.
+    ///
+    /// Sends from this machine on ordinary UDP sockets, each packet at its ST 2110-21
+    /// time, paced by a spinning thread: a wide sender's timing at HD rates on a quiet
+    /// machine. Frames and RTP timestamps line up with the SMPTE Epoch by the system
+    /// clock, taken as UTC, with TAI --tai-utc ahead: PTP time when the clock follows
+    /// PTP, as phc2sys keeps it. Writes the stream's SDP file to standard output, or to
+    /// --sdp, before the first packet. Give --to twice for the two legs of an ST 2022-7
+    /// pair. With --pcap, writes the packets into a capture file at their times instead,
+    /// as fast as it can. Exits with 0 when the stream was sent, and 2 when it cannot be.
+    Send {
+        #[command(subcommand)]
+        signal: stream::Signal,
+    },
+    /// Receive an ST 2110-20 video or ST 2110-30 audio stream and report what arrived.
+    ///
+    /// Reads the stream from its SDP file, joins each leg's multicast group (from the
+    /// source the file names, for source-specific multicast) or listens on its unicast
+    /// address, and merges the two legs of an ST 2022-7 pair. Reports each leg's packets
+    /// and loss, the loss after merging, how far apart the legs arrive and the tightest
+    /// ST 2022-7 class that allows it, incomplete and missing frames, gaps in the audio,
+    /// and the latency from each RTP timestamp, which means something when both clocks
+    /// follow PTP. With --pcap, reads the packets from a capture instead. Exits with 0
+    /// when the stream arrived whole, 1 when packets were lost after merging, frames
+    /// were incomplete or nothing arrived, and 2 when the stream cannot be received.
+    Receive(stream::ReceiveArgs),
     /// List the rules, or show the ones named.
     Rules {
         /// Rule identifiers, such as mediaclk-offset; every rule when none is given.
@@ -365,6 +392,8 @@ fn main() -> ExitCode {
             let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
             timing::run(&args, format)
         }
+        Command::Send { signal } => stream::send(&signal),
+        Command::Receive(args) => stream::receive(&args),
         Command::Rules { ids, format } => list_rules(&ids, format),
     };
     match result {

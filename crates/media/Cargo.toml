@@ -1,0 +1,24 @@
+[package]
+name = "st2110-media"
+description = "ST 2110-20 video and ST 2110-30 audio senders and receivers on ordinary UDP sockets, with ST 2022-7 redundancy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# Senders and receivers on UDP sockets.
+net = ["dep:socket2"]
+serde = ["dep:serde"]
+
+[dependencies]
+st2110-sdp.workspace = true
+st2110-ptp.workspace = true
+st2110-pcap.workspace = true
+st2110-connect.workspace = true
+serde = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
+
+[lints]
+workspace = true

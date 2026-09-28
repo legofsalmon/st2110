@@ -1,0 +1,698 @@
+//! `st2110 send` and `st2110 receive`: send colour bars or a tone as an ST 2110 stream,
+//! and receive a stream and report what arrived.
+
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Args, Subcommand, ValueEnum};
+use serde::Serialize;
+use st2110_media::describe::{Clock, Description, Leg, Media};
+use st2110_media::files::{Capture, UNKNOWN_SOURCE, WavWriter, write_png};
+use st2110_media::format::{AudioFormat, Packing, Range, SenderType, VideoFormat};
+use st2110_media::net::{self, Transmitter};
+use st2110_media::receive::{self as session, Report, Session, Sink};
+use st2110_media::send::{SendCounts, Sender};
+use st2110_media::video::FrameInfo;
+
+use crate::{Format, Style, read, seconds};
+
+const NANOS: i128 = 1_000_000_000;
+
+/// What to send.
+#[derive(Subcommand)]
+pub(crate) enum Signal {
+    /// Colour bars, EBU 100/0/75/0, over a black strip in which a white box steps
+    /// across a little each frame.
+    Video {
+        #[command(flatten)]
+        video: VideoArgs,
+        #[command(flatten)]
+        send: SendArgs,
+    },
+    /// A tone, the same on every channel.
+    Audio {
+        #[command(flatten)]
+        audio: AudioArgs,
+        #[command(flatten)]
+        send: SendArgs,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct VideoArgs {
+    /// The picture: 1080p50, 2160p59.94, 720p60000/1001, or any size, such as
+    /// 1280x720p25. Progressive only.
+    #[arg(value_name = "FORMAT", default_value = "1080p50")]
+    format: String,
+    /// The sampling: YCbCr-4:2:2, YCbCr-4:4:4, RGB or KEY.
+    #[arg(long, default_value = "YCbCr-4:2:2")]
+    sampling: String,
+    /// Bits a sample: 8, 10, 12 or 16.
+    #[arg(long, default_value = "10")]
+    depth: String,
+    /// The colorimetry, such as BT709 or BT2020.
+    #[arg(long, default_value = "BT709")]
+    colorimetry: String,
+    /// The transfer characteristic, such as SDR, PQ or HLG.
+    #[arg(long, default_value = "SDR")]
+    tcs: String,
+    /// The range of code values.
+    #[arg(long, value_enum, default_value_t = RangeArg::Narrow)]
+    range: RangeArg,
+    /// How pixel groups are packed into packets: general (2110GPM) or block (2110BPM).
+    #[arg(long, value_enum, default_value_t = PackingArg::Gpm)]
+    packing: PackingArg,
+    /// The ST 2110-21 sender type the SDP file declares. Pacing on ordinary sockets
+    /// can keep to wide at best.
+    #[arg(long, value_enum, default_value_t = SenderArg::Wide)]
+    sender_type: SenderArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RangeArg {
+    Narrow,
+    Fullprotect,
+    Full,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PackingArg {
+    Gpm,
+    Bpm,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SenderArg {
+    Narrow,
+    NarrowLinear,
+    Wide,
+}
+
+#[derive(Args)]
+pub(crate) struct AudioArgs {
+    /// Channels, 1 to 64.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=64))]
+    channels: u16,
+    /// Samples a second: 48000, 96000 or 44100.
+    #[arg(long, value_name = "HZ", default_value_t = 48_000)]
+    sample_rate: u32,
+    /// Bits a sample: 24 (L24) or 16 (L16).
+    #[arg(long, default_value_t = 24)]
+    bits: u8,
+    /// Milliseconds of audio in each packet: 1, or 0.125 as levels B and C have.
+    #[arg(long, value_name = "MS", default_value_t = 1.0)]
+    packet_time: f64,
+    /// The tone's frequency in Hz.
+    #[arg(long, value_name = "HZ", default_value_t = 1000)]
+    tone: u32,
+    /// The tone's level in dB below full scale; EBU R 68 lines up at −18.
+    #[arg(long, value_name = "DBFS", default_value_t = -18.0, allow_negative_numbers = true)]
+    level: f64,
+}
+
+#[derive(Args)]
+pub(crate) struct SendArgs {
+    /// Where to send: a multicast group or a unicast address, and a port, such as
+    /// 239.1.1.1:5004. Give it twice for the two legs of an ST 2022-7 pair.
+    #[arg(long, value_name = "ADDRESS:PORT", required = true)]
+    to: Vec<SocketAddrV4>,
+    /// The address of the network interface to send from; the one the routing table
+    /// picks when omitted. Give it once for every leg, or twice to send each leg from
+    /// its own.
+    #[arg(long, value_name = "ADDRESS")]
+    interface: Vec<Ipv4Addr>,
+    /// The RTP payload type: 96 for video and 97 for audio when omitted.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(96..=127))]
+    payload_type: Option<u8>,
+    /// The time to live of multicast packets.
+    #[arg(long, default_value_t = 32)]
+    ttl: u8,
+    /// The DSCP value to mark packets with: AF41, as AES67 marks media, by default.
+    #[arg(long, default_value_t = 34, value_parser = clap::value_parser!(u8).range(0..=63))]
+    dscp: u8,
+    /// The reference clock to name in the SDP file: traceable, <grandmaster>:<domain>
+    /// such as 08-00-11-FF-FE-21-E1-B0:127, or localmac=<MAC address>. Name the
+    /// grandmaster when the system clock follows PTP; localmac with this machine's MAC
+    /// address, which only Linux can find, when omitted.
+    #[arg(long, value_name = "CLOCK")]
+    clock: Option<String>,
+    /// The session name in the SDP file.
+    #[arg(long)]
+    name: Option<String>,
+    /// Seconds to send for; until stopped when omitted.
+    #[arg(long, value_name = "SECONDS")]
+    duration: Option<f64>,
+    /// Write the SDP file here, rather than to standard output.
+    #[arg(long, value_name = "FILE")]
+    sdp: Option<PathBuf>,
+    /// Write the packets into a capture file, each stamped with its time, instead of
+    /// sending them. Needs --duration.
+    #[arg(long, value_name = "FILE", requires = "duration")]
+    pcap: Option<PathBuf>,
+    /// TAI − UTC in seconds.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = st2110_ptp::TAI_UTC_2017,
+        allow_negative_numbers = true,
+        value_parser = crate::offset()
+    )]
+    tai_utc: i32,
+}
+
+/// A number that differs from run to run, for SSRCs and sequence numbers: RFC 3550
+/// asks for random ones, and this need not be unpredictable, only different.
+fn scramble(salt: u64) -> u64 {
+    let mut x = (net::tai_now(0) as u64) ^ (u64::from(std::process::id()) << 32) ^ salt;
+    // SplitMix64's finaliser.
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// One of this machine's MAC addresses, written as `localmac=` wants it, from Linux's
+/// `/sys/class/net`.
+fn local_mac() -> Option<String> {
+    let mut names: Vec<_> =
+        fs::read_dir("/sys/class/net").ok()?.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    names.sort();
+    names.iter().filter(|name| *name != "lo").find_map(|name| {
+        let address = fs::read_to_string(Path::new("/sys/class/net").join(name).join("address")).ok()?;
+        let address = address.trim();
+        (address.len() == 17 && address != "00:00:00:00:00:00").then(|| address.replace(':', "-").to_ascii_uppercase())
+    })
+}
+
+fn video_format(args: &VideoArgs) -> Result<VideoFormat, String> {
+    let mut format = VideoFormat::from_name(&args.format)?;
+    format.sampling = args.sampling.parse().map_err(|()| format!("{} is not an ST 2110-20 sampling", args.sampling))?;
+    format.depth = args.depth.parse().map_err(|()| format!("{} is not an ST 2110-20 depth", args.depth))?;
+    format.colorimetry = args.colorimetry.clone();
+    format.transfer = args.tcs.clone();
+    format.range = match args.range {
+        RangeArg::Narrow => Range::Narrow,
+        RangeArg::Fullprotect => Range::FullProtect,
+        RangeArg::Full => Range::Full,
+    };
+    format.packing = match args.packing {
+        PackingArg::Gpm => Packing::General,
+        PackingArg::Bpm => Packing::Block,
+    };
+    format.sender_type = match args.sender_type {
+        SenderArg::Narrow => SenderType::Narrow,
+        SenderArg::NarrowLinear => SenderType::NarrowLinear,
+        SenderArg::Wide => SenderType::Wide,
+    };
+    format.check()?;
+    Ok(format)
+}
+
+fn audio_format(args: &AudioArgs) -> Result<AudioFormat, String> {
+    let packet_time_us = (args.packet_time * 1000.0).round();
+    if !(1.0..=4000.0).contains(&packet_time_us) || (packet_time_us - args.packet_time * 1000.0).abs() > 1e-6 {
+        return Err(format!("--packet-time {} is not a whole number of microseconds up to 4 ms", args.packet_time));
+    }
+    let format = AudioFormat {
+        channels: args.channels,
+        sample_rate: args.sample_rate,
+        bits: args.bits,
+        packet_time_us: packet_time_us as u32,
+    };
+    format.check()?;
+    Ok(format)
+}
+
+pub(crate) fn send(signal: &Signal) -> io::Result<ExitCode> {
+    match prepare(signal) {
+        Ok(ready) => ready.run(),
+        Err(e) => {
+            eprintln!("st2110: {e}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+/// A stream ready to send, its SDP file written.
+struct Ready<'a> {
+    args: &'a SendArgs,
+    description: Description,
+    sender: Sender,
+    transmitter: Option<Transmitter>,
+}
+
+fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
+    let (media, args, tone, level) = match signal {
+        Signal::Video { video, send } => (Media::Video(video_format(video)?), send, 1000, -18.0),
+        Signal::Audio { audio, send } => (Media::Audio(audio_format(audio)?), send, audio.tone, audio.level),
+    };
+    if args.to.len() > 2 {
+        return Err("give --to once, or twice for an ST 2022-7 pair".into());
+    }
+    if args.interface.len() > args.to.len() {
+        return Err("give --interface no more times than --to".into());
+    }
+    args.duration.map(|d| seconds("--duration", d)).transpose()?;
+    let clock = match &args.clock {
+        Some(text) => Clock::parse(text)?,
+        None => Clock::LocalMac(local_mac().ok_or(
+            "this machine's MAC address cannot be found for the SDP file's reference clock: \
+             give --clock localmac=<its MAC address>, or --clock <grandmaster>:<domain> when \
+             the system clock follows PTP",
+        )?),
+    };
+    let video = matches!(media, Media::Video(_));
+    let name = args.name.clone().unwrap_or_else(|| {
+        format!("st2110 {} {}", if video { "bars" } else { "tone" }, media).replace(['\r', '\n'], " ")
+    });
+    let interfaces: Vec<Option<Ipv4Addr>> =
+        (0..args.to.len()).map(|i| args.interface.get(i).or(args.interface.last()).copied()).collect();
+    let mut description = Description {
+        name,
+        media,
+        payload_type: args.payload_type.unwrap_or(if video { 96 } else { 97 }),
+        legs: args.to.iter().map(|&destination| Leg { destination, source: None }).collect(),
+        clock: Some(clock),
+        ttl: args.ttl,
+    };
+    let transmitter = if args.pcap.is_some() {
+        for (leg, interface) in description.legs.iter_mut().zip(&interfaces) {
+            leg.source = Some(interface.unwrap_or(UNKNOWN_SOURCE));
+        }
+        None
+    } else {
+        let t = Transmitter::new(&description.legs, &interfaces, args.ttl, args.dscp, args.tai_utc)
+            .map_err(|e| format!("cannot open a socket to send from: {e}"))?;
+        for (leg, &source) in description.legs.iter_mut().zip(t.sources()) {
+            leg.source = (!source.is_unspecified()).then_some(source);
+        }
+        Some(t)
+    };
+    description.check()?;
+    let ssrc = scramble(1) as u32;
+    let sender = Sender::new(&description, tone, level, ssrc, scramble(2) as u32)?;
+    let sdp = description.sdp(u64::try_from(net::tai_now(0) / NANOS).unwrap_or(0));
+    match &args.sdp {
+        Some(path) => fs::write(path, &sdp).map_err(|e| format!("{}: {e}", path.display()))?,
+        None => {
+            let mut out = io::stdout().lock();
+            out.write_all(sdp.as_bytes()).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(Ready { args, description, sender, transmitter })
+}
+
+impl Ready<'_> {
+    fn run(mut self) -> io::Result<ExitCode> {
+        let args = self.args;
+        let duration = args.duration.map_or(i128::MAX / 4, |d| (d * 1e9) as i128);
+        // A moment's grace, for whoever reads the SDP file to join.
+        let start = net::tai_now(args.tai_utc) + NANOS / 10;
+        let legs = self.description.legs.len();
+        let summary = |counts: SendCounts| {
+            let (sent, skipped) = match &self.description.media {
+                Media::Video(_) => (plural(counts.frames, "frame"), plural(counts.skipped, "frame")),
+                Media::Audio(a) => {
+                    let time = |n: u64| format!("{:.3} s", n as f64 * f64::from(a.packet_time_us) / 1e6);
+                    (time(counts.frames), time(counts.skipped))
+                }
+            };
+            let mut line = format!(
+                "sent {sent} of {} ({}) on {}",
+                self.description.media,
+                plural(counts.packets, "packet"),
+                plural(legs as u64, "leg")
+            );
+            if counts.skipped > 0 {
+                line.push_str(&format!("; left out {skipped} whose time had passed"));
+            }
+            line
+        };
+        match (&args.pcap, self.transmitter.take()) {
+            (Some(path), _) => {
+                let file =
+                    File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+                let ports: Vec<(SocketAddrV4, SocketAddrV4)> = self
+                    .description
+                    .legs
+                    .iter()
+                    .map(|l| {
+                        (SocketAddrV4::new(l.source.unwrap_or(UNKNOWN_SOURCE), l.destination.port()), l.destination)
+                    })
+                    .collect();
+                let mut capture = Capture::new(BufWriter::new(file), ports, args.ttl, args.tai_utc)?;
+                let counts = self.sender.run(&mut capture, start, start + duration)?;
+                capture.into_inner().flush()?;
+                eprintln!("st2110: {} into {}", summary(counts), path.display());
+            }
+            (None, Some(mut transmitter)) => {
+                let counts = self.sender.run(&mut transmitter, start, start + duration)?;
+                let t = transmitter.counts();
+                let mut line = summary(counts);
+                if t.late > 0 {
+                    let went = if t.late == 1 { "packet went" } else { "packets went" };
+                    line.push_str(&format!(
+                        "; {} {went} more than 100 µs late, the latest by {:.0} µs",
+                        t.late,
+                        t.latest_ns as f64 / 1000.0
+                    ));
+                }
+                if t.refused > 0 {
+                    line.push_str(&format!("; the system's buffers had no room for {}", plural(t.refused, "packet")));
+                }
+                eprintln!("st2110: {line}");
+            }
+            (None, None) => unreachable!("a transmitter unless writing a capture"),
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn plural(count: u64, noun: &str) -> String {
+    crate::plural(count as usize, noun)
+}
+
+#[derive(Args)]
+pub(crate) struct ReceiveArgs {
+    /// The stream's SDP file; `-` reads standard input.
+    sdp: PathBuf,
+    /// The address of the network interface to receive on; the one the system picks
+    /// when omitted. Give it once for every leg, or twice to receive each leg on its
+    /// own.
+    #[arg(long, value_name = "ADDRESS")]
+    interface: Vec<Ipv4Addr>,
+    /// Seconds to receive for.
+    #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+    duration: f64,
+    /// Read the packets from a capture file instead of the network; `-` reads standard
+    /// input.
+    #[arg(long, value_name = "FILE")]
+    pcap: Option<PathBuf>,
+    /// Save the last frame that arrived whole as a PNG picture.
+    #[arg(long, value_name = "FILE")]
+    png: Option<PathBuf>,
+    /// Save the audio as a WAV file, with silence where packets were missing.
+    #[arg(long, value_name = "FILE")]
+    wav: Option<PathBuf>,
+    /// TAI − UTC in seconds: how far the system clock, or a capture's, is behind PTP time.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = st2110_ptp::TAI_UTC_2017,
+        allow_negative_numbers = true,
+        value_parser = crate::offset()
+    )]
+    tai_utc: i32,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+}
+
+/// Where received audio goes, when it is saved.
+struct Saver {
+    wav: Option<WavWriter<BufWriter<File>>>,
+    error: Option<io::Error>,
+}
+
+impl Sink for Saver {
+    fn frame(&mut self, _: &FrameInfo, _: &[u8]) {}
+
+    fn samples(&mut self, samples: &[i32]) {
+        if let (Some(wav), None) = (&mut self.wav, &self.error)
+            && let Err(e) = wav.write(samples)
+        {
+            self.error = Some(e);
+        }
+    }
+}
+
+/// What `st2110 receive` found.
+#[derive(Serialize)]
+struct Received {
+    file: String,
+    /// How the SDP file's legs were read.
+    sdp_notes: Vec<String>,
+    /// Where the packets came from: the network or a capture.
+    input: String,
+    /// When reading a capture: how its clock was moved onto PTP time, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_shift: Option<i32>,
+    #[serde(flatten)]
+    report: Report,
+}
+
+pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
+    let file = args.sdp.display().to_string();
+    let text = match read(&args.sdp) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("st2110: {file}: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let (description, sdp_notes) = match Description::parse(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("st2110: {file}: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let mut session = match Session::new(&description) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("st2110: {file}: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    if args.interface.len() > description.legs.len() {
+        eprintln!("st2110: give --interface no more times than the stream has legs ({})", description.legs.len());
+        return Ok(ExitCode::from(2));
+    }
+    let mut saver = Saver { wav: None, error: None };
+    if let Some(path) = &args.wav {
+        let Media::Audio(format) = &description.media else {
+            eprintln!("st2110: --wav is for audio streams, and {file} describes video");
+            return Ok(ExitCode::from(2));
+        };
+        let file = File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        saver.wav = Some(WavWriter::new(BufWriter::new(file), format.channels, format.sample_rate, format.bits)?);
+    }
+    if args.png.is_some() && !matches!(description.media, Media::Video(_)) {
+        eprintln!("st2110: --png is for video streams, and {file} describes audio");
+        return Ok(ExitCode::from(2));
+    }
+    let mut capture_shift = None;
+    let input = match &args.pcap {
+        Some(path) => {
+            let shift = from_capture(&mut session, path, args.tai_utc, &mut saver)?;
+            capture_shift = shift;
+            format!("capture {}", path.display())
+        }
+        None => {
+            let duration = match seconds("--duration", args.duration) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("st2110: {e}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            let mut sockets = Vec::new();
+            for (i, leg) in description.legs.iter().enumerate() {
+                match net::listen(leg, args.interface.get(i).or(args.interface.last()).copied()) {
+                    Ok((socket, buffer)) => {
+                        if matches!(description.media, Media::Video(_)) && buffer < 4 << 20 {
+                            eprintln!(
+                                "st2110: the system gave leg {} a receive buffer of {} KiB, which a burst of video overflows; raise net.core.rmem_max",
+                                i + 1,
+                                buffer / 1024
+                            );
+                        }
+                        sockets.push(socket);
+                    }
+                    Err(e) => {
+                        eprintln!("st2110: cannot receive {leg}: {e}");
+                        return Ok(ExitCode::from(2));
+                    }
+                }
+            }
+            let until = net::tai_now(args.tai_utc) + duration.as_nanos() as i128;
+            net::receive(&mut session, sockets, until, args.tai_utc, &mut saver)?;
+            "network".to_string()
+        }
+    };
+    if let Some(e) = saver.error.take() {
+        eprintln!("st2110: {}: {e}", args.wav.as_deref().unwrap_or(Path::new("")).display());
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(wav) = saver.wav.take() {
+        wav.finish()?.flush()?;
+    }
+    let report = session.report();
+    if let Some(path) = &args.png {
+        match (session.last_whole_frame(), &description.media) {
+            (Some(frame), Media::Video(format)) => {
+                let rgb = st2110_media::pixels::to_rgb(format, frame).map_err(io::Error::other)?;
+                let mut out = BufWriter::new(
+                    File::create(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?,
+                );
+                write_png(&mut out, format.width, format.height, &rgb)?;
+                out.flush()?;
+            }
+            _ => eprintln!("st2110: no frame arrived whole, so {} was not written", path.display()),
+        }
+    }
+    let failed = !report.problems.is_empty();
+    let received = Received { file, sdp_notes, input, capture_shift, report };
+    let mut out = io::stdout().lock();
+    match args.format {
+        Format::Text => write_text(&mut out, &received, &description, Style::detect())?,
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, &received)?;
+            writeln!(out)?;
+        }
+    }
+    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// Feeds a capture's datagrams to the session, each to the leg whose destination (and
+/// source, where two legs share a destination) it matches. A capture on UTC is moved
+/// onto PTP time by `tai_utc`, and one already on PTP time is not: whichever puts the
+/// first packet nearer its RTP timestamp. Gives the shift, once one packet has decided it.
+fn from_capture(session: &mut Session, path: &Path, tai_utc: i32, sink: &mut impl Sink) -> io::Result<Option<i32>> {
+    let input: Box<dyn io::Read> = if path.as_os_str() == "-" {
+        Box::new(io::stdin().lock())
+    } else {
+        Box::new(File::open(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?)
+    };
+    let mut reader = st2110_pcap::Reader::new(BufReader::new(input))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+    let legs = session.description().legs.clone();
+    let clock_rate = session.description().media.clock_rate();
+    let mut shift: Option<i32> = None;
+    while let Some(frame) = reader.next_frame() {
+        let frame =
+            frame.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+        let st2110_pcap::net::Packet::Udp(datagram) = st2110_pcap::net::parse(frame.link, frame.data) else {
+            continue;
+        };
+        let (SocketAddr::V4(source), SocketAddr::V4(destination)) = (datagram.source, datagram.destination) else {
+            continue;
+        };
+        let matching = |l: &&Leg| l.destination == destination;
+        let Some(leg) = legs
+            .iter()
+            .position(|l| matching(&l) && l.source == Some(*source.ip()))
+            .or_else(|| legs.iter().position(|l| matching(&l)))
+        else {
+            continue;
+        };
+        if !datagram.complete() {
+            continue;
+        }
+        let shift = *shift.get_or_insert_with(|| match st2110_pcap::rtp::header(datagram.payload, true) {
+            Some(h) => {
+                let off = |s: i32| {
+                    session::since_timestamp(h.timestamp, frame.time + i128::from(s) * NANOS, clock_rate).abs()
+                };
+                if off(tai_utc) < off(0) { tai_utc } else { 0 }
+            }
+            None => tai_utc,
+        });
+        session.push(leg, *source.ip(), frame.time + i128::from(shift) * NANOS, datagram.payload, sink);
+    }
+    session.finish(sink);
+    Ok(shift)
+}
+
+fn write_text(out: &mut impl Write, r: &Received, description: &Description, style: Style) -> io::Result<()> {
+    let report = &r.report;
+    writeln!(out, "{}: {}, from the {}", style.paint("1", &r.file), report.stream, r.input)?;
+    if let Some(shift) = r.capture_shift.filter(|&s| s != 0) {
+        writeln!(out, "  the capture's clock is taken as UTC, and moved {shift} s onto PTP time")?;
+    }
+    for (i, leg) in report.legs.iter().enumerate() {
+        let mut line = format!("  leg {} {}: {}", i + 1, leg.leg, plural(leg.rtp.received, "packet"));
+        if leg.rtp.lost > 0 {
+            line.push_str(&format!(", {} lost", leg.rtp.lost));
+        }
+        if leg.rtp.reordered > 0 {
+            line.push_str(&format!(", {} out of order", leg.rtp.reordered));
+        }
+        if leg.rtp.duplicates > 0 {
+            line.push_str(&format!(", {} twice", leg.rtp.duplicates));
+        }
+        writeln!(out, "{line}")?;
+    }
+    let lost = if report.lost == 0 { "none lost".to_string() } else { format!("{} lost", report.lost) };
+    let merged = if report.legs.len() > 1 { "merged: " } else { "" };
+    writeln!(
+        out,
+        "  {merged}{} in {:.3} s, {:.1} Mb/s of RTP, {lost}",
+        plural(report.passed, "packet"),
+        report.seconds,
+        report.megabits_per_second
+    )?;
+    if let Some(skew) = &report.skew {
+        let class = match &report.class {
+            Some(class) => format!("ST 2022-7 class {class}"),
+            None => "beyond every ST 2022-7 class".into(),
+        };
+        let (behind, ahead) = if skew.mean_ns < 0.0 { (1, 2) } else { (2, 1) };
+        writeln!(
+            out,
+            "  legs apart: at most {:.1} µs, leg {behind} behind leg {ahead} by {:.1} µs on average: {class}",
+            skew.max_ns as f64 / 1000.0,
+            skew.mean_ns.abs() / 1000.0
+        )?;
+    }
+    if let Some(video) = &report.video {
+        let c = video.counts;
+        let mut whole = if c.whole == c.frames { "all whole".to_string() } else { format!("{} whole", c.whole) };
+        if c.cut > 0 {
+            whole.push_str(&format!(" and {} cut off by the start or end of receiving", c.cut));
+        }
+        let rate = video.frame_rate.map(|r| format!(", {r:.3} frames a second")).unwrap_or_default();
+        writeln!(
+            out,
+            "  video: {}, {whole}, {} packets a frame{rate}",
+            plural(c.frames, "frame"),
+            video.packets_per_frame
+        )?;
+    }
+    if let Some(audio) = &report.audio {
+        let peaks: Vec<String> =
+            audio.peaks.iter().map(|p| p.map_or("silent".into(), |db| format!("{db:.1}"))).collect();
+        let samples = if let Media::Audio(f) = &description.media {
+            format!("{:.3} s", audio.counts.samples as f64 / f64::from(f.sample_rate))
+        } else {
+            String::new()
+        };
+        writeln!(
+            out,
+            "  audio: {samples} in {}, peaks {} dBFS",
+            plural(audio.counts.packets, "packet"),
+            peaks.join(", ")
+        )?;
+    }
+    if let Some(latency) = &report.latency {
+        writeln!(
+            out,
+            "  latency from RTP timestamp: {:.1} to {:.1} µs, mean {:.1} µs",
+            latency.min, latency.max, latency.mean
+        )?;
+    }
+    for note in r.sdp_notes.iter().chain(&report.notes) {
+        writeln!(out, "  {}: {note}", style.paint("1;36", "note"))?;
+    }
+    for problem in &report.problems {
+        writeln!(out, "  {}: {problem}", style.paint("1;31", "problem"))?;
+    }
+    if report.problems.is_empty() {
+        writeln!(out, "{}: arrived whole", r.file)?;
+    } else {
+        writeln!(out, "{}: {}", r.file, plural(report.problems.len() as u64, "problem"))?;
+    }
+    Ok(())
+}

@@ -1,6 +1,6 @@
 # st2110
 
-Tools for SMPTE ST 2110 media over IP, written in Rust. There are five so far:
+Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
 
 - an SDP linter, which reads the session description a sender publishes, describes
   each stream in it and checks it against ST 2110 and the documents it builds on;
@@ -14,7 +14,12 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are five so far:
   by ST 2059-1;
 - a capture analyser, which reads pcap and pcapng files and measures each flow as
   RP 2110-25 describes: loss, timing against PTP time, the ST 2110-21 sender models,
-  audio packet timing, and the PTP messages across the capture.
+  audio packet timing, and the PTP messages across the capture;
+- a sender and receiver on ordinary UDP sockets, which send colour bars as ST 2110-20
+  video or tone as ST 2110-30 audio, paced by ST 2110-21 and lined up with the SMPTE
+  Epoch, on one leg or an ST 2022-7 pair, and receive a stream from its SDP file,
+  merging the legs, putting frames and samples back together and reporting what
+  arrived.
 
 Every finding cites the clause behind it.
 
@@ -25,7 +30,8 @@ Every finding cites the clause behind it.
 | [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap` and `st2110 time`. |
+| [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send` and `st2110 receive`. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -216,6 +222,36 @@ audio 48000 Hz
 - `--non-drop` counts 29.97 time code without dropping frames, and `--tai-utc` changes TAI − UTC from 37 s.
 - The arithmetic is exact: PTP time is kept in integer nanoseconds and rates as ratios, so 1000/1001 rates land on the right nanosecond and RTP timestamps step 1501 and 1502 at 59.94 fps.
 
+## Send and receive streams
+
+```console
+$ st2110 send video 1080p50 --to 239.10.1.1:5004 --to 239.10.2.1:5004 --interface 192.168.10.21 --interface 192.168.20.21 \
+    --clock 08-00-11-FF-FE-21-E1-B0:127 --duration 1 --sdp bars.sdp --pcap bars.pcap
+st2110: sent 50 frames of 1920x1080p50 YCbCr-4:2:2 10-bit (216000 packets) on 2 legs into bars.pcap
+$ st2110 receive bars.sdp --pcap bars.pcap --png bars.png
+bars.sdp: 1920x1080p50 YCbCr-4:2:2 10-bit, from the capture bars.pcap
+  the capture's clock is taken as UTC, and moved 37 s onto PTP time
+  leg 1 239.10.1.1:5004 from 192.168.10.21: 216000 packets
+  leg 2 239.10.2.1:5004 from 192.168.20.21: 216000 packets
+  merged: 216000 packets in 1.000 s, 2108.2 Mb/s of RTP, none lost
+  legs apart: at most 0.0 µs, leg 2 behind leg 1 by 0.0 µs on average: ST 2022-7 class D
+  video: 50 frames, all whole, 4320 packets a frame, 50.000 frames a second
+  latency from RTP timestamp: 382.2 to 382.2 µs, mean 382.2 µs
+bars.sdp: arrived whole
+```
+
+- `st2110 send video [FORMAT]` sends EBU colour bars, with a box that moves along the black strip beneath them, as ST 2110-20 video. FORMAT is 1080p50 unless it names another, such as 2160p59.94 or 1280x720p25; video is progressive. `--sampling`, `--depth`, `--colorimetry`, `--tcs`, `--range` and `--packing` choose the rest. `st2110 send audio` sends a 1 kHz tone at −18 dBFS as ST 2110-30 audio; `--channels`, `--sample-rate`, `--bits`, `--packet-time`, `--tone` and `--level` choose it.
+- Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, `wide` unless it says `narrow` or `narrow-linear`, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Each audio packet goes as its last sample falls due.
+- `--to` gives the destination, a multicast group or a unicast address; give it twice for the two legs of an ST 2022-7 pair, which carry the same packets. `--interface` gives the address to send from, once for every leg or once for each; otherwise the routing table picks. `--ttl` sets the multicast time to live and `--dscp` the DSCP, AF41 by default, as AES67 marks media.
+- It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it.
+- It times packets by the system clock, taking TAI to be 37 s ahead of it (`--tai-utc` changes that). On a machine whose clock `phc2sys` keeps to PTP, name the grandmaster with `--clock <grandmaster>:<domain>` or `--clock traceable`, and its streams line up with every other sender's. Otherwise the SDP file names this machine's MAC address as `localmac`, which only Linux can find; elsewhere give `--clock`.
+- `--duration` sends for that many seconds, and without it the sender runs until it is stopped. With `--pcap FILE` it writes the packets into a capture instead, as fast as it can make them, each at the time it would have gone out, on UTC as a capture made with the system clock is. `st2110 pcap` measures such a capture, and `st2110 receive --pcap` reads it.
+- `st2110 receive SDP` joins each leg's group, from the SDP file's source only when it has a source filter, or takes a unicast leg on its address; `--interface` gives the interface. It merges the legs as ST 2022-7 does, passing on the first copy of each packet, and puts the frames or samples back together. It reports what each leg lost and what was lost after merging, how far apart the legs' copies arrived and the tightest ST 2022-7 receiver class that allows it, which frames arrived whole, the frame rate, and the latency from each frame's RTP timestamp, which is the sender's and the network's delay when both clocks follow PTP. A frame cut off by the start or end of receiving is not a fault.
+- `--duration` receives for that many seconds, 5 by default. `--pcap FILE` reads a capture instead of the network, and works out whether its clock is PTP time or UTC. `--png FILE` saves the last frame that arrived whole, and `--wav FILE` the audio, with silence where packets were lost. `--format json` gives everything the report holds.
+- `receive` exits with 0 when the stream arrived whole, 1 when something was lost or incomplete, and 2 when it cannot receive. `send` exits with 0 when it has sent, and 2 when it cannot.
+
+Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. A receiver needs a large socket buffer for video: on Linux, raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=67108864`); `receive` says when the system allows less than 4 MiB.
+
 ## What it checks
 
 The full catalogue, with the clause behind each rule, is in [docs/rules.md](docs/rules.md).
@@ -346,6 +382,37 @@ for f in &report.findings {
 
 `st2110_pcap::Analyser` takes one frame at a time instead, for captures that arrive some other way.
 
+To send a stream, describe it, write its SDP file and send it (the `net` feature); to receive one, read its SDP file:
+
+```rust
+use st2110_media::describe::{Clock, Description, Leg, Media};
+use st2110_media::format::VideoFormat;
+use st2110_media::net::{self, Transmitter};
+use st2110_media::receive::Session;
+use st2110_media::send::Sender;
+
+let stream = Description {
+    name: "Bars".into(),
+    media: Media::Video(VideoFormat::from_name("1080p50")?),
+    payload_type: 96,
+    legs: vec![Leg { destination: "239.10.1.1:5004".parse()?, source: Some("192.168.10.21".parse()?) }],
+    clock: Some(Clock::Traceable),
+    ttl: 32,
+};
+std::fs::write("bars.sdp", stream.sdp(1))?;
+let mut transmitter = Transmitter::new(&stream.legs, &["192.168.10.21".parse().ok()], 32, 34, 37)?;
+let start = net::tai_now(37) + 100_000_000;
+Sender::new(&stream, 1000, -18.0, 0x1234_5678, 0)?.run(&mut transmitter, start, start + 10_000_000_000)?;
+
+let (stream, _notes) = Description::parse(&std::fs::read_to_string("bars.sdp")?)?;
+let mut session = Session::new(&stream)?;
+let sockets = stream.legs.iter().map(|leg| Ok(net::listen(leg, None)?.0)).collect::<std::io::Result<Vec<_>>>()?;
+net::receive(&mut session, sockets, net::tai_now(37) + 2_000_000_000, 37, &mut ())?;
+println!("{:?}", session.report().problems);
+```
+
+`Sender` sends to any `send::Output`, and `receive::Session` takes datagrams from anywhere, so without the `net` feature the crate works on captures and in tests. `video::Packetiser` and `video::Depacketiser`, `audio::AudioPacketiser` and `audio::AudioDepacketiser`, and `merge::Merger` work on their own too.
+
 To make connections, read the registry without the SDP files, which are fetched as they are needed, and give the controller the routes (the `client` feature):
 
 ```rust
@@ -420,4 +487,4 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 ## Roadmap
 
-These are the first five steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, and the IS-05 controller. Next come senders and receivers on Intel MTL.
+These are the first six steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, the IS-05 controller, and senders and receivers on ordinary sockets. Next, the same senders and receivers on Intel MTL, behind the same interface, for UHD rates and a narrow sender's pace.
