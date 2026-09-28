@@ -55,7 +55,8 @@ pub struct AudioCounts {
     /// Samples per channel that arrived.
     pub samples: u64,
     /// Samples per channel of the packets that never did, filled with silence: up to
-    /// ten seconds a gap.
+    /// ten seconds a gap, as long as the run keeps within ten seconds of the time since
+    /// the first packet came.
     pub missing: u64,
     /// Samples per channel that the RTP timestamps skip beyond the packets missing,
     /// filled with silence as those are: the sender paused or left them out, or its clock
@@ -71,8 +72,11 @@ pub struct AudioCounts {
     pub malformed: u64,
 }
 
-/// The longest gap filled with silence, in seconds.
+/// The longest gap filled with silence, and the furthest the run may get ahead of the
+/// time since the first packet came, in seconds.
 const MOST_SILENCE: u64 = 10;
+
+const NANOS: i128 = 1_000_000_000;
 
 /// Puts ST 2110-30 packets back into a continuous run of samples.
 ///
@@ -80,6 +84,8 @@ const MOST_SILENCE: u64 = 10;
 /// with the number missing before each. Their time is filled with silence: as the RTP
 /// timestamps say, when they agree with the packets missing, and otherwise as the
 /// packet time says. Time the timestamps skip beyond the packets missing is filled too.
+/// The run never gets more than ten seconds ahead of the time since the first packet
+/// came, so timestamps that run away cannot fill hours of silence in seconds.
 #[derive(Clone, Debug)]
 pub struct AudioDepacketiser {
     format: AudioFormat,
@@ -87,6 +93,10 @@ pub struct AudioDepacketiser {
     counts: AudioCounts,
     peaks: Vec<u32>,
     samples: Vec<i32>,
+    /// When the first packet came, in nanoseconds, and the samples per channel played
+    /// since, silence and all.
+    first: Option<i128>,
+    played: u64,
 }
 
 impl AudioDepacketiser {
@@ -99,6 +109,8 @@ impl AudioDepacketiser {
             counts: AudioCounts::default(),
             peaks: vec![0; usize::from(format.channels)],
             samples: Vec::new(),
+            first: None,
+            played: 0,
         })
     }
 
@@ -114,15 +126,16 @@ impl AudioDepacketiser {
         self.peaks.iter().map(|&p| (p > 0).then(|| 20.0 * (f64::from(p) / full).log10())).collect()
     }
 
-    /// Forgets where the stream was, for one that starts again.
+    /// Forgets where the stream was, for one that starts again. The run goes on.
     pub fn reset(&mut self) {
         self.next = None;
     }
 
-    /// Takes one RTP packet, with `missing` packets lost just before it, and calls
-    /// `play` with the samples it adds to the run: silence for the time of those
-    /// missing, then its own.
-    pub fn push(&mut self, packet: &[u8], missing: u64, mut play: impl FnMut(&[i32])) {
+    /// Takes one RTP packet that arrived at `at` nanoseconds, with `missing` packets lost
+    /// just before it, and calls `play` with the samples it adds to the run: silence for
+    /// the time of those missing or left out, then its own.
+    pub fn push(&mut self, at: i128, packet: &[u8], missing: u64, mut play: impl FnMut(&[i32])) {
+        let first = *self.first.get_or_insert(at);
         let Some(header) = rtp::read_header(packet) else {
             self.counts.malformed += 1;
             return;
@@ -155,7 +168,12 @@ impl AudioDepacketiser {
             };
             self.counts.missing += lost;
             self.counts.unsent += unsent;
-            self.silence(lost + unsent, &mut play);
+            // No more than keeps the run within ten seconds of the time since the first
+            // packet came.
+            let rate = u64::from(self.format.sample_rate);
+            let since = u64::try_from((at - first).max(0) * i128::from(rate) / NANOS).unwrap_or(u64::MAX);
+            let room = since.saturating_add(MOST_SILENCE * rate).saturating_sub(self.played);
+            self.silence(lost.saturating_add(unsent).min(MOST_SILENCE * rate).min(room), &mut play);
         }
         self.samples.clear();
         if self.format.bits == 16 {
@@ -170,15 +188,17 @@ impl AudioDepacketiser {
             *peak = (*peak).max(s.unsigned_abs());
         }
         play(&self.samples);
+        self.played += u64::from(count);
         self.counts.packets += 1;
         self.counts.samples += u64::from(count);
         self.next = Some(header.timestamp.wrapping_add(count));
     }
 
-    /// Plays `instants` of silence, up to [`MOST_SILENCE`] seconds of it.
+    /// Plays `instants` of silence.
     fn silence(&mut self, instants: u64, play: &mut impl FnMut(&[i32])) {
         let channels = usize::from(self.format.channels);
-        let mut left = instants.min(MOST_SILENCE * u64::from(self.format.sample_rate));
+        self.played += instants;
+        let mut left = instants;
         while left > 0 {
             let n = left.min(4096);
             self.samples.clear();
@@ -225,7 +245,7 @@ mod tests {
             let mut d = AudioDepacketiser::new(&format).unwrap();
             let mut out = Vec::new();
             for p in &packets {
-                d.push(p, 0, |s| out.extend_from_slice(s));
+                d.push(0, p, 0, |s| out.extend_from_slice(s));
             }
             assert_eq!(out, samples);
             assert_eq!(
@@ -244,7 +264,7 @@ mod tests {
         let mut d = AudioDepacketiser::new(&format).unwrap();
         let mut out = Vec::new();
         for (i, missing) in [(0, 0), (2, 1), (3, 0)] {
-            d.push(&packets[i], missing, |s| out.extend_from_slice(s));
+            d.push(i as i128 * 1_000_000, &packets[i], missing, |s| out.extend_from_slice(s));
         }
         let per = 96;
         assert_eq!(out.len(), 4 * per);
@@ -257,14 +277,31 @@ mod tests {
         let mut later = packets[4].clone();
         later[4..8].copy_from_slice(&(1000u32 + 4 * 48 + 96_000).to_be_bytes());
         out.clear();
-        d.push(&later, 2000, |s| out.extend_from_slice(s));
+        d.push(2_004_000_000, &later, 2000, |s| out.extend_from_slice(s));
         assert_eq!(out.len(), 96_000 * 2 + 96);
         // A minute of them: ten seconds of silence, and the minute counted.
         later[4..8].copy_from_slice(&(1000u32 + 5 * 48 + 96_000 + 2_880_000).to_be_bytes());
         out.clear();
-        d.push(&later, 60_000, |s| out.extend_from_slice(s));
+        d.push(62_005_000_000, &later, 60_000, |s| out.extend_from_slice(s));
         assert_eq!(out.len(), 480_000 * 2 + 96);
         assert_eq!((d.counts().missing, d.counts().jumps), (48 + 96_000 + 2_880_000, 0));
+    }
+
+    #[test]
+    fn timestamps_that_run_away_fill_no_more_than_the_time_that_passed() {
+        let format = AudioFormat::new(2);
+        let (_, packets) = packets(&format, 1, 0);
+        let mut d = AudioDepacketiser::new(&format).unwrap();
+        let mut played = 0;
+        // A packet a millisecond, each a second on from the one before by its timestamp.
+        for i in 0..100u32 {
+            let mut packet = packets[0].clone();
+            packet[4..8].copy_from_slice(&(i * 48_000).to_be_bytes());
+            d.push(i128::from(i) * 1_000_000, &packet, 0, |s| played += s.len() / 2);
+        }
+        // Ten seconds of the silence it asked for, and the time that passed.
+        assert_eq!(played, 480_000 + 99 * 48 + 48);
+        assert_eq!(d.counts().unsent, 99 * (48_000 - 48));
     }
 
     #[test]
@@ -277,10 +314,10 @@ mod tests {
             let mut packet = packet.to_vec();
             packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
             let mut out = 0;
-            d.push(&packet, missing, |s| out += s.len());
+            d.push(0, &packet, missing, |s| out += s.len());
             out
         }
-        d.push(&packets[0], 0, |_| {});
+        d.push(0, &packets[0], 0, |_| {});
         // The clock steps back a second, and no packet was lost: nothing to fill.
         let back = 1048u32.wrapping_sub(48_000);
         assert_eq!(at(&mut d, &packets[1], back, 0), 96);
@@ -296,7 +333,7 @@ mod tests {
         assert_eq!((c.packets, c.missing, c.unsent, c.jumps), (5, 96, 48_000, 2));
         // After a restart, the first packet follows nothing.
         d.reset();
-        d.push(&packets[0], 0, |s| assert_eq!(s.len(), 96));
+        d.push(0, &packets[0], 0, |s| assert_eq!(s.len(), 96));
         assert_eq!(d.counts().jumps, 2);
     }
 
@@ -309,17 +346,17 @@ mod tests {
         let samples: Vec<i32> = (0..96).map(|i| if i % 2 == 0 { -(1 << 22) } else { 0 }).collect();
         p.packet(&samples, 0, &mut packet);
         let mut d = AudioDepacketiser::new(&format).unwrap();
-        d.push(&packet, 0, |_| {});
+        d.push(0, &packet, 0, |_| {});
         let peaks = d.peaks();
         assert!((peaks[0].unwrap() + 6.0206).abs() < 1e-3, "{peaks:?}");
         assert_eq!(peaks[1], None);
-        d.push(&packet[..12 + 5], 0, |_| panic!("not whole instants"));
-        d.push(&packet[..12], 0, |_| panic!("empty"));
+        d.push(0, &packet[..12 + 5], 0, |_| panic!("not whole instants"));
+        d.push(0, &packet[..12], 0, |_| panic!("empty"));
         assert_eq!(d.counts().malformed, 2);
         // Half a packet time is odd, but played.
         let mut half = packet[..12 + 144].to_vec();
         half[4..8].copy_from_slice(&48u32.to_be_bytes());
-        d.push(&half, 0, |s| assert_eq!(s.len(), 48));
+        d.push(0, &half, 0, |s| assert_eq!(s.len(), 48));
         assert_eq!(d.counts().odd_sized, 1);
     }
 }

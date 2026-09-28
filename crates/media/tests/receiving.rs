@@ -193,6 +193,37 @@ fn a_restarted_sender_starts_again() {
 }
 
 #[test]
+fn a_source_that_comes_back_is_followed_again() {
+    let d = audio(1);
+    let mut first = Sender::new(&d, 1000, -18.0, 7, 0).unwrap();
+    let mut out = Keep::default();
+    first.run(&mut out, T, T + 100_000_000).unwrap();
+    // Another source for 100 ms, then the first again.
+    Sender::new(&d, 1000, -18.0, 8, 30_000).unwrap().run(&mut out, T + 100_000_000, T + 200_000_000).unwrap();
+    first.run(&mut out, T + 200_000_000, T + 1_200_000_000).unwrap();
+    let (r, sink) = receive(&d, arrivals(&out.0, &[20_000], |_, _| false));
+    assert_eq!(sink.samples, out.0.len() * 96);
+    assert_eq!((r.passed, r.lost, r.restarts, r.stale, r.ssrc), (out.0.len() as u64, 0, 2, 0, Some(7)));
+}
+
+#[test]
+fn a_capture_played_twice_restarts_on_the_same_numbers() {
+    let d = audio(2);
+    // A second of packets, then the same again, as a sender whose numbers start in the
+    // same place sends them when it restarts, or a capture played in a loop.
+    let mut packets = sent(&d, NANOS);
+    packets.extend(packets.clone().into_iter().map(|(p, at)| (p, at + NANOS)));
+    let (r, sink) = receive(&d, arrivals(&packets, &[20_000, 320_000], |_, _| false));
+    assert_eq!(sink.samples, packets.len() * 96);
+    assert_eq!((r.passed, r.lost, r.too_late, r.restarts), (packets.len() as u64, 0, 0, 1));
+    assert_eq!(
+        r.problems,
+        ["the stream restarted once: a new synchronisation source, or sequence numbers or timestamps that \
+             started again elsewhere"]
+    );
+}
+
+#[test]
 fn a_clock_that_steps_back_restarts_the_stream() {
     let d = video(1);
     let mut sender = Sender::new(&d, 1000, -18.0, 7, 0).unwrap();

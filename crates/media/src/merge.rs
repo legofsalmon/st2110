@@ -191,8 +191,8 @@ pub struct Merger {
     arrival: Vec<i64>,
     base: Option<i128>,
     regime: Option<Regime>,
-    /// The synchronisation source and highest sequence number before the last restart.
-    retired: Option<(u32, u32)>,
+    /// The synchronisation source before the last restart.
+    retired: Option<u32>,
     candidate: Option<Candidate>,
     /// The packets that came soonest after their timestamps, in the stretch of the pace
     /// before this one and in this one: their timestamps and when they came.
@@ -280,12 +280,9 @@ impl Merger {
                 return self.too_late(leg, sequence);
             }
         }
-        let stale = self.retired.is_some_and(|(retired, highest)| {
-            retired == ssrc
-                && (ssrc != regime.ssrc
-                    || sequence.wrapping_sub(highest).min(highest.wrapping_sub(sequence)) <= self.window)
-        });
-        if stale {
+        // The stream from before the last restart, on a leg that has brought nothing
+        // since: a leg that runs behind the others, still bringing it.
+        if self.retired == Some(ssrc) && self.legs[leg].highest.is_none() {
             self.stale += 1;
             return Verdict::Stale;
         }
@@ -518,12 +515,20 @@ impl Merger {
                     self.take(leg, sequence, timestamp, time);
                     return Verdict::Resumed;
                 }
-                for (l, arrival) in candidate.arrivals.iter().enumerate() {
-                    if arrival.is_some() {
-                        self.too_late(l, candidate.sequence);
+                // Further behind than the window: a leg that runs that far behind the
+                // others, unless a leg it came on has gone back over its own numbers,
+                // when the stream started again on the same ones.
+                let back = |l: usize| {
+                    self.legs[l].highest.is_some_and(|highest| (highest.wrapping_sub(candidate.sequence) as i32) >= 0)
+                };
+                if !(back(leg) || (0..self.legs.len()).any(|l| candidate.arrivals[l].is_some() && back(l))) {
+                    for (l, arrival) in candidate.arrivals.iter().enumerate() {
+                        if arrival.is_some() {
+                            self.too_late(l, candidate.sequence);
+                        }
                     }
+                    return self.too_late(leg, sequence);
                 }
-                return self.too_late(leg, sequence);
             }
             if self.paused(&candidate, &regime, ahead, ticks) {
                 // The pace is measured afresh from here, not across the pause.
@@ -534,7 +539,7 @@ impl Merger {
             }
         }
         self.lost += self.open_losses();
-        self.retired = Some((regime.ssrc, regime.highest));
+        self.retired = Some(regime.ssrc);
         self.restarts += 1;
         self.seen.fill(0);
         for l in &mut self.legs {
@@ -633,7 +638,7 @@ pub struct PlayoutCounts {
     /// Packets given up on: still missing when the packets after them had waited as
     /// long as allowed, or when receiving stopped.
     pub skipped: u64,
-    /// Packets that came after they had been given up on.
+    /// Packets that came after they had been given up on, or let go.
     pub too_late: u64,
     /// Packets older than the first one let go, left out.
     pub before_start: u64,
@@ -706,6 +711,11 @@ impl Playout {
             return Placed::TooLate;
         }
         let key = next + ahead as u64;
+        if key - next > self.capacity {
+            // No room to hold it: give up on the oldest gaps, which may let it go too.
+            self.skip_to(key - self.capacity, &mut out);
+        }
+        let next = self.next.expect("started");
         let placed = if key == next {
             out(Released { sequence, data, at, missing: std::mem::take(&mut self.missing) });
             self.counts.released += 1;
@@ -715,10 +725,11 @@ impl Playout {
             }
             self.drain(&mut out);
             Placed::Released
+        } else if key < next {
+            // A copy of one held, let go on the way.
+            self.counts.too_late += 1;
+            return Placed::TooLate;
         } else {
-            if key - next > self.capacity {
-                self.skip_to(key - self.capacity, &mut out);
-            }
             if !self.held.contains_key(&key) {
                 let mut buffer = self.spare.pop().unwrap_or_default();
                 buffer.clear();
@@ -790,7 +801,8 @@ impl Playout {
 
     /// Gives up on the gaps before packets that have waited longer than the hold.
     fn expire(&mut self, now: i128, out: &mut impl FnMut(Released<'_>)) {
-        loop {
+        // Every packet held is after the next to go, so each round lets go at least one.
+        for _ in 0..=self.held.len() {
             let Some(next) = self.next else { return };
             while self.order.front().is_some_and(|&(_, key)| key < next) {
                 self.order.pop_front();
@@ -800,6 +812,7 @@ impl Playout {
                 return;
             }
             let Some((&first, _)) = self.held.first_key_value() else { return };
+            debug_assert!(first > next, "held {first} at or before the next to go, {next}");
             self.skip_to(first, out);
         }
     }
@@ -908,11 +921,11 @@ mod tests {
         }
         // A new source whose sequence numbers and timestamps start elsewhere.
         assert_eq!(m.push(0, 2, 40_000, 7, 0), Verdict::Held);
-        assert_eq!(m.push(1, 2, 40_000, 7, 0), Verdict::Copy);
         assert_eq!(m.push(0, 2, 40_001, 55, 0), Verdict::Restart);
         assert_eq!(m.ssrc(), Some(2));
-        // Leg 2, behind, still brings the old source's packets.
+        // Leg 2, behind, still brings the old source's packets, then the new source's.
         assert_eq!(push(&mut m, 1, 10, 0), Verdict::Stale);
+        assert_eq!(m.push(1, 2, 40_000, 7, 0), Verdict::Copy);
         assert_eq!(m.push(1, 2, 40_001, 55, 0), Verdict::Copy);
         let c = m.counts();
         assert_eq!((c.passed, c.lost, c.restarts, c.stale, c.strays), (12, 0, 1, 1, 0));
@@ -921,6 +934,47 @@ mod tests {
         assert_eq!(m.push(0, 2, 8, 1_000_048, 0), Verdict::Restart);
         assert_eq!(m.push(1, 2, 40_002, 103, 0), Verdict::Stale);
         assert_eq!(m.counts().restarts, 2);
+    }
+
+    #[test]
+    fn a_source_that_comes_back_is_followed_again() {
+        let mut m = merger(1, 16);
+        for seq in 0..10 {
+            push(&mut m, 0, seq, 0);
+        }
+        assert_eq!(m.push(0, 2, 40_000, 7, 0), Verdict::Held);
+        assert_eq!(m.push(0, 2, 40_001, 55, 0), Verdict::Restart);
+        // The first source again, on the leg that has brought the second since.
+        assert_eq!(push(&mut m, 0, 10, 0), Verdict::Held);
+        assert_eq!(push(&mut m, 0, 11, 0), Verdict::Restart);
+        assert_eq!(m.ssrc(), Some(1));
+        let c = m.counts();
+        assert_eq!((c.passed, c.restarts, c.stale, c.strays), (14, 2, 0, 0));
+    }
+
+    #[test]
+    fn a_sender_that_starts_again_on_the_same_numbers_restarts() {
+        // Forty packets 1 ms apart, then the same forty again, as a sender whose numbers
+        // start in the same place sends them when it restarts, or a capture played in a
+        // loop: on one leg, and on two 300 µs and 10 ms apart.
+        for (legs, lag, stale) in [(1, 0, 0), (2, 300_000, 0), (2, 10_000_000, 9)] {
+            let mut arrivals = Vec::new();
+            for run in 0..2 {
+                for seq in 0..40u32 {
+                    for leg in 0..legs {
+                        arrivals.push(((40 * run + i128::from(seq)) * 1_000_000 + leg as i128 * lag, leg, seq));
+                    }
+                }
+            }
+            arrivals.sort_unstable();
+            let mut m = merger(legs, 16);
+            for (at, leg, seq) in arrivals {
+                push(&mut m, leg, seq, at);
+            }
+            let c = m.counts();
+            // Leg 2's last packets of the first run, 10 ms behind, come after the restart.
+            assert_eq!((c.passed, c.lost, c.restarts, c.too_late, c.stale, c.strays), (80, 0, 1, 0, stale, 0));
+        }
     }
 
     #[test]
@@ -1022,6 +1076,62 @@ mod tests {
         assert_eq!(out, [(1, 0, 0), (3, 1, 100), (4, 0, 1000), (5, 0, 1101), (6, 0, 1300)]);
         let c = p.counts();
         assert_eq!((c.skipped, c.too_late, c.before_start), (1, 1, 0));
+    }
+
+    #[test]
+    fn playout_full_behind_a_gap_gives_it_up() {
+        let mut p = Playout::new(1000, 4);
+        // No room for 6 while 1 is missing: 1 is given up, and 2 to 6 go.
+        let out = release_all(&mut p, &[(0, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 5000)]);
+        assert_eq!(out, [(0, 0, 0), (2, 1, 0), (3, 0, 0), (4, 0, 0), (5, 0, 0), (6, 0, 0), (7, 0, 5000)]);
+        assert_eq!(p.counts(), PlayoutCounts { released: 7, held: 4, skipped: 1, ..PlayoutCounts::default() });
+    }
+
+    /// xorshift64*, so a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        }
+    }
+
+    #[test]
+    fn playout_lets_each_packet_go_once_in_order() {
+        let mut rng = Rng(0x5EED_2110);
+        for round in 0..2000 {
+            let hold = [0, 10, 1000][rng.below(3) as usize];
+            let mut p = Playout::new(hold, [1, 4, 16][rng.below(3) as usize]);
+            let first = rng.below(1 << 32) as u32;
+            let (mut at, mut ahead) = (0i128, 0i64);
+            let mut out = Vec::new();
+            for _ in 0..rng.below(80) + 1 {
+                // Mostly in order, sometimes back a few or on past a gap; arrival times
+                // mostly on, sometimes back a little or on past the hold.
+                ahead += match rng.below(10) {
+                    0 => -(rng.below(6) as i64),
+                    1 => rng.below(40) as i64,
+                    _ => 1,
+                };
+                at += match rng.below(6) {
+                    0 => 0,
+                    1 => 2000,
+                    2 => -3,
+                    _ => i128::from(rng.below(20)),
+                };
+                let sequence = first.wrapping_add(ahead as u32);
+                p.push(sequence, at, &sequence.to_be_bytes(), |r| {
+                    assert_eq!(r.data, r.sequence.to_be_bytes());
+                    out.push(r.sequence.wrapping_sub(first) as i32);
+                });
+            }
+            p.finish(|r| out.push(r.sequence.wrapping_sub(first) as i32));
+            assert!(out.windows(2).all(|w| w[0] < w[1]), "round {round}: {out:?}");
+            assert_eq!(p.counts().released, out.len() as u64, "round {round}");
+        }
     }
 
     #[test]

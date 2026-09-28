@@ -519,8 +519,9 @@ impl Session {
             }
             if rtp.too_late > 0 {
                 problems.push(format!(
-                    "{name} ran more than {} behind the other: {} came too late to merge",
+                    "{name} ran more than {} behind the {}: {} came too late to merge",
                     count(u64::from(self.merger.window()), "packet"),
+                    if r.legs.len() > 2 { "others" } else { "other" },
                     count(rtp.too_late, "packet")
                 ));
             }
@@ -660,7 +661,7 @@ fn release(
             if let Some(header) = rtp::read_header(packet.data) {
                 latency.add(since_timestamp(header.timestamp, packet.at, clock_rate) / 1000.0);
             }
-            depacketiser.push(packet.data, packet.missing, |samples| sink.samples(samples));
+            depacketiser.push(packet.at, packet.data, packet.missing, |samples| sink.samples(samples));
         }
     }
 }
