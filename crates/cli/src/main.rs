@@ -8,6 +8,8 @@ mod pcap;
 mod ptp;
 mod stream;
 mod timing;
+#[cfg(feature = "view")]
+mod view;
 
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -289,6 +291,15 @@ enum Command {
     /// when the stream arrived whole, 1 when packets were lost after merging, frames
     /// were incomplete or nothing arrived, and 2 when the stream cannot be received.
     Receive(stream::ReceiveArgs),
+    /// Show an ST 2110-20 video stream in a window as it arrives.
+    ///
+    /// Receives the stream as `st2110 receive` does, from its SDP file, and shows each
+    /// frame as it arrives, with the frames before it where its packets are missing,
+    /// and the title counts those. With --pcap, plays a capture instead, at the pace it
+    /// was captured. Escape or Q closes the window, and the report of what arrived
+    /// follows. Exits as `st2110 receive` does.
+    #[cfg(feature = "view")]
+    View(view::ViewArgs),
     /// List the rules, or show the ones named.
     Rules {
         /// Rule identifiers, such as mediaclk-offset; every rule when none is given.
@@ -394,6 +405,8 @@ fn main() -> ExitCode {
         }
         Command::Send { signal } => stream::send(&signal),
         Command::Receive(args) => stream::receive(&args),
+        #[cfg(feature = "view")]
+        Command::View(args) => view::view(&args),
         Command::Rules { ids, format } => list_rules(&ids, format),
     };
     match result {

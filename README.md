@@ -19,7 +19,7 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
   video or tone as ST 2110-30 audio, paced by ST 2110-21 and lined up with the SMPTE
   Epoch, on one leg or an ST 2022-7 pair, and receive a stream from its SDP file,
   merging the legs, putting the packets back in order and the frames and samples back
-  together, and reporting what arrived.
+  together, and reporting what arrived, or showing the video in a window as it arrives.
 
 Every finding cites the clause behind it.
 
@@ -31,7 +31,7 @@ Every finding cites the clause behind it.
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send` and `st2110 receive`. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -252,6 +252,31 @@ bars.sdp: arrived whole
 - `receive` exits with 0 when the stream arrived whole, 1 when something was lost or incomplete, and 2 when it cannot receive. `send` exits with 0 when it has sent, and 2 when it cannot.
 
 Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. The receiver times each datagram by the kernel's receive timestamp on Linux and macOS, and by when it reads it elsewhere. It needs a large socket buffer for video: raise `net.core.rmem_max` on Linux (`sysctl -w net.core.rmem_max=67108864`) or `kern.ipc.maxsockbuf` on macOS; `receive` says when the system allows less than 4 MiB.
+
+## Watch a stream
+
+`st2110 view` shows an ST 2110-20 video stream in a window as it arrives. A Mac with no network at all can play a capture, 600 MB of it here:
+
+```console
+$ st2110 send video 720p50 --to 239.10.1.1:5004 --clock traceable --duration 5 --sdp bars.sdp --pcap bars.pcap
+st2110: sent 250 frames of 1280x720p50 YCbCr-4:2:2 10-bit (540000 packets) on 1 leg into bars.pcap
+$ st2110 view bars.sdp --pcap bars.pcap
+```
+
+To watch vizz on the same Mac, run it from its checkout, sending to the Mac itself to keep the stream off the network, and view the SDP file it writes:
+
+```console
+$ cargo run --release -- --st2110 127.0.0.1:5004 --st2110-rate 50 --width 1280 --height 720 --st2110-sdp vizz.sdp
+$ st2110 view vizz.sdp
+```
+
+- It receives the stream as `st2110 receive` does, from its SDP file, with the same `--interface`, `--max-skew` and `--tai-utc`, and shows each frame as it arrives. Where a frame's packets are missing, the frames before it show through, as a receiver hides a loss, and where none has filled the gap yet, the all-zero codes show, which are dark green in YCbCr.
+- The title names the stream and counts the frames, the incomplete ones and the packets missing from them, and says when nothing has arrived for a second or more.
+- `--pcap FILE` plays a capture instead of receiving, at the pace it was captured, and the window keeps the last frame when it ends.
+- Escape or Q closes the window. The report `st2110 receive` gives follows, with its exit codes.
+- Colours are worked out with the stream's luma coefficients and range, and shown as the screen's own: HDR (PQ or HLG) is not tone-mapped, and BT.2020 colours are not converted to the screen's.
+- A frame is unpacked in bands of rows across the machine's cores, about 9 ms of work for 1080p on one 2.8 GHz Xeon core, and a screen that falls behind skips frames rather than delaying them. The sockets are the limit, as for `receive`, and need the same large buffer.
+- The window is [minifb](https://github.com/emoon/rust_minifb)'s. Building with `--no-default-features` leaves out `view`, and minifb with it.
 
 ## What it checks
 

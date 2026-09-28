@@ -12,6 +12,11 @@ publish.workspace = true
 name = "st2110"
 path = "src/main.rs"
 
+[features]
+default = ["view"]
+# `st2110 view`: a window that shows a video stream as it arrives.
+view = ["dep:minifb"]
+
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
 st2110-nmos = { workspace = true, features = ["client"] }
@@ -22,6 +27,7 @@ st2110-media = { workspace = true, features = ["net", "serde"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+minifb = { version = "0.28", optional = true }
 
 [lints]
 workspace = true

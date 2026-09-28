@@ -916,6 +916,29 @@ fn sends_and_receives_over_the_loopback_interface() {
     assert_eq!(json["problems"], serde_json::json!([]));
 }
 
+#[cfg(feature = "view")]
+#[test]
+fn view_refuses_what_it_cannot_show_before_opening_a_window() {
+    let dir = Scratch::new("view");
+    let (audio, video) = (dir.path("a.sdp"), dir.path("v.sdp"));
+    for (signal, sdp) in [("audio", &audio), ("video", &video)] {
+        let args = ["send", signal, "--to", "239.10.3.1:5004", "--clock", "traceable", "--duration", "0.1"];
+        let pcap = dir.path("x.pcap");
+        let output = st2110(&[&args[..], &["--sdp", sdp, "--pcap", &pcap]].concat());
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    }
+    for (args, message) in [
+        (vec!["view", &audio], "describes audio, and view shows video"),
+        (vec!["view", &video, "--pcap", "no-such-capture.pcap"], "no-such-capture.pcap: "),
+        (vec!["view", &video, "--max-skew", "2000"], "--max-skew 2000 is not 0 to 1000 ms"),
+        (vec!["view", "no-such-file.sdp"], "st2110: no-such-file.sdp: "),
+    ] {
+        let output = st2110(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains(message), "{args:?}: {}", stderr(&output));
+    }
+}
+
 #[test]
 fn send_and_receive_refuse_what_they_cannot_do() {
     let refused = |args: &[&str], message: &str| {

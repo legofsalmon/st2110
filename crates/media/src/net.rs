@@ -329,15 +329,39 @@ pub fn receive(
     tai_utc: i32,
     sink: &mut impl Sink,
 ) -> io::Result<()> {
-    let stop = Arc::new(AtomicBool::new(false));
+    run(session, sockets, until, &AtomicBool::new(false), tai_utc, sink)
+}
+
+/// Receives as [`receive`] does until another thread sets `stop`, such as one that
+/// shows the pictures, rather than until a time.
+pub fn receive_until_stopped(
+    session: &mut Session,
+    sockets: Vec<UdpSocket>,
+    stop: &AtomicBool,
+    tai_utc: i32,
+    sink: &mut impl Sink,
+) -> io::Result<()> {
+    run(session, sockets, i128::MAX, stop, tai_utc, sink)
+}
+
+/// Receives until `until` or until `stop` is set, whichever comes first.
+fn run(
+    session: &mut Session,
+    sockets: Vec<UdpSocket>,
+    until: i128,
+    stop: &AtomicBool,
+    tai_utc: i32,
+    sink: &mut impl Sink,
+) -> io::Result<()> {
+    let halt = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel::<Arrival>(1 << 16);
     let mut threads = Vec::new();
     for (leg, socket) in sockets.into_iter().enumerate() {
-        let (tx, stop) = (tx.clone(), Arc::clone(&stop));
+        let (tx, halt) = (tx.clone(), Arc::clone(&halt));
         threads.push(thread::spawn(move || -> io::Result<()> {
             let mut buffer = vec![0u8; 65_536];
             let mut reader = Reader::new(socket);
-            while !stop.load(Ordering::Relaxed) {
+            while !halt.load(Ordering::Relaxed) {
                 match reader.read(&mut buffer, tai_utc) {
                     Ok((n, Some(from), at)) => {
                         let arrival = Arrival { leg, source: *from.ip(), at, data: buffer[..n].to_vec() };
@@ -360,7 +384,7 @@ pub fn receive(
     drop(tx);
     loop {
         let left = until - tai_now(tai_utc);
-        if left <= 0 {
+        if left <= 0 || stop.load(Ordering::Relaxed) {
             break;
         }
         match rx.recv_timeout(Duration::from_nanos(left.min(50_000_000) as u64)) {
@@ -370,10 +394,12 @@ pub fn receive(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    stop.store(true, Ordering::Relaxed);
+    // Receiving ends at `until`, or sooner when it stopped.
+    let end = until.min(tai_now(tai_utc));
+    halt.store(true, Ordering::Relaxed);
     // What arrived before the end and is still queued.
     while let Ok(a) = rx.try_recv() {
-        if a.at < until {
+        if a.at < end {
             session.push(a.leg, a.source, a.at, &a.data, sink);
         }
     }
@@ -384,6 +410,58 @@ pub fn receive(
             result = ended;
         }
     }
-    session.finish(until, sink);
+    session.finish(end, sink);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::describe::{Clock, Description, Media};
+    use crate::format::AudioFormat;
+    use crate::send::Sender;
+
+    /// Sends each packet as soon as it is made, to one address.
+    struct Now(UdpSocket, SocketAddr);
+
+    impl Output for Now {
+        fn send(&mut self, packet: &[u8], _: i128) -> io::Result<()> {
+            self.0.send_to(packet, self.1).map(|_| ())
+        }
+    }
+
+    #[test]
+    fn receives_until_another_thread_stops_it() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let SocketAddr::V4(destination) = socket.local_addr().unwrap() else { unreachable!("IPv4") };
+        let stream = Description {
+            name: "Tone".into(),
+            media: Media::Audio(AudioFormat::new(2)),
+            payload_type: 97,
+            legs: vec![Leg { destination, source: None }],
+            clock: Some(Clock::Traceable),
+            ttl: 32,
+        };
+        socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut session = Session::new(&stream).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut out = Now(UdpSocket::bind("127.0.0.1:0").unwrap(), destination.into());
+                // 50 ms of tone, sent at once, and then the stop.
+                let start = tai_now(TAI_UTC_2017);
+                let mut sender = Sender::new(&stream, 1000, -18.0, 0x1234, 0).unwrap();
+                sender.run(&mut out, start, start + 50_000_000).unwrap();
+                thread::sleep(Duration::from_millis(200));
+                stop.store(true, Ordering::Relaxed);
+            });
+            receive_until_stopped(&mut session, vec![socket], &stop, TAI_UTC_2017, &mut ()).unwrap();
+        });
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let report = session.report();
+        assert_eq!((report.passed, report.lost), (50, 0), "{report:?}");
+    }
 }
