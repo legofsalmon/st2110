@@ -421,6 +421,8 @@ println!("{:?}", session.report().problems);
 
 `Sender` sends to any `send::Output`, and `receive::Session` takes datagrams from anywhere, so without the `net` feature the crate works on captures and in tests. `video::Packetiser` and `video::Depacketiser`, `audio::AudioPacketiser` and `audio::AudioDepacketiser`, `merge::Merger` and `merge::Playout` work on their own too.
 
+To send pictures of your own, such as a renderer's, give `send::VideoSender` a `send::FrameSource`. It asks for each frame just before the frame's packets are due, and leaves out any frame whose time passed while it was behind, without asking for it. `pixels::Converter::pack_frame` packs 8-bit pictures into pixel groups, with their octets in RGB or BGRA order and their rows padded as GPUs read them back: a 1080-line frame takes under 10 ms on one 2.1 GHz Xeon core.
+
 To make connections, read the registry without the SDP files, which are fetched as they are needed, and give the controller the routes (the `client` feature):
 
 ```rust

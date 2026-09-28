@@ -4,9 +4,10 @@
 //! - [`format`] describes the picture or sound, and [`describe`] the stream: its SDP
 //!   file, written for a sender and read for a receiver.
 //! - [`video`] and [`audio`] cut frames and samples into RTP packets and put them back
-//!   together; [`pixels`] packs 8-bit R'G'B' pictures into ST 2110-20 pixel groups.
-//! - [`send`] sends colour bars or a tone, each packet at its ST 2110-21 time, lined up
-//!   with the SMPTE Epoch; [`pattern`] draws them.
+//!   together; [`pixels`] packs 8-bit R'G'B' pictures into ST 2110-20 pixel groups, in
+//!   RGB or BGRA order, and unpacks them.
+//! - [`send`] sends colour bars or a tone, or frames from elsewhere, each packet at its
+//!   ST 2110-21 time, lined up with the SMPTE Epoch; [`pattern`] draws the bars.
 //! - [`merge`] merges the legs of an ST 2022-7 pair and measures how far apart they are;
 //!   [`receive`] follows a stream through it and reports what it finds.
 //! - [`files`] writes PNG pictures, WAV files and pcap captures.
