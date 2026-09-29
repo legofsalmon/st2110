@@ -1,0 +1,169 @@
+name: Release
+
+# Cuts a release with ST 2110 Viewer for macOS attached: Actions, Release, Run workflow,
+# with the tag to release (v0.1.0). The tag is made at the branch or commit given when
+# it does not exist yet, so a release never depends on pushing a tag first. Run on an
+# existing release, it builds the app again and replaces the one attached.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release's tag, such as v0.1.0. Made if it does not exist."
+        required: true
+      ref:
+        description: "The branch or commit to tag, when making the tag."
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  viewer-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Every tag, to find the one to build.
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Find or make the tag
+        run: |
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            # Build what the tag points at, whatever the run started from.
+            echo "The tag $RELEASE_TAG exists: building from it."
+            git checkout --detach "refs/tags/$RELEASE_TAG"
+          else
+            echo "No tag $RELEASE_TAG: making it at $(git rev-parse --short HEAD)."
+            # Runners have no git identity, and an annotated tag needs one.
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" -m "st2110 $RELEASE_TAG"
+            # A tag pushed with the workflow's own token starts no other run.
+            git push origin "$RELEASE_TAG"
+          fi
+          # The download carries its version, taken from the tag so that it matches the
+          # release it hangs on; the smoke test checks the app inside says the same.
+          echo "ASSET=st2110-viewer-${RELEASE_TAG#v}.app.zip" >> "$GITHUB_ENV"
+      - name: See whether there is a Developer ID
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+        run: |
+          if [ -n "$CERT_P12" ]; then
+            echo "HAVE_CERT=true" >> "$GITHUB_ENV"
+            echo "A Developer ID is set: the app will be signed and notarized."
+          else
+            echo "HAVE_CERT=false" >> "$GITHUB_ENV"
+            echo "::warning::No APPLE_CERT_P12 secret: the app is signed ad hoc, and its first launch needs Open Anyway."
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # The Developer ID goes into a keychain made for this job, with a random password,
+      # and gone with the runner. Skipped without the secret.
+      - name: Import the signing certificate
+        if: ${{ env.HAVE_CERT == 'true' }}
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign waits on a prompt no one can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+      - name: Build the app, for Apple silicon and Intel
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.HAVE_CERT == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+        run: |
+          scripts/make-viewer-app.sh --universal
+          # The script names the zip from Cargo.toml and the release from its tag, which
+          # differ for a prerelease such as v0.2.0-rc1: the release's name wins.
+          built=(dist/st2110-viewer-*.app.zip)
+          [ -f "${built[0]}" ] || { echo "::error::make-viewer-app.sh made no zip"; exit 1; }
+          [ "${built[0]}" = "dist/$ASSET" ] || mv "${built[0]}" "dist/$ASSET"
+      # Notarized and stapled, so that the first launch needs no word from Apple over a
+      # network, which a venue may not have.
+      - name: Notarize and staple
+        if: ${{ env.HAVE_CERT == 'true' }}
+        env:
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          echo "$API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/key.p8"
+          ditto -c -k --keepParent "dist/ST 2110 Viewer.app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/key.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/key.p8"
+          xcrun stapler staple "dist/ST 2110 Viewer.app"
+          # codesign says the signature is well formed; spctl asks what Gatekeeper will.
+          xcrun stapler validate "dist/ST 2110 Viewer.app"
+          spctl -a -vvv -t install "dist/ST 2110 Viewer.app"
+          # The stapled app, zipped again for the download.
+          rm -f dist/*.app.zip
+          ditto -c -k --keepParent "dist/ST 2110 Viewer.app" "dist/$ASSET"
+      # The app that ships, run: its version matches the tag, and it plays a capture in
+      # its window with every frame whole.
+      - name: Play a capture in the app
+        timeout-minutes: 15
+        run: |
+          BIN="dist/ST 2110 Viewer.app/Contents/MacOS/st2110-viewer"
+          want="${RELEASE_TAG#v}"; want="${want%%-*}"
+          got=$("$BIN" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ "$got" != "$want" ]; then
+            echo "::error::the app says it is $got, and the tag is $RELEASE_TAG"
+            exit 1
+          fi
+          lipo -archs "$BIN"
+          cargo build --release --locked -p st2110-cli
+          target/release/st2110 send video 1280x720p25 --to 239.1.1.1:5004 --clock traceable --duration 3 \
+            --sdp bars.sdp --pcap bars.pcap
+          "$BIN" bars.sdp --pcap bars.pcap --exit-after-frames 50 --screenshot viewer.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: st2110-viewer-release
+          path: viewer.png
+          if-no-files-found: ignore
+      - name: Attach the app to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$HAVE_CERT" = "true" ]; then
+            notes="ST 2110 Viewer for macOS 11 or later, on Apple silicon and Intel. Signed with a Developer ID and notarized by Apple, so it opens with a double-click: unzip it and move it to Applications."
+          else
+            notes="ST 2110 Viewer for macOS 11 or later, on Apple silicon and Intel. It is not signed with a Developer ID, so macOS refuses it the first time: unzip it, move it to Applications, open it, then choose Open Anyway in System Settings, Privacy & Security."
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "The release $RELEASE_TAG exists: replacing its app."
+            # Its notes are left as they are, for they may have been written by hand.
+            gh release upload "$RELEASE_TAG" "dist/$ASSET" --clobber
+          else
+            echo "Making the release $RELEASE_TAG with the app."
+            body="$RUNNER_TEMP/notes.md"
+            printf '%s\n' "$notes" > "$body"
+            # Notes written for the release, if any, after the line about the app.
+            written="docs/release-notes/$RELEASE_TAG.md"
+            if [ -f "$written" ]; then
+              printf '\n' >> "$body"
+              cat "$written" >> "$body"
+            fi
+            gh release create "$RELEASE_TAG" "dist/$ASSET" --title "st2110 $RELEASE_TAG" \
+              --generate-notes --notes-file "$body"
+          fi
+          gh release view "$RELEASE_TAG" --json assets | grep -q "$ASSET" \
+            || { echo "::error::$ASSET is missing from the release $RELEASE_TAG"; exit 1; }
+          echo "$ASSET is attached to the release $RELEASE_TAG."

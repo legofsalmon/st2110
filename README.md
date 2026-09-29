@@ -19,7 +19,8 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
   video or tone as ST 2110-30 audio, paced by ST 2110-21 and lined up with the SMPTE
   Epoch, on one leg or an ST 2022-7 pair, and receive a stream from its SDP file,
   merging the legs, putting the packets back in order and the frames and samples back
-  together, and reporting what arrived, or showing the video in a window as it arrives.
+  together, and reporting what arrived, or showing the video in a window as it arrives,
+  from the command line or in ST 2110 Viewer, an app for the Mac.
 
 Every finding cites the clause behind it.
 
@@ -32,6 +33,7 @@ Every finding cites the clause behind it.
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
 | [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
+| [`crates/viewer`](crates/viewer) (`st2110-viewer`) | ST 2110 Viewer, a desktop app that plays a stream from the network or a capture with what has arrived beside it. Built with egui, and needs Rust 1.95; the rest builds with 1.88. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -277,6 +279,47 @@ $ st2110 view vizz.sdp
 - Colours are worked out with the stream's luma coefficients and range, and shown as the screen's own: HDR (PQ or HLG) is not tone-mapped, and BT.2020 colours are not converted to the screen's.
 - A frame is unpacked in bands of rows across the machine's cores, about 9 ms of work for 1080p on one 2.8 GHz Xeon core, and a screen that falls behind skips frames rather than delaying them. The sockets are the limit, as for `receive`, and need the same large buffer.
 - The window is [minifb](https://github.com/emoon/rust_minifb)'s. Building with `--no-default-features` leaves out `view`, and minifb with it.
+
+## ST 2110 Viewer
+
+ST 2110 Viewer is an app for the Mac that plays an ST 2110-20 video stream as it arrives, from the network or from a capture, with what has arrived beside the picture. It receives as `st2110 view` does and counts what `st2110 receive` counts, and it keeps going: open another SDP file, change the port, stop and start.
+
+- **Open a stream.** Open its SDP file with the button or ⌘O, pick one from Recent, or drop it on the window. Receiving starts at once.
+- **Say where it comes from.** Network receives on the port picked beside it, which the app remembers; Any port lets the system route the stream's addresses. Capture plays a pcap or pcapng file at the pace it was captured, with the open SDP file saying what to look for. Drop an SDP file and a capture together to play them.
+- **Watch it.** The picture fills the window at the stream's shape. Double-click it for full screen, and Escape to leave. When frames stop coming, the picture keeps the last one and says how long it has been.
+- **Read what arrived.** Beside the picture: frames and the incomplete ones, the frame rate, packets and what was lost or came too late, each leg of an ST 2022-7 pair, how far apart the legs arrived and the tightest receiver class that allows it, the latency from RTP timestamps, and for audio the loudest sample on each channel. Problems and notes are the ones `st2110 receive` reports, as they come. The line along the bottom says what receiving is doing.
+
+The first time it receives from the network, macOS 15 asks whether ST 2110 Viewer may find and connect to devices on the local network. Allow it, or nothing arrives; System Settings, Privacy & Security, Local Network changes the answer later.
+
+### Get it
+
+Each [release](https://github.com/legofsalmon/st2110/releases) has the app for macOS 11 or later, on Apple silicon and Intel, as `st2110-viewer-<version>.app.zip`. Unzip it and move ST 2110 Viewer to Applications. A release signed with a Developer ID and notarized opens with a double-click, and its notes say so; one that is not needs Open Anyway in System Settings, Privacy & Security, the first time.
+
+To build it yourself on a Mac:
+
+```console
+$ scripts/make-viewer-app.sh              # for this Mac's processor
+$ scripts/make-viewer-app.sh --universal  # for Apple silicon and Intel both
+```
+
+That leaves `dist/ST 2110 Viewer.app` and a zip of it, signed with the Developer ID in `APPLE_SIGNING_IDENTITY` when there is one, and ad hoc otherwise. On Linux, `cargo run --release -p st2110-viewer` runs the app itself, which takes an SDP file and `--pcap FILE` on its command line too.
+
+### Releases
+
+The **Release** workflow cuts one: Actions, Release, Run workflow, with the tag to release, such as `v0.1.0`, which it makes at the branch given. It builds the app for both processors, plays a capture in it and checks its version against the tag, then attaches the zip to the release. With these repository secrets, the same ones vizz uses, it signs the app with the Developer ID and has Apple notarize it first:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERT_P12` | The Developer ID Application certificate and its key, exported as a .p12 file, in base64 |
+| `APPLE_CERT_PASSWORD` | The .p12 file's password |
+| `APPLE_SIGNING_IDENTITY` | The certificate's name, such as `Developer ID Application: Name (TEAMID)` |
+| `APPLE_API_KEY_P8` | An App Store Connect API key for notarizing, the .p8 file, in base64 |
+| `APPLE_API_KEY_ID` | That key's ID |
+| `APPLE_API_ISSUER_ID` | Its issuer ID |
+
+`--exit-after-frames N` closes the app once N frames have arrived, and exits with 0 when they arrived whole, and `--screenshot FILE` saves a picture of the window first. CI runs the app that way on a Mac for every change, and keeps the app and the picture as the run's artifacts.
+
+The app carries the licences of the crates compiled into it, in [crates/viewer/THIRD_PARTY_NOTICES.md](crates/viewer/THIRD_PARTY_NOTICES.md). After changing its dependencies, write that again with `python3 scripts/third-party-notices.py`; CI fails when it is out of date.
 
 ## What it checks
 

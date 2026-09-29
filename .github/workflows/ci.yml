@@ -36,6 +36,34 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # ST 2110 Viewer as it ships: the app bundle, playing a capture in its window on a Mac,
+  # with a picture of the window to look at.
+  viewer-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Third-party notices are current
+        run: python3 scripts/third-party-notices.py --check
+      - run: scripts/make-viewer-app.sh
+      - name: Play a capture in the app
+        timeout-minutes: 10
+        run: |
+          cargo build --release --locked -p st2110-cli
+          target/release/st2110 send video 1280x720p25 --to 239.1.1.1:5004 --clock traceable --duration 3 \
+            --sdp bars.sdp --pcap bars.pcap
+          "dist/ST 2110 Viewer.app/Contents/MacOS/st2110-viewer" bars.sdp --pcap bars.pcap \
+            --exit-after-frames 50 --screenshot viewer.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: st2110-viewer-macos
+          path: |
+            dist/*.app.zip
+            viewer.png
+          if-no-files-found: ignore
+
   wasm:
     runs-on: ubuntu-latest
     steps:
