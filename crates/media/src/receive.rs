@@ -19,6 +19,10 @@ pub const DEFAULT_MAX_SKEW_NS: i64 = 50_000_000;
 /// The longest a receiver will wait: a second, more than class C's 450 ms.
 pub const MOST_SKEW_NS: i64 = 1_000_000_000;
 
+/// How often receiving reports what has arrived so far: every half second of the
+/// stream.
+pub(crate) const PROGRESS_NS: i128 = 500_000_000;
+
 /// Where received pictures and sound go.
 pub trait Sink {
     /// A video frame, whole or with packets missing, and its pixel groups.
@@ -29,6 +33,12 @@ pub trait Sink {
     /// Audio samples, interleaved, in order, with silence where packets are missing.
     fn samples(&mut self, samples: &[i32]) {
         let _ = samples;
+    }
+
+    /// What has arrived so far, every half second while receiving from the network
+    /// or playing a capture goes on, for a display that follows the stream.
+    fn progress(&mut self, report: &Report) {
+        let _ = report;
     }
 }
 

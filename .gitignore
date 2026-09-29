@@ -1,2 +1,4 @@
 /target
 /crates/wasm/pkg
+# What scripts/make-viewer-app.sh builds.
+/dist

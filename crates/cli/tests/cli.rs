@@ -883,8 +883,9 @@ fn audio_goes_through_a_capture_into_a_wav_file() {
     assert_eq!(audio.len(), 44 + 4800 * 2 * 3);
 }
 
-#[test]
-fn sends_and_receives_over_the_loopback_interface() {
+/// Sends audio on two legs over the loopback interface and receives half a second of it,
+/// giving what the sender said and what the receiver did.
+fn send_and_receive_on_loopback() -> (Output, Output) {
     // Two free ports: both stay taken until both are read, so they differ.
     let probes = [0; 2].map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     let [one, two] = probes.each_ref().map(|p| format!("127.0.0.1:{}", p.local_addr().unwrap().port()));
@@ -905,15 +906,31 @@ fn sends_and_receives_over_the_loopback_interface() {
             break;
         }
     }
-    let output = with_stdin(&["receive", "-", "--duration", "0.5", "--format", "json"], &sdp);
-    let sent = sender.wait_with_output().unwrap();
-    assert_eq!(sent.status.code(), Some(0), "{}", stderr(&sent));
-    assert_eq!(output.status.code(), Some(0), "{}\n{}", stdout(&output), stderr(&output));
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    assert_eq!(json["input"], "network");
-    assert!(json["passed"].as_u64().unwrap() > 300, "{json}");
-    assert_eq!((json["lost"].as_u64(), json["legs"].as_array().map(Vec::len)), (Some(0), Some(2)));
-    assert_eq!(json["problems"], serde_json::json!([]));
+    let received = with_stdin(&["receive", "-", "--duration", "0.5", "--format", "json"], &sdp);
+    (sender.wait_with_output().unwrap(), received)
+}
+
+#[test]
+fn sends_and_receives_over_the_loopback_interface() {
+    // A sender held up for more than a tenth of a second, as a busy machine can hold one
+    // up, leaves out the audio whose time has passed and says so. The receiver then
+    // rightly reports the jump in the timestamps, so such a run is tried again.
+    const RUNS: u32 = 5;
+    for run in 1..=RUNS {
+        let (sent, output) = send_and_receive_on_loopback();
+        assert_eq!(sent.status.code(), Some(0), "{}", stderr(&sent));
+        if stderr(&sent).contains("whose time had passed") && run < RUNS {
+            continue;
+        }
+        let said = format!("{}\n{}\nThe sender: {}", stdout(&output), stderr(&output), stderr(&sent));
+        assert_eq!(output.status.code(), Some(0), "{said}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        assert_eq!(json["input"], "network");
+        assert!(json["passed"].as_u64().unwrap() > 300, "{said}");
+        assert_eq!((json["lost"].as_u64(), json["legs"].as_array().map(Vec::len)), (Some(0), Some(2)), "{said}");
+        assert_eq!(json["problems"], serde_json::json!([]), "{said}");
+        return;
+    }
 }
 
 #[cfg(feature = "view")]

@@ -3,7 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,7 +13,8 @@ use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::files::{Capture, UNKNOWN_SOURCE, WavWriter, write_png};
 use st2110_media::format::{AudioFormat, Packing, Range, SenderType, VideoFormat};
 use st2110_media::net::{self, Transmitter};
-use st2110_media::receive::{self as session, DEFAULT_MAX_SKEW_NS, Report, Session, Sink};
+use st2110_media::receive::{DEFAULT_MAX_SKEW_NS, Report, Session, Sink};
+use st2110_media::replay;
 use st2110_media::send::{SendCounts, Sender, default_sender_type};
 use st2110_media::video::FrameInfo;
 
@@ -603,62 +604,18 @@ pub(crate) fn capture(path: &Path) -> io::Result<CaptureReader> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))
 }
 
-/// Feeds a capture's datagrams to the session, each to the leg whose destination (and
-/// source, where two legs share a destination) it matches. A capture on UTC is moved
-/// onto PTP time by `tai_utc`, and one already on PTP time is not: whichever puts the
-/// first packet nearer its RTP timestamp. Before each datagram, `pace` has its time in
-/// the capture, and stops reading when it gives false. Gives the shift, once one packet
-/// has decided it.
+/// Feeds a capture's datagrams to the session, as [`replay::replay`] does, and says
+/// which file it could not read.
 pub(crate) fn from_capture(
     session: &mut Session,
-    mut reader: CaptureReader,
+    reader: CaptureReader,
     path: &Path,
     tai_utc: i32,
     sink: &mut impl Sink,
-    mut pace: impl FnMut(i128) -> bool,
+    pace: impl FnMut(i128) -> bool,
 ) -> io::Result<Option<i32>> {
-    let legs = session.description().legs.clone();
-    let clock_rate = session.description().media.clock_rate();
-    let mut shift: Option<i32> = None;
-    let mut end = 0;
-    while let Some(frame) = reader.next_frame() {
-        let frame =
-            frame.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
-        end = end.max(frame.time);
-        let st2110_pcap::net::Packet::Udp(datagram) = st2110_pcap::net::parse(frame.link, frame.data) else {
-            continue;
-        };
-        let (SocketAddr::V4(source), SocketAddr::V4(destination)) = (datagram.source, datagram.destination) else {
-            continue;
-        };
-        let matching = |l: &&Leg| l.destination == destination;
-        let Some(leg) = legs
-            .iter()
-            .position(|l| matching(&l) && l.source == Some(*source.ip()))
-            .or_else(|| legs.iter().position(|l| matching(&l)))
-        else {
-            continue;
-        };
-        if !datagram.complete() {
-            continue;
-        }
-        if !pace(frame.time) {
-            break;
-        }
-        let shift = *shift.get_or_insert_with(|| match st2110_pcap::rtp::header(datagram.payload, true) {
-            Some(h) => {
-                let off = |s: i32| {
-                    session::since_timestamp(h.timestamp, frame.time + i128::from(s) * NANOS, clock_rate).abs()
-                };
-                if off(tai_utc) < off(0) { tai_utc } else { 0 }
-            }
-            None => tai_utc,
-        });
-        session.push(leg, *source.ip(), frame.time + i128::from(shift) * NANOS, datagram.payload, sink);
-    }
-    // The capture stopped at its last packet, whatever it was.
-    session.finish(end + i128::from(shift.unwrap_or(0)) * NANOS, sink);
-    Ok(shift)
+    replay::replay(session, reader, tai_utc, sink, pace)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))
 }
 
 pub(crate) fn write_text(

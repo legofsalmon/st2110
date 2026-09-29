@@ -14,8 +14,8 @@
 //! in fixed point, which is fast enough to send a renderer's pictures live. Pictures may
 //! come with their octets in another [`Order`], and with their rows padded, as GPUs read
 //! them back. Unpacking adds up what tables say each code gives R', G' and B', which is
-//! fast enough to watch a stream as it arrives, in R'G'B' triplets or in the 0RGB words
-//! that windows show.
+//! fast enough to watch a stream as it arrives, in R'G'B' triplets, in the 0RGB words
+//! that windows show, or in the RGBA that graphics cards take.
 
 use std::fmt;
 
@@ -214,6 +214,13 @@ impl Pixel for u32 {
     }
 }
 
+/// R'G'B' and an opaque alpha.
+impl Pixel for [u8; 4] {
+    fn new(r: u8, g: u8, b: u8) -> Self {
+        [r, g, b, 255]
+    }
+}
+
 /// An 8-bit level, from a fixed-point one that holds a half to round with.
 fn level(v: i32) -> u8 {
     (v >> LEVEL_FRACTION).clamp(0, 255) as u8
@@ -376,6 +383,16 @@ impl Converter {
     ///
     /// If `row` is shorter than a row of pixel groups or `out` than `width` pixels.
     pub fn unpack_row_0rgb(&self, row: &[u8], out: &mut [u32]) {
+        self.unpack(row, out);
+    }
+
+    /// Unpacks one row of pixel groups into `width` pixels of R'G'B' with an opaque
+    /// alpha, as graphics cards take textures.
+    ///
+    /// # Panics
+    ///
+    /// If `row` is shorter than a row of pixel groups or `out` than `width` pixels.
+    pub fn unpack_row_rgba(&self, row: &[u8], out: &mut [[u8; 4]]) {
         self.unpack(row, out);
     }
 
@@ -776,13 +793,15 @@ mod tests {
                                 (state >> 32) as u8
                             })
                             .collect();
-                        let (mut rgb, mut words) = (vec![0; 3 * 484], vec![0; 484]);
+                        let (mut rgb, mut words, mut rgba) = (vec![0; 3 * 484], vec![0; 484], vec![[0; 4]; 484]);
                         c.unpack_row(&row, &mut rgb);
                         c.unpack_row_0rgb(&row, &mut words);
+                        c.unpack_row_rgba(&row, &mut rgba);
                         let expected = unpacked_by_formula(&c, range, &row, k);
                         assert_eq!(expected.len(), 484);
                         for (x, (values, got)) in expected.iter().zip(rgb.as_chunks::<3>().0).enumerate() {
                             assert_eq!(words[x], u32::from_be_bytes([0, got[0], got[1], got[2]]), "{f}: pixel {x}");
+                            assert_eq!(rgba[x], [got[0], got[1], got[2], 255], "{f}: pixel {x}");
                             for (&value, &level) in values.iter().zip(got) {
                                 let near = |v: f64| v.clamp(0.0, 255.0);
                                 let half = (value - value.floor() - 0.5).abs() < 1e-3;

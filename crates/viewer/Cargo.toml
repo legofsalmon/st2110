@@ -1,0 +1,28 @@
+[package]
+name = "st2110-viewer"
+description = "ST 2110 Viewer: a desktop app that plays an ST 2110-20 video stream as it arrives, with what arrived beside it"
+version.workspace = true
+edition.workspace = true
+# eframe 0.36 needs it.
+rust-version = "1.95"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "st2110-viewer"
+path = "src/main.rs"
+
+[dependencies]
+st2110-media = { workspace = true, features = ["net"] }
+st2110-pcap.workspace = true
+clap.workspace = true
+serde.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "persistence", "wayland", "wgpu", "x11"] }
+egui = { version = "0.36", default-features = false, features = ["bytemuck"] }
+bytemuck = "1"
+rfd = "0.17"
+if-addrs = "0.15"
+
+[lints]
+workspace = true
