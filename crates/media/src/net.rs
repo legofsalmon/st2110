@@ -22,7 +22,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 pub use st2110_ptp::TAI_UTC_2017;
 
 use crate::describe::Leg;
-use crate::receive::{Session, Sink};
+use crate::receive::{PROGRESS_NS, Session, Sink};
 use crate::send::Output;
 
 const NANOS: i128 = 1_000_000_000;
@@ -382,10 +382,16 @@ fn run(
         }));
     }
     drop(tx);
+    let mut reported = tai_now(tai_utc);
     loop {
-        let left = until - tai_now(tai_utc);
+        let now = tai_now(tai_utc);
+        let left = until - now;
         if left <= 0 || stop.load(Ordering::Relaxed) {
             break;
+        }
+        if now - reported >= PROGRESS_NS {
+            sink.progress(&session.report());
+            reported = now;
         }
         match rx.recv_timeout(Duration::from_nanos(left.min(50_000_000) as u64)) {
             Ok(a) if a.at < until => session.push(a.leg, a.source, a.at, &a.data, sink),

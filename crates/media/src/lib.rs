@@ -9,7 +9,10 @@
 //! - [`send`] sends colour bars or a tone, or frames from elsewhere, each packet at its
 //!   ST 2110-21 time, lined up with the SMPTE Epoch; [`pattern`] draws the bars.
 //! - [`merge`] merges the legs of an ST 2022-7 pair and measures how far apart they are;
-//!   [`receive`] follows a stream through it and reports what it finds.
+//!   [`receive`] follows a stream through it and reports what it finds, and [`replay`]
+//!   plays a capture into it.
+//! - [`live`] hands frames and progress from the thread that receives to one that shows
+//!   them as they arrive.
 //! - [`files`] writes PNG pictures, WAV files and pcap captures.
 //! - With the `net` feature, [`net`] sends and receives on UDP sockets. Without it the
 //!   crate does no I/O of its own, so senders can write captures and receivers can
@@ -60,12 +63,14 @@ pub mod audio;
 pub mod describe;
 pub mod files;
 pub mod format;
+pub mod live;
 pub mod merge;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod pattern;
 pub mod pixels;
 pub mod receive;
+pub mod replay;
 mod rtp;
 pub mod send;
 pub mod video;

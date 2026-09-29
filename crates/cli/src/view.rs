@@ -10,18 +10,19 @@ use std::net::{Ipv4Addr, UdpSocket};
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Args;
 use minifb::{Key, ScaleMode, Window, WindowOptions};
 use st2110_media::describe::Media;
+use st2110_media::live::{Latest, Monitor};
 use st2110_media::net;
 use st2110_media::pixels::Converter;
-use st2110_media::receive::{DEFAULT_MAX_SKEW_NS, Sink};
-use st2110_media::video::FrameInfo;
+use st2110_media::receive::DEFAULT_MAX_SKEW_NS;
+use st2110_media::replay::as_captured;
 
 use crate::Style;
 use crate::stream::{self, CaptureReader, Opened, Received};
@@ -59,62 +60,6 @@ pub(crate) struct ViewArgs {
 enum Input {
     Network(Vec<UdpSocket>),
     Capture(CaptureReader),
-}
-
-/// What the receiving thread hands the window.
-#[derive(Default)]
-struct Latest {
-    /// The newest frame to show, and whether the window has yet to show it.
-    frame: Vec<u8>,
-    fresh: bool,
-    /// Frames that arrived; those of them that arrived incomplete, not counting any that
-    /// the start or end of receiving cut off; and the packets those were missing.
-    frames: u64,
-    incomplete: u64,
-    missing: u64,
-    /// Whether a frame has arrived whole.
-    whole: bool,
-    /// When the last frame arrived.
-    last: Option<Instant>,
-    /// Whether receiving has stopped, at the end of a capture or on an error.
-    ended: bool,
-}
-
-#[derive(Default)]
-struct Handoff {
-    latest: Mutex<Latest>,
-    arrived: Condvar,
-}
-
-impl Handoff {
-    fn lock(&self) -> MutexGuard<'_, Latest> {
-        self.latest.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Hands each frame to the window, whole or with packets missing, where the frames
-/// before it show through, but not those the start or end of receiving cut off.
-struct Viewer(Arc<Handoff>);
-
-impl Sink for Viewer {
-    fn frame(&mut self, info: &FrameInfo, pixels: &[u8]) {
-        let mut latest = self.0.lock();
-        latest.frames += 1;
-        latest.last = Some(Instant::now());
-        latest.whole |= info.whole;
-        if info.cut {
-            return;
-        }
-        if !info.whole {
-            latest.incomplete += 1;
-            latest.missing += u64::from(info.missing);
-        }
-        latest.frame.clear();
-        latest.frame.extend_from_slice(pixels);
-        latest.fresh = true;
-        drop(latest);
-        self.0.arrived.notify_one();
-    }
 }
 
 pub(crate) fn view(args: &ViewArgs) -> io::Result<ExitCode> {
@@ -155,25 +100,25 @@ pub(crate) fn view(args: &ViewArgs) -> io::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
-    let (handoff, stop) = (Arc::new(Handoff::default()), Arc::new(AtomicBool::new(false)));
+    let (monitor, stop) = (Arc::new(Monitor::default()), Arc::new(AtomicBool::new(false)));
     let receiver = {
-        let (handoff, stop, pcap, tai_utc) = (Arc::clone(&handoff), Arc::clone(&stop), args.pcap.clone(), args.tai_utc);
+        let (monitor, stop, pcap, tai_utc) = (Arc::clone(&monitor), Arc::clone(&stop), args.pcap.clone(), args.tai_utc);
         thread::Builder::new().name("receive".into()).spawn(move || {
-            let mut viewer = Viewer(handoff);
+            let mut sink = &*monitor;
             let result = match input {
                 Input::Network(sockets) => {
-                    net::receive_until_stopped(&mut session, sockets, &stop, tai_utc, &mut viewer).map(|()| None)
+                    net::receive_until_stopped(&mut session, sockets, &stop, tai_utc, &mut sink).map(|()| None)
                 }
                 Input::Capture(reader) => {
                     let path = pcap.unwrap_or_default();
-                    stream::from_capture(&mut session, reader, &path, tai_utc, &mut viewer, as_captured(&stop))
+                    stream::from_capture(&mut session, reader, &path, tai_utc, &mut sink, as_captured(&stop))
                 }
             };
-            viewer.0.lock().ended = true;
+            monitor.end(None);
             (session, result)
         })?
     };
-    let shown = picture.show(&mut window, &mut pixels, &handoff, &converter, args.pcap.is_some());
+    let shown = picture.show(&mut window, &mut pixels, &monitor, &converter, args.pcap.is_some());
     stop.store(true, Ordering::Relaxed);
     drop(window);
     let (session, received) = receiver.join().map_err(|_| io::Error::other("the receiving thread panicked"))?;
@@ -188,27 +133,6 @@ pub(crate) fn view(args: &ViewArgs) -> io::Result<ExitCode> {
     stream::write_text(&mut out, &received, &description, Style::detect())?;
     out.flush()?;
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
-}
-
-/// Paces a capture as it was captured: lets each packet go at its time in the capture,
-/// counting from when the first went, a millisecond early at most, and stops once
-/// `stop` is set.
-fn as_captured(stop: &AtomicBool) -> impl FnMut(i128) -> bool + '_ {
-    let mut first = None;
-    move |time| {
-        let (start, at) = *first.get_or_insert((time, Instant::now()));
-        let due = at + Duration::from_nanos(u64::try_from(time - start).unwrap_or(0));
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return false;
-            }
-            let now = Instant::now();
-            if due <= now + Duration::from_millis(1) {
-                return true;
-            }
-            thread::sleep((due - now).min(Duration::from_millis(50)));
-        }
-    }
 }
 
 /// The stream the window shows.
@@ -240,7 +164,7 @@ impl Picture {
         &self,
         window: &mut Window,
         pixels: &mut [u32],
-        handoff: &Handoff,
+        monitor: &Monitor,
         converter: &Converter,
         capture: bool,
     ) -> minifb::Result<()> {
@@ -249,11 +173,7 @@ impl Picture {
         let mut titled: Option<Instant> = None;
         while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
             let (fresh, title) = {
-                let mut latest = handoff.lock();
-                if !latest.fresh {
-                    let waited = handoff.arrived.wait_timeout(latest, Duration::from_millis(20));
-                    latest = waited.unwrap_or_else(PoisonError::into_inner).0;
-                }
+                let mut latest = monitor.wait(Duration::from_millis(20));
                 let fresh = std::mem::take(&mut latest.fresh);
                 if fresh {
                     std::mem::swap(&mut latest.frame, &mut frame);
@@ -328,42 +248,6 @@ mod tests {
 
     use super::*;
 
-    fn info(whole: bool, cut: bool, missing: u32) -> FrameInfo {
-        FrameInfo {
-            timestamp: 0,
-            packets: 10 - missing,
-            missing,
-            filled: 0,
-            whole,
-            cut,
-            first_arrival: 0,
-            last_arrival: 0,
-            first_sequence: 0,
-            last_sequence: 0,
-        }
-    }
-
-    #[test]
-    fn hands_over_each_frame_that_receiving_did_not_cut_off() {
-        let handoff = Arc::new(Handoff::default());
-        let mut viewer = Viewer(Arc::clone(&handoff));
-        // Cut off by the start of receiving, which leaves the top of the picture unsent.
-        viewer.frame(&info(false, true, 4), &[1; 8]);
-        assert!(!handoff.lock().fresh);
-        // Incomplete, and shown all the same, for a stream that always loses a packet
-        // or two would otherwise show nothing.
-        viewer.frame(&info(false, false, 2), &[2; 8]);
-        let latest = handoff.lock();
-        assert_eq!((latest.fresh, &latest.frame[..], latest.whole), (true, &[2; 8][..], false));
-        drop(latest);
-        viewer.frame(&info(true, false, 0), &[3; 8]);
-        // Cut off by the end: the window keeps the frame before it.
-        viewer.frame(&info(false, true, 5), &[4; 8]);
-        let latest = handoff.lock();
-        assert_eq!((&latest.frame[..], latest.whole), (&[3; 8][..], true));
-        assert_eq!((latest.frames, latest.incomplete, latest.missing), (4, 1, 2));
-    }
-
     #[test]
     fn titles_say_what_has_arrived() {
         let picture = Picture {
@@ -418,21 +302,5 @@ mod tests {
         }
         // 75% yellow, the second of eight bars, in a row near the top.
         assert_eq!(one[width * 100 + width * 3 / 16], 0x00BF_BF00);
-    }
-
-    #[test]
-    fn plays_a_capture_at_its_pace_until_stopped() {
-        let stop = AtomicBool::new(false);
-        let mut pace = as_captured(&stop);
-        let started = Instant::now();
-        // Times in nanoseconds, 30 ms apart: the second waits for its turn.
-        assert!(pace(1_000_000_000));
-        assert!(pace(1_030_000_000));
-        let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(28) && waited < Duration::from_millis(500), "{waited:?}");
-        // A packet from before the first goes at once.
-        assert!(pace(999_000_000));
-        stop.store(true, Ordering::Relaxed);
-        assert!(!pace(1_031_000_000));
     }
 }
