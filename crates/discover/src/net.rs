@@ -82,26 +82,49 @@ fn join(socket: &Socket, group: Ipv4Addr, interfaces: &[Ipv4Addr]) -> io::Result
     }
 }
 
-/// Sockets that hear SAP packets sent to `addresses`: one for the multicast groups on
-/// each port, joined on each of `interfaces`, and one bound to each unicast address.
-pub(crate) fn sap_sockets(addresses: &[SocketAddrV4], interfaces: &[Ipv4Addr]) -> io::Result<Vec<UdpSocket>> {
+/// Joins `groups` on the ports that are up now and were not when `joined` was listed,
+/// and lists them again: for a socket that hears every port. Gives whether they changed.
+pub(crate) fn rejoin(socket: &UdpSocket, groups: &[Ipv4Addr], joined: &mut Vec<Ipv4Addr>) -> bool {
+    let up: Vec<Ipv4Addr> = interfaces().into_iter().map(|i| i.address).collect();
+    if up == *joined {
+        return false;
+    }
+    for interface in up.iter().filter(|i| !joined.contains(i)) {
+        for group in groups {
+            // A port that comes back with its address may still be joined.
+            _ = socket.join_multicast_v4(group, interface);
+        }
+    }
+    *joined = up;
+    true
+}
+
+/// Sockets that hear SAP packets sent to `addresses`, each with the groups it joined:
+/// one for the multicast groups on each port, joined on each of `interfaces`, and one
+/// bound to each unicast address.
+pub(crate) fn sap_sockets(
+    addresses: &[SocketAddrV4],
+    interfaces: &[Ipv4Addr],
+) -> io::Result<Vec<(UdpSocket, Vec<Ipv4Addr>)>> {
     let mut sockets = Vec::new();
     let mut ports: Vec<u16> = addresses.iter().filter(|a| a.ip().is_multicast()).map(|a| a.port()).collect();
     ports.sort_unstable();
     ports.dedup();
     for port in ports {
         let socket = shared(port)?;
+        let mut groups = Vec::new();
         for group in addresses.iter().filter(|a| a.ip().is_multicast() && a.port() == port) {
             join(&socket, *group.ip(), interfaces)
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot join {}: {e}", group.ip())))?;
+            groups.push(*group.ip());
         }
         socket.set_read_timeout(Some(TICK))?;
-        sockets.push(socket.into());
+        sockets.push((socket.into(), groups));
     }
     for address in addresses.iter().filter(|a| !a.ip().is_multicast()) {
         let socket = UdpSocket::bind(address)?;
         socket.set_read_timeout(Some(TICK))?;
-        sockets.push(socket);
+        sockets.push((socket, Vec::new()));
     }
     Ok(sockets)
 }
@@ -218,6 +241,13 @@ impl Mdns {
         result
     }
 
+    /// Asks on the ports that are up now, joining the group on those that have come up:
+    /// for a querier that asks on every port. Gives whether they changed.
+    pub(crate) fn follow(&mut self) -> bool {
+        let groups = if self.one_shot { Vec::new() } else { vec![*self.to.ip()] };
+        rejoin(&self.socket, &groups, &mut self.interfaces)
+    }
+
     /// The next response to arrive, if one does within a tick.
     pub(crate) fn receive(&self, buffer: &mut [u8]) -> io::Result<Option<Message>> {
         match self.socket.recv_from(buffer) {
@@ -298,4 +328,21 @@ fn lookup_tcp(server: SocketAddr, query: &[u8], timeout: Duration) -> io::Result
     let mut response = vec![0u8; usize::from(u16::from_be_bytes(length))];
     stream.read_exact(&mut response)?;
     Message::decode(&response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{server}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_the_ports_that_come_up() {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let group = Ipv4Addr::new(239, 255, 255, 255);
+        let up: Vec<Ipv4Addr> = interfaces().into_iter().map(|i| i.address).collect();
+        // Joined on none, as when no port was up at the start.
+        let mut joined = Vec::new();
+        assert_eq!(rejoin(&socket, &[group], &mut joined), !up.is_empty());
+        assert_eq!(joined, up);
+        assert!(!rejoin(&socket, &[group], &mut joined), "none has come up since");
+    }
 }

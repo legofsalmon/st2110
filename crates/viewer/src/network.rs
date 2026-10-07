@@ -64,12 +64,14 @@ impl Network {
         self.listed = std::mem::take(&mut list.streams)
             .into_iter()
             .map(|found| {
-                let sdp = found.sdp.clone().unwrap_or_default();
-                let result = playable.remove(&sdp).unwrap_or_else(|| match &found.sdp {
-                    Some(text) => Stream::playable(text),
+                let result = match &found.sdp {
+                    Some(text) => {
+                        let result = playable.remove(text).unwrap_or_else(|| Stream::playable(text));
+                        self.playable.insert(text.clone(), result.clone());
+                        result
+                    }
                     None => Err(found.problem.clone().unwrap_or_else(|| "it has no SDP file".into())),
-                });
-                self.playable.insert(sdp, result.clone());
+                };
                 Listed { found, playable: result }
             })
             .collect();
@@ -234,6 +236,7 @@ mod tests {
         assert_eq!((ago(95.4), ago(150.0)), ("95 s".to_string(), "2 min".to_string()));
         let found = Found {
             name: "CAM 1 video".into(),
+            id: "nmos 5e0d0001".into(),
             sdp: None,
             streams: Vec::new(),
             active: Some(true),

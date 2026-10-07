@@ -71,10 +71,17 @@ const DNS_EVERY: Duration = Duration::from_secs(60);
 /// How many Nodes are read at once, peer to peer.
 const PARALLEL_NODES: usize = 16;
 
+/// How often the machine's ports are listed again, to look on those that have come up.
+const FOLLOW_EVERY: Duration = Duration::from_secs(5);
+
+/// The longest that `Options::refresh` and `Options::timeout` are taken to be.
+const HOUR: Duration = Duration::from_secs(3600);
+
 /// Where and how to look.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// The addresses of the ports to look on: every port that is up when empty.
+    /// The addresses of the ports to look on: when empty, every port that is up, and
+    /// each one that comes up later.
     pub interfaces: Vec<Ipv4Addr>,
     /// Where to hear SAP: the groups announcements go to, by default; none to hear none.
     /// A unicast address is listened on as it is.
@@ -91,9 +98,10 @@ pub struct Options {
     pub dns_servers: Vec<SocketAddr>,
     /// The domains to browse: the system's search domains when `None`.
     pub domains: Option<Vec<String>>,
-    /// How often to read the registry, or the Nodes, again.
+    /// How often to read the registry, or the Nodes, again: an hour at most.
     pub refresh: Duration,
-    /// How long a request to a DNS server, a registry or a Node may take.
+    /// How long a request to a DNS server, a registry or a Node may take: an hour at
+    /// most.
     pub timeout: Duration,
 }
 
@@ -119,6 +127,9 @@ impl Default for Options {
 pub struct Found {
     /// Its name: the NMOS Sender's label, or else the session name in its SDP file.
     pub name: String,
+    /// What names it from one look to the next: where its packets go, and from where
+    /// when its SDP file says, or how it was found when it has no SDP file.
+    pub id: String,
     /// Its SDP file, when there is one to read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdp: Option<String>,
@@ -147,7 +158,7 @@ pub enum Origin {
         announcer: IpAddr,
         /// Seconds since it was last heard.
         heard_s: f64,
-        /// Seconds between its last two announcements.
+        /// Seconds between its announcements: the longest of the last few gaps.
         #[serde(skip_serializing_if = "Option::is_none")]
         interval_s: Option<f64>,
     },
@@ -194,17 +205,68 @@ impl Found {
     }
 
     /// What names it across ways of finding it: where its packets go, from where.
-    fn key(&self) -> Option<String> {
-        let mut legs: Vec<String> = self
+    fn key(&self) -> Option<Key> {
+        let mut legs: Vec<(String, Option<String>)> = self
             .streams
             .iter()
-            .filter_map(|s| {
-                let at = format!("{}:{}", s.destination.as_deref()?, s.port?);
-                Some(s.source.as_ref().map_or_else(|| at.clone(), |source| format!("{at} from {source}")))
-            })
+            .filter_map(|s| Some((format!("{}:{}", s.destination.as_deref()?, s.port?), s.source.clone())))
             .collect();
         legs.sort();
-        (!legs.is_empty()).then(|| legs.join(", "))
+        (!legs.is_empty()).then_some(Key::Legs(legs))
+    }
+}
+
+/// What names a stream across ways of finding it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Key {
+    /// Each leg's destination and port, and its source where the SDP file names one.
+    Legs(Vec<(String, Option<String>)>),
+    /// How it was found, for a stream with no SDP file to say where it goes.
+    Alone(String),
+}
+
+impl Key {
+    /// Whether two keys name the same stream: to the same destinations, and from the
+    /// same sources where both SDP files name them, as one may leave its source filter
+    /// out.
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Legs(mine), Self::Legs(theirs)) => {
+                mine.len() == theirs.len()
+                    && mine.iter().zip(theirs).all(|((to, from), (their_to, their_from))| {
+                        to == their_to && (from.is_none() || their_from.is_none() || from == their_from)
+                    })
+            }
+            (Self::Alone(mine), Self::Alone(theirs)) => mine == theirs,
+            _ => false,
+        }
+    }
+
+    /// Takes the sources that `other` names and this leaves out.
+    fn fill(&mut self, other: &Self) {
+        if let (Self::Legs(mine), Self::Legs(theirs)) = (self, other) {
+            for ((_, from), (_, their_from)) in mine.iter_mut().zip(theirs) {
+                if from.is_none() {
+                    from.clone_from(their_from);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Key {
+    /// `239.10.10.1:5004 from 192.168.10.21, 239.20.10.1:5004`, or how it was found.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legs(legs) => {
+                let legs: Vec<String> = legs
+                    .iter()
+                    .map(|(to, from)| from.as_ref().map_or_else(|| to.clone(), |from| format!("{to} from {from}")))
+                    .collect();
+                f.write_str(&legs.join(", "))
+            }
+            Self::Alone(how) => f.write_str(how),
+        }
     }
 }
 
@@ -323,7 +385,9 @@ impl Discovery {
     /// Starts looking as `options` say, calling `wake` whenever the list changes. What
     /// cannot be looked at, such as a port another program holds alone, is noted in the
     /// list.
-    pub fn start(options: Options, wake: impl Fn() + Send + Sync + 'static) -> Self {
+    pub fn start(mut options: Options, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        // An hour is as long as forever here, and a time that far ahead cannot overflow.
+        (options.refresh, options.timeout) = (options.refresh.min(HOUR), options.timeout.min(HOUR));
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -332,11 +396,10 @@ impl Discovery {
         });
         // Until the first read of a registry or the Nodes, which starts at once.
         shared.lock().busy = options.nmos;
-        let interfaces: Vec<Ipv4Addr> = if options.interfaces.is_empty() {
-            interfaces().into_iter().map(|i| i.address).collect()
-        } else {
-            options.interfaces.clone()
-        };
+        // Given no ports, it looks on every one that is up, and joins those that come up.
+        let follow = options.interfaces.is_empty();
+        let interfaces: Vec<Ipv4Addr> =
+            if follow { interfaces().into_iter().map(|i| i.address).collect() } else { options.interfaces.clone() };
         let spawn = |name: &str, run: Box<dyn FnOnce() + Send>| {
             if let Err(e) = thread::Builder::new().name(name.into()).spawn(run) {
                 shared.note(name, Some(format!("Cannot start looking: {e}")));
@@ -347,44 +410,41 @@ impl Discovery {
             match net::sap_sockets(&options.sap, &interfaces) {
                 Ok(sockets) => {
                     shared.update(|s| s.looking.insert("1 sap", format!("SAP announcements to {addresses}")).is_none());
-                    for socket in sockets {
+                    for (socket, groups) in sockets {
                         let shared = Arc::clone(&shared);
-                        spawn("sap", Box::new(move || listen_sap(&shared, &socket)));
+                        let joined = (follow && !groups.is_empty()).then(|| (groups, interfaces.clone()));
+                        spawn("sap", Box::new(move || listen_sap(&shared, &socket, joined)));
                     }
                 }
                 Err(e) => shared.note("sap", Some(format!("Cannot hear SAP announcements to {addresses}: {e}"))),
             }
         }
         if options.nmos {
-            match &options.registry {
-                Some(url) => {
-                    shared.update(|s| s.looking.insert("2 registry", format!("the NMOS registry at {url}")).is_none())
-                }
-                None => {
-                    if let Some(to) = options.mdns {
-                        match Mdns::open(to, &interfaces) {
-                            Ok(mdns) => {
-                                let how = if mdns.one_shot { ", from a port of its own" } else { "" };
-                                let looking = format!("NMOS registries and Nodes by multicast DNS{how}");
-                                shared.update(|s| s.looking.insert("3 mdns", looking).is_none());
-                                let shared = Arc::clone(&shared);
-                                spawn("mdns", Box::new(move || browse_mdns(&shared, &mdns)));
-                            }
-                            Err(e) => shared.note("mdns", Some(format!("Cannot ask by multicast DNS: {e}"))),
-                        }
-                    }
-                    if options.dns {
-                        let (system_servers, system_domains) = resolv::system();
-                        let servers =
-                            if options.dns_servers.is_empty() { system_servers } else { options.dns_servers.clone() };
-                        let domains = options.domains.clone().unwrap_or(system_domains);
-                        if !servers.is_empty() && !domains.is_empty() {
-                            let looking = format!("NMOS registries by DNS-SD in {}", domains.join(", "));
-                            shared.update(|s| s.looking.insert("4 dns", looking).is_none());
+            // A registry it is given counts as somewhere it looks once it has answered.
+            if options.registry.is_none() {
+                if let Some(to) = options.mdns {
+                    match Mdns::open(to, &interfaces) {
+                        Ok(mut mdns) => {
+                            let how = if mdns.one_shot { ", from a port of its own" } else { "" };
+                            let looking = format!("NMOS registries and Nodes by multicast DNS{how}");
+                            shared.update(|s| s.looking.insert("3 mdns", looking).is_none());
                             let shared = Arc::clone(&shared);
-                            let timeout = options.timeout;
-                            spawn("dns-sd", Box::new(move || browse_dns(&shared, &servers, &domains, timeout)));
+                            spawn("mdns", Box::new(move || browse_mdns(&shared, &mut mdns, follow)));
                         }
+                        Err(e) => shared.note("mdns", Some(format!("Cannot ask by multicast DNS: {e}"))),
+                    }
+                }
+                if options.dns {
+                    let (system_servers, system_domains) = resolv::system();
+                    let servers =
+                        if options.dns_servers.is_empty() { system_servers } else { options.dns_servers.clone() };
+                    let domains = options.domains.clone().unwrap_or(system_domains);
+                    if !servers.is_empty() && !domains.is_empty() {
+                        let looking = format!("NMOS registries by DNS-SD in {}", domains.join(", "));
+                        shared.update(|s| s.looking.insert("4 dns", looking).is_none());
+                        let shared = Arc::clone(&shared);
+                        let timeout = options.timeout;
+                        spawn("dns-sd", Box::new(move || browse_dns(&shared, &servers, &domains, timeout)));
                     }
                 }
             }
@@ -418,8 +478,8 @@ impl Discovery {
         self.shared.lock().generation
     }
 
-    /// Asks again at once: by multicast DNS and of the DNS servers, and reads the
-    /// registry or the Nodes again, with every SDP file.
+    /// Asks again at once: by multicast DNS and of the DNS servers, on any port that
+    /// has come up too, and reads the registry or the Nodes again, with every SDP file.
     pub fn refresh(&self) {
         self.shared.update(|s| {
             s.refreshes += 1;
@@ -432,17 +492,29 @@ impl Discovery {
 impl Drop for Discovery {
     /// Stops looking. The threads end on their own, within a tick or a request.
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        // Under the lock, so that a thread about to wait cannot miss it.
+        {
+            let _state = self.shared.lock();
+            self.shared.stop.store(true, Ordering::Relaxed);
+        }
         self.shared.changed.notify_all();
     }
 }
 
-/// Hears SAP packets on one socket until it stops.
-fn listen_sap(shared: &Shared, socket: &UdpSocket) {
+/// Hears SAP packets on one socket until it stops. Given the groups it joined and the
+/// ports it joined them on, it joins them on each port that comes up.
+fn listen_sap(shared: &Shared, socket: &UdpSocket, mut joined: Option<(Vec<Ipv4Addr>, Vec<Ipv4Addr>)>) {
     let mut buffer = vec![0u8; 65_536];
     let mut expired = Instant::now();
+    let (mut followed, mut refreshes) = (Instant::now(), shared.refreshes());
     let mut unreadable = 0;
     while !shared.stopped() {
+        if let Some((groups, interfaces)) = &mut joined
+            && (followed.elapsed() >= FOLLOW_EVERY || shared.refreshes() != refreshes)
+        {
+            (followed, refreshes) = (Instant::now(), shared.refreshes());
+            net::rejoin(socket, groups, interfaces);
+        }
         match socket.recv_from(&mut buffer) {
             Ok((n, _)) => match sap::parse(&buffer[..n]) {
                 Ok(packet) => shared.update(|s| s.sap.heard(&packet, Instant::now())),
@@ -492,7 +564,7 @@ fn apis_in(cache: &Cache, types: &[(Name, ApiKind)], by: &str) -> Vec<Api> {
 /// Browses for NMOS APIs by multicast DNS until it stops: asks after 1 s, 2 s, 4 s and
 /// so on, up to every 30 s (RFC 6762 §5.2), and asks at once for the records that each
 /// instance it hears of still lacks.
-fn browse_mdns(shared: &Shared, mdns: &Mdns) {
+fn browse_mdns(shared: &Shared, mdns: &mut Mdns, follow: bool) {
     let types = nmos_types("local");
     let names: Vec<Name> = types.iter().map(|(n, _)| n.clone()).collect();
     let browse: Vec<Question> = names.iter().map(|n| Question::new(n.clone(), dns::PTR)).collect();
@@ -506,12 +578,22 @@ fn browse_mdns(shared: &Shared, mdns: &Mdns) {
     // asking again: a second, doubling to a minute.
     let mut asked: HashMap<Question, (Instant, Duration)> = HashMap::new();
     let mut refreshes = shared.refreshes();
+    let mut followed = Instant::now();
     let mut found: Vec<Api> = Vec::new();
     while !shared.stopped() {
         let now = Instant::now();
         let r = shared.refreshes();
-        if r != refreshes {
+        let refreshed = r != refreshes;
+        if refreshed {
             (refreshes, next, delay) = (r, now, Duration::from_secs(1));
+        }
+        // On a port that has come up, it asks again from the start.
+        if follow && (refreshed || now.duration_since(followed) >= FOLLOW_EVERY) {
+            followed = now;
+            if mdns.follow() {
+                (next, delay) = (now, Duration::from_secs(1));
+                asked.clear();
+            }
         }
         if now >= next {
             let asking = mdns.ask(&browse);
@@ -777,10 +859,15 @@ fn read_nmos(shared: &Shared, options: &Options) {
             let notes_before = s.notes.clone();
             s.notes.retain(|k, _| !k.starts_with("nmos "));
             s.notes.extend(notes.into_iter().map(|(url, note)| (format!("nmos {url}"), note)));
+            let answered = match (&options.registry, &registry) {
+                (Some(url), Some(_)) => s.looking.insert("2 registry", format!("the NMOS registry at {url}")).is_none(),
+                _ => false,
+            };
             let changed = s.senders != senders
                 || s.registry != registry
                 || s.peer_to_peer != peer_to_peer
-                || s.notes != notes_before;
+                || s.notes != notes_before
+                || answered;
             (s.senders, s.registry, s.peer_to_peer, s.busy) = (senders, registry, peer_to_peer, false);
             changed
         });
@@ -796,9 +883,10 @@ fn session_name(sdp: &str) -> Option<String> {
 
 /// Puts a stream in the list, or adds how it was found to the one that goes to the same
 /// destinations.
-fn merge(found: &mut Vec<(String, Found)>, key: String, item: Found) {
-    match found.iter_mut().find(|(k, _)| *k == key) {
-        Some((_, f)) => {
+fn merge(found: &mut Vec<(Key, Found)>, key: Key, item: Found) {
+    match found.iter_mut().find(|(k, _)| k.matches(&key)) {
+        Some((k, f)) => {
+            k.fill(&key);
             f.by.extend(item.by);
             f.stale &= item.stale;
             f.active = f.active.or(item.active);
@@ -812,7 +900,7 @@ fn merge(found: &mut Vec<(String, Found)>, key: String, item: Found) {
 
 /// The streams found, in name order.
 fn assemble(state: &State, now: Instant) -> Vec<Found> {
-    let mut found: Vec<(String, Found)> = Vec::new();
+    let mut found: Vec<(Key, Found)> = Vec::new();
     for sender in &state.senders {
         let (sdp, problem) = match &sender.sdp {
             Ok(sdp) => (Some(sdp.clone()), None),
@@ -831,8 +919,17 @@ fn assemble(state: &State, now: Instant) -> Vec<Found> {
             api: sender.api.clone(),
             peer_to_peer: sender.peer_to_peer,
         };
-        let item = Found { name, sdp, streams, active: sender.active, stale: false, problem, by: vec![origin] };
-        let key = item.key().unwrap_or_else(|| format!("nmos {}", sender.id));
+        let item = Found {
+            name,
+            id: String::new(),
+            sdp,
+            streams,
+            active: sender.active,
+            stale: false,
+            problem,
+            by: vec![origin],
+        };
+        let key = item.key().unwrap_or_else(|| Key::Alone(format!("nmos {}", sender.id)));
         merge(&mut found, key, item);
     }
     for (id, session) in state.sap.iter() {
@@ -844,6 +941,7 @@ fn assemble(state: &State, now: Instant) -> Vec<Found> {
         };
         let mut item = Found {
             name: session_name(&session.sdp).unwrap_or_default(),
+            id: String::new(),
             sdp: Some(session.sdp.clone()),
             streams,
             active: None,
@@ -855,11 +953,11 @@ fn assemble(state: &State, now: Instant) -> Vec<Found> {
             item.name =
                 item.destinations().first().cloned().unwrap_or_else(|| format!("announced by {}", session.origin));
         }
-        let key = item.key().unwrap_or_else(|| format!("sap {id}"));
+        let key = item.key().unwrap_or_else(|| Key::Alone(format!("sap {id}")));
         merge(&mut found, key, item);
     }
-    found.sort_by_cached_key(|(key, f)| (f.name.to_lowercase(), key.clone()));
-    found.into_iter().map(|(_, f)| f).collect()
+    found.sort_by_cached_key(|(key, f)| (f.name.to_lowercase(), key.to_string()));
+    found.into_iter().map(|(key, f)| Found { id: key.to_string(), ..f }).collect()
 }
 
 #[cfg(test)]
@@ -899,8 +997,15 @@ mod tests {
             VIDEO.replace("o=- 1 1", "o=- 2 1").replace("239.10.10.1", "239.10.10.9").replace("s=CAM 1 video", "s=-");
         state.sap.heard(&sap::parse(&sap::packet(Ipv4Addr::new(192, 168, 10, 21), &other, false)).unwrap(), now);
         let list = assemble(&state, now + Duration::from_secs(2));
-        let names: Vec<&str> = list.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["239.10.10.9:5004", "5e0d0003", "CAM 1 video"]);
+        let names: Vec<(&str, &str)> = list.iter().map(|f| (f.name.as_str(), f.id.as_str())).collect();
+        assert_eq!(
+            names,
+            [
+                ("239.10.10.9:5004", "239.10.10.9:5004 from 192.168.10.21"),
+                ("5e0d0003", "nmos 5e0d0003"),
+                ("CAM 1 video", "239.10.10.1:5004 from 192.168.10.21")
+            ]
+        );
         let both = &list[2];
         assert_eq!(both.by.len(), 2);
         assert_eq!(both.by[0].describe(), "NMOS Node Camera 1");
@@ -917,5 +1022,23 @@ mod tests {
         // Unheard for long enough, a SAP-only stream goes stale.
         assert!(assemble(&state, now + Duration::from_secs(91))[0].stale);
         assert!(!assemble(&state, now + Duration::from_secs(91))[2].stale, "NMOS still lists it");
+    }
+
+    #[test]
+    fn lists_once_a_stream_whose_announcement_leaves_its_source_out() {
+        let now = Instant::now();
+        let mut state = State { senders: vec![sender("5e0d0001", "CAM 1 video", Ok(VIDEO))], ..State::default() };
+        let unfiltered = VIDEO.replace("a=source-filter: incl IN IP4 239.10.10.1 192.168.10.21\r\n", "");
+        state.sap.heard(&sap::parse(&sap::packet(Ipv4Addr::new(192, 168, 10, 21), &unfiltered, false)).unwrap(), now);
+        let list = assemble(&state, now);
+        let found: Vec<(&str, &str, usize)> =
+            list.iter().map(|f| (f.name.as_str(), f.id.as_str(), f.by.len())).collect();
+        assert_eq!(found, [("CAM 1 video", "239.10.10.1:5004 from 192.168.10.21", 2)]);
+        // A second sender to the group, from a source of its own, is another stream.
+        let other = VIDEO.replace("192.168.10.21", "192.168.10.99");
+        let senders = vec![sender("5e0d0001", "CAM 1 video", Ok(VIDEO)), sender("5e0d0009", "CAM 9 video", Ok(&other))];
+        let list = assemble(&State { senders, ..State::default() }, now);
+        let ids: Vec<&str> = list.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["239.10.10.1:5004 from 192.168.10.21", "239.10.10.1:5004 from 192.168.10.99"]);
     }
 }

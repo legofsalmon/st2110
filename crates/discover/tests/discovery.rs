@@ -364,6 +364,7 @@ fn reads_a_registry_it_is_given_and_notes_one_it_cannot_read() {
     let (discovery, changed) = start(Options { nmos: true, registry: Some(nothing.clone()), ..nowhere() });
     let list = wait_for(&discovery, &changed, |l| !l.notes.is_empty() && !l.busy);
     assert!(list.streams.is_empty());
+    assert!(list.looking.is_empty(), "a registry that has not answered is nowhere it looks: {:?}", list.looking);
     let [note] = &list.notes[..] else { panic!("{:?}", list.notes) };
     assert!(note.starts_with(&format!("Cannot read the NMOS registry at {nothing}: ")), "{note}");
 }

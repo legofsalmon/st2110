@@ -1106,6 +1106,15 @@ fn discover_says_when_it_finds_nothing_or_cannot_look() {
     assert_eq!(held.status.code(), Some(2));
     let text = stdout(&held);
     assert!(text.starts_with(&format!("0 streams found.\nnote: Cannot hear SAP announcements to {sap}: ")), "{text}");
+    // A registry that does not answer is nowhere to look either.
+    let registry = format!("http://127.0.0.1:{}", free_udp_port());
+    let unread = st2110(&["discover", "--no-sap", "--registry", &registry, "--duration", "0.2", "--timeout", "1"]);
+    assert_eq!(unread.status.code(), Some(2));
+    let text = stdout(&unread);
+    assert!(
+        text.starts_with(&format!("0 streams found.\nnote: Cannot read the NMOS registry at {registry}: ")),
+        "{text}"
+    );
     let refused = st2110(&["discover", "--no-sap", "--no-nmos"]);
     assert_eq!(refused.status.code(), Some(2));
     assert!(stderr(&refused).contains("there is nothing to look for"), "{}", stderr(&refused));

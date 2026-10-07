@@ -32,6 +32,10 @@ const FORGET_AFTER: Duration = Duration::from_secs(3600);
 /// own interval counts.
 const ASSUMED_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How many of the gaps between a session's announcements its interval is the longest
+/// of.
+const GAPS_KEPT: usize = 4;
+
 /// A SAP packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
@@ -153,8 +157,14 @@ pub struct Session {
     pub first: Instant,
     /// When it was last heard.
     pub last: Instant,
-    /// How long it was between the last two announcements.
+    /// How long it is between its announcements: the longest of the last few gaps, so
+    /// that a copy heard in a second group or on a second network, a while after the
+    /// first, does not shorten it.
     pub interval: Option<Duration>,
+    /// The last few gaps between its announcements.
+    gaps: Vec<Duration>,
+    /// Whether it was stale when last looked at.
+    marked_stale: bool,
 }
 
 impl Session {
@@ -177,8 +187,8 @@ pub struct Sessions {
 
 impl Sessions {
     /// Takes in a packet heard at `now`: a new session, a new version of one, or the
-    /// deletion of one. Gives whether the sessions changed, not counting when they
-    /// were heard.
+    /// deletion of one. Gives whether the sessions changed, counting a stale one heard
+    /// again but not when each was heard.
     pub fn heard(&mut self, packet: &Packet, now: Instant) -> bool {
         let key = session_id(&packet.payload).unwrap_or_else(|| format!("{} {}", packet.origin, packet.hash));
         if packet.deletion {
@@ -191,10 +201,15 @@ impl Sessions {
                 // The same announcement on another port, or in another group, is not a repeat.
                 let since = now.saturating_duration_since(session.last);
                 if since >= Duration::from_secs(1) {
-                    session.interval = Some(since);
+                    if session.gaps.len() == GAPS_KEPT {
+                        session.gaps.remove(0);
+                    }
+                    session.gaps.push(since);
+                    session.interval = session.gaps.iter().max().copied();
                 }
                 session.last = now;
-                let changed = session.sdp != packet.payload || session.origin != packet.origin;
+                let changed = session.sdp != packet.payload || session.origin != packet.origin || session.marked_stale;
+                session.marked_stale = false;
                 (session.origin, session.hash, session.sdp) = (packet.origin, packet.hash, packet.payload.clone());
                 changed
             }
@@ -206,6 +221,8 @@ impl Sessions {
                     first: now,
                     last: now,
                     interval: None,
+                    gaps: Vec::new(),
+                    marked_stale: false,
                 };
                 self.sessions.insert(key, session);
                 true
@@ -213,12 +230,18 @@ impl Sessions {
         }
     }
 
-    /// Forgets the sessions that have not been announced for too long; gives whether
-    /// any were.
+    /// Forgets the sessions that have not been announced for too long, and marks those
+    /// gone stale; gives whether either changed anything.
     pub fn expire(&mut self, now: Instant) -> bool {
         let before = self.sessions.len();
         self.sessions.retain(|_, s| !s.forgotten(now));
-        self.sessions.len() != before
+        let mut changed = self.sessions.len() != before;
+        for session in self.sessions.values_mut() {
+            let stale = session.stale(now);
+            changed |= stale != session.marked_stale;
+            session.marked_stale = stale;
+        }
+        changed
     }
 
     /// The sessions, keyed by what names each across versions.
@@ -322,7 +345,9 @@ mod tests {
         let newer = STAGEBOX.replace("1311738121 1311738121", "1311738121 1311738122");
         assert!(sessions.heard(&parse(&packet(origin(), &newer, false)).unwrap(), at(60)));
         assert_eq!((sessions.len(), sessions.iter().next().unwrap().1.sdp.as_str()), (1, newer.as_str()));
-        // Forgotten after an hour unheard, as ten intervals are less.
+        // Marked stale after three intervals, and forgotten after an hour unheard, as
+        // ten intervals are less.
+        assert!(!sessions.expire(at(60 + 120)) && sessions.expire(at(60 + 121)));
         assert!(!sessions.expire(at(60 + 3600)));
         assert!(sessions.expire(at(60 + 3601)) && sessions.is_empty());
         // Or deleted, by the deletion of either version.
@@ -331,5 +356,33 @@ mod tests {
         assert!(sessions.is_empty());
         // A deletion that names nothing announced changes nothing.
         assert!(!sessions.heard(&parse(&packet(origin(), STAGEBOX, true)).unwrap(), at(2)));
+    }
+
+    #[test]
+    fn says_when_a_session_goes_stale_and_when_it_is_heard_again() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut sessions = Sessions::default();
+        let announced = parse(&packet(origin(), STAGEBOX, false)).unwrap();
+        sessions.heard(&announced, at(0));
+        assert!(!sessions.expire(at(90)));
+        assert!(sessions.expire(at(91)) && sessions.iter().next().unwrap().1.stale(at(91)));
+        assert!(!sessions.expire(at(92)));
+        assert!(sessions.heard(&announced, at(100)));
+        assert!(!sessions.heard(&announced, at(130)) && !sessions.expire(at(131)));
+    }
+
+    #[test]
+    fn a_second_copy_of_each_announcement_does_not_shorten_the_interval() {
+        let start = Instant::now();
+        let mut sessions = Sessions::default();
+        let announced = parse(&packet(origin(), STAGEBOX, false)).unwrap();
+        // Every 30 s, and a copy from a second network 5 s after each.
+        for s in [0, 5, 30, 35, 60, 65, 90, 95] {
+            sessions.heard(&announced, start + Duration::from_secs(s));
+        }
+        let (_, session) = sessions.iter().next().unwrap();
+        assert_eq!(session.interval, Some(Duration::from_secs(25)));
+        assert!(!session.stale(start + Duration::from_secs(95 + 75)));
     }
 }

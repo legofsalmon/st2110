@@ -25,8 +25,8 @@ pub(crate) struct DiscoverArgs {
     /// Keep looking, and print each stream as it comes, changes and goes, until stopped.
     #[arg(long, conflicts_with_all = ["duration", "save"])]
     watch: bool,
-    /// The address of a network interface to look on; every one that is up when
-    /// omitted. Give it more than once for several.
+    /// The address of a network interface to look on; when omitted, every one that is
+    /// up, and each that comes up. Give it more than once for several.
     #[arg(long, value_name = "ADDRESS")]
     interface: Vec<Ipv4Addr>,
     /// Where to hear SAP announcements: a multicast group or a unicast address, and a
@@ -179,9 +179,13 @@ fn save(directory: &Path, streams: &[Found]) -> io::Result<Vec<PathBuf>> {
     for found in streams {
         let Some(sdp) = &found.sdp else { continue };
         let name = file_name(&found.name);
+        // Compared without case, as the file systems of Macs and Windows compare names.
+        let taken = |path: &PathBuf| {
+            saved.iter().any(|s| s.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase())
+        };
         let path = (1..)
             .map(|n| directory.join(if n == 1 { format!("{name}.sdp") } else { format!("{name} {n}.sdp") }))
-            .find(|path| !saved.contains(path))
+            .find(|path| !taken(path))
             .expect("a free name");
         fs::write(&path, sdp)?;
         saved.push(path);
@@ -243,7 +247,9 @@ fn write_text(
     match (&list.registry, list.peer_to_peer) {
         (Some(registry), _) => writeln!(out, "NMOS Senders read from the registry at {registry}.")?,
         (None, true) => writeln!(out, "NMOS Senders read from {} peer to peer.", plural(nodes, "Node"))?,
-        (None, false) if !args.no_nmos && list.apis.is_empty() => writeln!(out, "No NMOS registry or Node found.")?,
+        (None, false) if !args.no_nmos && args.registry.is_none() && list.apis.is_empty() => {
+            writeln!(out, "No NMOS registry or Node found.")?;
+        }
         (None, false) => {}
     }
     if !list.looking.is_empty() {
@@ -280,8 +286,7 @@ fn watch(discovery: &Discovery, format: Format) -> io::Result<ExitCode> {
                         .streams
                         .iter()
                         .map(|f| {
-                            let key = format!("{} {}", f.name, f.destinations().join(" "));
-                            (key, format!("{}: {} ({})", style.paint("1", &f.name), carries(f), found_by(f)))
+                            (f.id.clone(), format!("{}: {} ({})", style.paint("1", &f.name), carries(f), found_by(f)))
                         })
                         .collect();
                     for (key, line) in &shown {
