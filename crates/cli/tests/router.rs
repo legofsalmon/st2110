@@ -17,9 +17,16 @@ struct Router {
 }
 
 impl Router {
+    /// Without previews, so that the demo sends no streams: only one test at a time
+    /// should, since every demo sends to the same multicast groups.
     fn start() -> Self {
+        Self::with(&["--previews", "0"])
+    }
+
+    fn with(more: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_st2110"))
             .args(["router", "--demo", "--listen", "127.0.0.1:0", "--lead", "0.5"])
+            .args(more)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -38,6 +45,12 @@ impl Router {
 
     /// Sends a request, and returns the status and body.
     fn request(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+        let (status, _, body) = self.bytes(method, path, headers, body);
+        (status, String::from_utf8(body).expect("text"))
+    }
+
+    /// Sends a request, and returns the status, the head and the body.
+    fn bytes(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String, Vec<u8>) {
         let mut stream = TcpStream::connect(&self.address).expect("connects");
         let mut request = format!("{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
         if !headers.iter().any(|(name, _)| *name == "Host") {
@@ -49,11 +62,19 @@ impl Router {
         request.push_str("\r\n");
         request.push_str(body);
         stream.write_all(request.as_bytes()).expect("sends");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("answers");
-        let (head, body) = response.split_once("\r\n\r\n").expect("a response");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("answers");
+        let end = response.windows(4).position(|w| w == b"\r\n\r\n").expect("a response");
+        let head = String::from_utf8(response[..end].to_vec()).expect("a head");
         let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status");
-        (status, body.to_string())
+        (status, head, response[end + 4..].to_vec())
+    }
+
+    fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+        let origin = format!("http://{}", self.address);
+        let headers = [("Content-Type", "application/json"), ("Origin", origin.as_str())];
+        let (status, body) = self.request("POST", path, &headers, &body.to_string());
+        (status, serde_json::from_str(&body).expect("JSON"))
     }
 
     fn get(&self, path: &str) -> Value {
@@ -63,12 +84,16 @@ impl Router {
     }
 
     fn take(&self, routes: Value) -> Value {
-        let body = json!({"routes": routes}).to_string();
-        let origin = format!("http://{}", self.address);
-        let headers = [("Content-Type", "application/json"), ("Origin", origin.as_str())];
-        let (status, body) = self.request("POST", "/api/take", &headers, &body);
+        let (status, body) = self.post("/api/take", &json!({"routes": routes}));
         assert_eq!(status, 200, "{body}");
-        serde_json::from_str(&body).expect("JSON")
+        body
+    }
+
+    /// A Sender's id, by its label.
+    fn sender(&self, label: &str) -> String {
+        let state = self.get("/api/state");
+        let senders = state["senders"].as_array().expect("senders");
+        senders.iter().find(|s| s["label"] == label).expect("a sender")["id"].as_str().unwrap().into()
     }
 
     /// Each Receiver's label, and the label of the Sender it takes now.
@@ -171,7 +196,51 @@ fn refuses_what_a_receiver_cannot_take_and_says_why() {
         id("receivers", "MON 4 video")
     ));
     assert_eq!(why["fits"], false);
-    assert!(why["reason"].as_str().unwrap().contains("frame_height 1080 is not one of 720"), "{why}");
+    assert!(why["reason"].as_str().unwrap().contains("frame_height 270 is not one of 180"), "{why}");
+}
+
+#[test]
+fn previews_the_demo_streams_and_describes_them() {
+    let router = Router::with(&[]);
+    let camera = router.sender("CAM 2 video");
+    let sound = router.sender("CAM 2 audio");
+    let (status, watching) = router.post("/api/watch", &json!({"senders": [camera, sound]}));
+    assert_eq!(status, 200, "{watching}");
+    assert_eq!(watching["refused"], json!({}));
+
+    // The demo sends each camera's stream on this machine, and the router receives it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let live = loop {
+        let live = router.get("/api/live");
+        let pictures = live["senders"][&camera]["pictures"].as_u64().unwrap_or(0);
+        let levels = live["senders"][&sound]["levels"].as_array().map_or(0, Vec::len);
+        if pictures > 0 && levels == 2 {
+            break live;
+        }
+        assert!(std::time::Instant::now() < deadline, "no previews: {live:#}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(live["senders"][&camera]["size"], json!([480, 270]), "{live:#}");
+    // CAM 2 sounds at -12 dBFS.
+    let level = live["senders"][&sound]["levels"][0].as_f64().expect("a level");
+    assert!((level + 12.0).abs() < 0.5, "{level}");
+
+    let (status, head, png) = router.bytes("GET", &format!("/api/preview?sender={camera}"), &[], "");
+    assert_eq!(status, 200);
+    assert!(head.contains("Content-Type: image/png"), "{head}");
+    assert_eq!(&png[1..4], b"PNG");
+
+    let stream = router.get(&format!("/api/stream?sender={camera}"));
+    assert_eq!(stream["device"], "Camera 2");
+    assert_eq!(stream["receivers"], json!(["MON 2 video"]));
+    assert_eq!(stream["streams"].as_array().unwrap().len(), 2, "an ST 2022-7 pair");
+    assert!(stream["sdp"].as_str().unwrap().contains("a=fmtp:96"), "{stream:#}");
+    assert_eq!(router.request("GET", "/api/stream?sender=nobody", &[], "").0, 404);
+
+    // Another site cannot ask for previews.
+    let headers = [("Content-Type", "application/json"), ("Origin", "http://evil.example")];
+    let (status, _) = router.request("POST", "/api/watch", &headers, r#"{"senders": []}"#);
+    assert_eq!(status, 403);
 }
 
 #[test]
