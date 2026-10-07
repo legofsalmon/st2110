@@ -6,6 +6,7 @@ mod connect;
 mod nmos;
 mod pcap;
 mod ptp;
+mod router;
 mod stream;
 mod timing;
 #[cfg(feature = "view")]
@@ -158,6 +159,52 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+    },
+    /// Serve a router panel to use in a browser: a crosspoint grid of which Senders
+    /// each Receiver can take, where a click connects them through IS-05.
+    ///
+    /// TARGET is a registry's Query API URL; --demo serves a facility of cameras and
+    /// monitors instead, to try the panel with no equipment. The page reads the registry
+    /// through this command, and connections are made by it as `st2110 connect` makes
+    /// them: checked against each Receiver's constraints and capabilities first, made
+    /// together as a salvo at one PTP time when several are taken at once, rolled back
+    /// when one fails, and checked on each /active endpoint and in the registry after.
+    /// So devices need not accept requests from a web page, and no video passes through
+    /// the browser. Anyone who can reach --listen can make connections. Runs until
+    /// stopped, and exits with 2 when it cannot start.
+    Router {
+        /// Query API URL, such as http://registry.example:8080.
+        #[arg(required_unless_present = "demo", conflicts_with = "demo")]
+        target: Option<String>,
+        /// Serve a demo facility of four cameras, a graphics machine and four monitors.
+        #[arg(long)]
+        demo: bool,
+        /// The address and port to serve the page on; 0.0.0.0:8110 lets other machines in.
+        #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:8110")]
+        listen: String,
+        /// Open the page in the default browser.
+        #[arg(long)]
+        open: bool,
+        /// Seconds to wait for each response from the registry or a Node.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        timeout: f64,
+        /// Seconds ahead to schedule a salvo, for every Connection API to have its
+        /// request in time.
+        #[arg(long, value_name = "SECONDS", default_value_t = 2.0)]
+        lead: f64,
+        /// Seconds to wait for a Receiver's /active endpoint, and then the registry, to
+        /// show a connection.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        wait: f64,
+        /// TAI − UTC in seconds.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = st2110_ptp::TAI_UTC_2017,
+            allow_negative_numbers = true,
+            value_parser = offset()
+        )]
+        tai_utc: i32,
     },
     /// Decode PTP messages and check them against the ST 2059-2 profile.
     ///
@@ -393,6 +440,9 @@ fn main() -> ExitCode {
                 tai_utc,
             };
             connect::run(&args, format)
+        }
+        Command::Router { target, demo, listen, open, timeout, lead, wait, tai_utc } => {
+            router::run(&router::Args { target, demo, listen, open, timeout, lead, wait, tai_utc })
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
         Command::Pcap { files, sdp, timescale, tai_utc, format, quiet, deny_warnings } => {
