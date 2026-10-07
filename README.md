@@ -281,6 +281,8 @@ It only looks: it answers no queries and registers nothing. It reads IPv4, as ST
 
 To try it on one machine with no ST 2110 equipment, run `python3 scripts/try-discovery.py`. It serves the test facility's Camera 1 as an NMOS Node, advertises it with the system's multicast DNS responder (`dns-sd` on macOS, `avahi-publish` on Linux), sends a tone announced by SAP, and runs `st2110 discover`, which finds Camera 1's two streams and the tone. CI runs it on macOS.
 
+On macOS 15, `st2110` can send to the network only once the terminal app has Local Network access (System Settings, Privacy & Security, Local Network); until then, its sends fail with "No route to host". Sending with `--interface 127.0.0.1` keeps a stream on this Mac and needs no permission.
+
 ## Send and receive streams
 
 ```console

@@ -12,11 +12,13 @@ It stands in for two devices, through the machine's own network services:
   responder, with dns-sd on macOS or avahi-publish on Linux. Nothing registers it
   anywhere, so st2110 reads its two Senders peer to peer;
 - an AES67-style sender: `st2110 send audio --sap`, a tone that it announces by SAP,
-  with a multicast time to live of 1 so that it stays on the local link.
+  on the loopback interface, so that it stays on this machine.
 
 Then it runs `st2110 discover`, which should list Camera 1's two streams and the
 tone. The first run on macOS 15 may ask whether Terminal may find devices on the
-local network: allow it, or nothing arrives.
+local network: allow it. Until then macOS refuses st2110's sends to the network with
+"No route to host". The tone goes over the loopback interface, which needs no
+permission.
 
 Uses nothing but the Python standard library, cargo, and the responder's tool.
 """
@@ -26,6 +28,7 @@ import http.server
 import json
 import os
 import shutil
+import socketserver
 import subprocess
 import sys
 import threading
@@ -66,6 +69,14 @@ def camera_node(host, path):
     return 404, "text/plain", "not found"
 
 
+class NodeServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # http.server looks up this machine's name here, which can take a minute on a Mac
+        # whose name no DNS server knows. Nothing here uses it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+
+
 class NodeApi(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         status, kind, body = camera_node(self.headers.get("Host", "127.0.0.1"), self.path.split("?")[0])
@@ -103,7 +114,7 @@ def main():
         subprocess.run(["cargo", "build", "--release", "--locked", "-p", "st2110-cli"], cwd=ROOT, check=True)
         st2110 = os.path.join(ROOT, "target", "release", "st2110")
 
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), NodeApi)
+    server = NodeServer(("0.0.0.0", 0), NodeApi)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     advertiser = advertise(port)
@@ -115,12 +126,13 @@ def main():
     time.sleep(1)
     print("Sending a tone and announcing it by SAP", flush=True)
     sender = subprocess.Popen(
-        [st2110, "send", "audio", "--to", "239.10.1.2:5004", "--ttl", "1", "--clock", "traceable", "--sap",
-         "--name", TONE, "--duration", str(LOOK + 5)],
+        [st2110, "send", "audio", "--to", "239.10.1.2:5004", "--interface", "127.0.0.1", "--clock", "traceable",
+         "--sap", "--name", TONE, "--duration", str(LOOK + 5)],
         stdout=subprocess.DEVNULL,
     )
     try:
         out, _ = discover.communicate(timeout=LOOK + 30)
+        sent = sender.poll()
     finally:
         for process in (sender, advertiser):
             process.terminate()
@@ -137,6 +149,8 @@ def main():
     missing = sorted(wanted - names)
     if missing:
         print(f"Not found: {', '.join(missing)}")
+        if sent:
+            print(f"The tone's sender stopped with exit code {sent}, saying why above.")
         if args.check:
             print(json.dumps(found, indent=2))
             sys.exit(1)
