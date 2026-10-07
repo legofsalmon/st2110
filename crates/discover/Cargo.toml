@@ -1,0 +1,23 @@
+[package]
+name = "st2110-discover"
+description = "Finds the ST 2110 streams on a network: from SAP announcements, and from NMOS Senders read from registries and Nodes found by DNS-SD"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+st2110-sdp = { workspace = true, features = ["serde"] }
+st2110-nmos = { workspace = true, features = ["client"] }
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+# The machine's ports and their addresses, to join multicast groups on.
+if-addrs = "0.15"
+# Inflates compressed SAP payloads (RFC 2974 §5).
+miniz_oxide = "0.9"
+
+[lints]
+workspace = true

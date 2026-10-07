@@ -1,6 +1,6 @@
 # st2110
 
-Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
+Tools for SMPTE ST 2110 media over IP, written in Rust. There are seven so far:
 
 - an SDP linter, which reads the session description a sender publishes, describes
   each stream in it and checks it against ST 2110 and the documents it builds on;
@@ -10,6 +10,9 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
   or as a salvo that switches at one PTP time, checking each against the Receiver's
   constraints and capabilities first and on the Receiver and in the registry after,
   with a router panel that does the same from a browser;
+- stream discovery, which finds the streams on a network as a monitor does: from the
+  SDP files senders announce by SAP, and from the Senders of the NMOS registries and
+  Nodes it finds by DNS-SD, read peer to peer where there is no registry;
 - PTP tools, which decode IEEE 1588 messages and check them against the ST 2059-2
   profile, and work out from PTP time where frames, RTP timestamps and time code fall
   by ST 2059-1;
@@ -21,7 +24,8 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are six so far:
   Epoch, on one leg or an ST 2022-7 pair, and receive a stream from its SDP file,
   merging the legs, putting the packets back in order and the frames and samples back
   together, and reporting what arrived, or showing the video in a window as it arrives,
-  from the command line or in ST 2110 Viewer, an app for the Mac.
+  from the command line or in ST 2110 Viewer, an app for the Mac that lists the streams
+  discovery finds.
 
 Every finding cites the clause behind it.
 
@@ -33,8 +37,9 @@ Every finding cites the clause behind it.
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 router`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
-| [`crates/viewer`](crates/viewer) (`st2110-viewer`) | ST 2110 Viewer, a desktop app that plays a stream from the network or a capture with what has arrived beside it. Built with egui, and needs Rust 1.95; the rest builds with 1.88. |
+| [`crates/discover`](crates/discover) (`st2110-discover`) | Stream discovery: SAP (RFC 2974) listening and announcing, a DNS-SD browser over multicast and unicast DNS for NMOS registries and Nodes, and the reader that lists their Senders' streams with those SAP announces, each once. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 router`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 discover`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
+| [`crates/viewer`](crates/viewer) (`st2110-viewer`) | ST 2110 Viewer, a desktop app that lists the streams on the network and plays one, or a capture, with what has arrived beside it. Built with egui, and needs Rust 1.95; the rest builds with 1.88. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
 ## Lint an SDP file
@@ -92,7 +97,7 @@ registry: 1 error, 3 warnings, 0 notes
 - `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`.
 - It exits with 0 when nothing is an error, 1 when something is, and 2 when the registry or file cannot be read.
 
-It only reads; `st2110 connect` makes connections. It does not browse DNS-SD for the registry, so give it the URL, and it does not yet send IS-10 access tokens.
+It only reads; `st2110 connect` makes connections. Give it a Node's address, or its Node API URL such as `http://camera.example/x-nmos/node/`, to check that Node alone where there is no registry. It reads the registry it is given, and `st2110 discover` finds registries and Nodes by DNS-SD. It does not yet send IS-10 access tokens.
 
 ## Connect Receivers to Senders
 
@@ -246,6 +251,38 @@ audio 48000 Hz
 - `--non-drop` counts 29.97 time code without dropping frames, and `--tai-utc` changes TAI − UTC from 37 s.
 - The arithmetic is exact: PTP time is kept in integer nanoseconds and rates as ratios, so 1000/1001 rates land on the right nanosecond and RTP timestamps step 1501 and 1502 at 59.94 fps.
 
+## Find the streams on a network
+
+```console
+$ st2110 discover
+CAM 1 audio
+  ST 2110-30, L24 48 kHz, 8 channels (51,ST), 1 ms, level A, 9.22 Mb/s, to 239.10.10.2:5006
+  NMOS Node Camera 1
+CAM 1 video
+  ST 2110-20, 1920x1080 progressive, 50 fps, YCbCr-4:2:2 10-bit, BT709 SDR, 2110GPM, 2110TPN, 2.07 Gb/s, to 239.10.10.1:5004 and 239.20.10.1:5004
+  NMOS Node Camera 1; SAP from 192.168.10.21
+Studio tone
+  ST 2110-30, L24 48 kHz, 2 channels (ST), 1 ms, level A, 2.30 Mb/s, to 239.10.1.2:5004
+  SAP from 192.168.10.50
+
+3 streams found.
+NMOS Senders read from 1 Node peer to peer.
+Looked for 10 s for SAP announcements to 239.255.255.255:9875 and 224.2.127.254:9875; NMOS registries and Nodes by multicast DNS; NMOS registries by DNS-SD in studio.example.
+```
+
+- `st2110 discover` listens for SAP announcements (RFC 2974) to 239.255.255.255 and 224.2.127.254 on port 9875, as AES67 devices make them and `st2110 send --sap` does. Each carries a stream's SDP file. A deletion takes its stream off the list at once; one not heard for three times the interval between its announcements, or 90 s when heard once, is marked as maybe stopped, and one not heard for an hour goes.
+- It browses by multicast DNS for registries' Query APIs (`_nmos-query._tcp`) and Nodes' Node APIs (`_nmos-node._tcp`), and asks the system's DNS servers for Query APIs in its search domains, as IS-04 has controllers do. It shares port 5353 with the system's responder to hear every answer, or asks from a port of its own where it cannot. `--dns-server` and `--domain` choose where to ask by unicast DNS, and `--no-dns` asks nowhere.
+- It reads the Senders from the registry a controller would choose: one that asks for no authorization first, then one in use before one for development (`pri` of 100 or more), the lowest `pri` first, going on to the next when one does not answer. `--registry URL` names one instead. Where no registry answers, it reads each Node it found, peer to peer through its Node API, and again whenever the version counters the Node advertises change.
+- It fetches each RTP Sender's SDP file from its `manifest_href`, as `st2110 nmos` does, but never through a proxy, and reads the registry or the Nodes again every 15 s. A stream that SAP announces and NMOS lists, going to the same addresses from the same sources (where both SDP files name them), is listed once, with both.
+- It looks on every port that is up, and on each one that comes up while it looks, or on those `--interface` names, for `--duration` seconds, 10 by default. Senders announce by SAP every 30 s or so, so give `--duration 35` to hear every one, or `--watch` to keep looking and print each stream as it comes, changes and goes. `--save DIR` writes each stream's SDP file there, named after the stream, to receive, view or check. `--sap`, `--no-sap`, `--no-nmos`, `--mdns` and `--timeout` change where and how it looks, and `--format json` gives everything it found, SDP files included.
+- It exits with 0 when it found a stream, 1 when it found none, and 2 when it could not look, as when another program holds a port alone.
+
+It only looks: it answers no queries and registers nothing. It reads IPv4, as ST 2110 networks are, and cannot read a registry or Node that asks for IS-10 authorization, nor encrypted SAP.
+
+To try it on one machine with no ST 2110 equipment, run `python3 scripts/try-discovery.py`. It serves the test facility's Camera 1 as an NMOS Node, advertises it with the system's multicast DNS responder (`dns-sd` on macOS, `avahi-publish` on Linux), sends a tone announced by SAP, and runs `st2110 discover`, which finds Camera 1's two streams and the tone. CI runs it on macOS.
+
+On macOS 15, `st2110` can send to the network only once the terminal app has Local Network access (System Settings, Privacy & Security, Local Network); until then, its sends fail with "No route to host". Sending with `--interface 127.0.0.1` keeps a stream on this Mac and needs no permission.
+
 ## Send and receive streams
 
 ```console
@@ -268,6 +305,7 @@ bars.sdp: arrived whole
 - Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Unless it says `narrow`, `narrow-linear` or `wide`, that is `wide` below 900 000 packets a second and `narrow-linear` from there, where ST 2110-21 defines no wide sender. Each audio packet goes as its last sample falls due.
 - `--to` gives the destination, a multicast group or a unicast address; give it twice for the two legs of an ST 2022-7 pair, which carry the same packets. `--interface` gives the address to send from, once for every leg or once for each; otherwise the routing table picks. `--ttl` sets the multicast time to live and `--dscp` the DSCP, AF41 by default, as AES67 marks media.
 - It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it.
+- `--sap` announces the stream by SAP as well, as AES67 devices do, for `st2110 discover` and ST 2110 Viewer to find: to 239.255.255.255:9875, or `--sap=ADDRESS:PORT`, as it starts and every 30 s after, withdrawing the announcement when `--duration` ends. A sender stopped with Ctrl-C cannot withdraw it, so listeners mark the stream as maybe stopped 90 s later.
 - It times packets by the system clock, taking TAI to be 37 s ahead of it (`--tai-utc` changes that). On a machine whose clock `phc2sys` keeps to PTP, name the grandmaster with `--clock <grandmaster>:<domain>` or `--clock traceable`, and its streams line up with every other sender's. Otherwise the SDP file names this machine's MAC address as `localmac`, which only Linux can find; elsewhere give `--clock`.
 - `--duration` sends for that many seconds, and without it the sender runs until it is stopped. With `--pcap FILE` it writes the packets into a capture instead, as fast as it can make them, each at the time it would have gone out, on UTC as a capture made with the system clock is. `st2110 pcap` measures such a capture, and `st2110 receive --pcap` reads it.
 - `st2110 receive SDP` joins each leg's group, from the SDP file's source only when it has a source filter, or takes a unicast leg on its address; `--interface` gives the interface. It merges the legs as ST 2022-7 does, passing on the first copy of each packet, puts the packets back in sequence order and the frames or samples back together. When a packet is missing it waits for it, for a copy on a leg that runs behind or one out of order, for up to `--max-skew` milliseconds: 50 by default, as far as ST 2022-7 class B receivers allow the legs to differ, and up to 1000.
@@ -304,14 +342,15 @@ $ st2110 view vizz.sdp
 
 ## ST 2110 Viewer
 
-ST 2110 Viewer is an app for the Mac that plays an ST 2110-20 video stream as it arrives, from the network or from a capture, with what has arrived beside the picture. It receives as `st2110 view` does and counts what `st2110 receive` counts, and it keeps going: open another SDP file, change the port, stop and start.
+ST 2110 Viewer is an app for the Mac that finds the ST 2110 streams on the network and plays an ST 2110-20 video stream as it arrives, from the network or from a capture, with what has arrived beside the picture. It finds streams as `st2110 discover` does, receives as `st2110 view` does and counts what `st2110 receive` counts, and it keeps going: pick another stream, change the port, stop and start.
 
+- **Find a stream.** The list on the left, which Find streams shows and hides, has the streams on the network as `st2110 discover` finds them, kept current: what each carries, where it goes and how it was found. Click one to play it. Those it cannot play, such as ancillary data, are dimmed with the reason, and so are NMOS Senders that are not sending and announcements that have stopped coming. Refresh asks again at once. Save SDP file, beside the picture, keeps the SDP file of a stream found this way.
 - **Open a stream.** Open its SDP file with the button or ⌘O, pick one from Recent, or drop it on the window. Receiving starts at once.
 - **Say where it comes from.** Network receives on the port picked beside it, which the app remembers; Any port lets the system route the stream's addresses. Capture plays a pcap or pcapng file at the pace it was captured, with the open SDP file saying what to look for. Drop an SDP file and a capture together to play them.
 - **Watch it.** The picture fills the window at the stream's shape. Double-click it for full screen, and Escape to leave. When frames stop coming, the picture keeps the last one and says how long it has been.
 - **Read what arrived.** Beside the picture: frames and the incomplete ones, the frame rate, packets and what was lost or came too late, each leg of an ST 2022-7 pair, how far apart the legs arrived and the tightest receiver class that allows it, the latency from RTP timestamps, and for audio the loudest sample on each channel. Problems and notes are the ones `st2110 receive` reports, as they come. The line along the bottom says what receiving is doing.
 
-The first time it receives from the network, macOS 15 asks whether ST 2110 Viewer may find and connect to devices on the local network. Allow it, or nothing arrives; System Settings, Privacy & Security, Local Network changes the answer later.
+The first time it looks for streams or receives one, macOS 15 asks whether ST 2110 Viewer may find and connect to devices on the local network. Allow it, or nothing is found and nothing arrives; System Settings, Privacy & Security, Local Network changes the answer later.
 
 ### Get it
 
@@ -587,7 +626,7 @@ $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md
 
 ## Roadmap
 
-These are the first six steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, the IS-05 controller, and senders and receivers on ordinary sockets. Next, the same senders and receivers on Intel MTL, behind the same interface, for UHD rates and a narrow sender's pace.
+These are the first six steps of the plan in the September 2026 standards review: the SDP model and linter, the read-only NMOS client, PTP decoders with ST 2059-1 arithmetic, the RP 2110-25 capture analyser, the IS-05 controller, and senders and receivers on ordinary sockets, and stream discovery after them. Next, the same senders and receivers on Intel MTL, behind the same interface, for UHD rates and a narrow sender's pace.
 
 None of it has yet met another maker's equipment. [docs/bench.md](docs/bench.md) is the plan for the first bench test, with two Blackmagic converters, a grandmaster and a Mac.
 

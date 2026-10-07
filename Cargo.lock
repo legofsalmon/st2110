@@ -3259,6 +3259,7 @@ dependencies = [
  "serde",
  "serde_json",
  "st2110-connect",
+ "st2110-discover",
  "st2110-media",
  "st2110-nmos",
  "st2110-pcap",
@@ -3276,6 +3277,19 @@ dependencies = [
  "st2110-ptp",
  "st2110-sdp",
  "ureq",
+]
+
+[[package]]
+name = "st2110-discover"
+version = "0.1.0"
+dependencies = [
+ "if-addrs",
+ "miniz_oxide 0.9.1",
+ "serde",
+ "serde_json",
+ "socket2",
+ "st2110-nmos",
+ "st2110-sdp",
 ]
 
 [[package]]
@@ -3336,6 +3350,7 @@ dependencies = [
  "if-addrs",
  "rfd",
  "serde",
+ "st2110-discover",
  "st2110-media",
  "st2110-pcap",
 ]

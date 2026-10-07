@@ -1042,3 +1042,152 @@ fn audio_at_44_1_khz_keeps_whole_samples_a_packet() {
     assert!(packets.as_u64().is_some_and(|p| (100..=101).contains(&p)), "{json}");
     assert_eq!(json["problems"], serde_json::json!([]));
 }
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Waits until a process has bound a UDP port to itself alone.
+fn wait_until_bound(address: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::net::UdpSocket::bind(address).is_ok() {
+        assert!(std::time::Instant::now() < deadline, "nothing bound {address}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn discover_hears_what_send_announces_and_saves_it() {
+    let scratch = Scratch::new("discover");
+    let (sap, to) = (format!("127.0.0.1:{}", free_udp_port()), format!("127.0.0.1:{}", free_udp_port()));
+    let found = scratch.path("found");
+    let discover = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["discover", "--no-nmos", "--sap", &sap, "--duration", "2", "--format", "json", "--save", &found])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    wait_until_bound(&sap);
+    // It sends for longer than discover looks, and withdraws the announcement after.
+    let sap_option = format!("--sap={sap}");
+    let args = ["send", "audio", "--to", &to, "--clock", "traceable", "--duration", "3", &sap_option];
+    let sent = st2110(&[&args[..], &["--name", "Studio tone"]].concat());
+    assert_eq!(sent.status.code(), Some(0), "{}", stderr(&sent));
+    assert!(stderr(&sent).contains(&format!("; announced it by SAP to {sap}, and withdrew it\n")), "{}", stderr(&sent));
+    let output = discover.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}{}", stdout(&output), stderr(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let streams = json["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 1, "{json:#}");
+    assert_eq!(streams[0]["name"], "Studio tone");
+    assert_eq!(streams[0]["sdp"].as_str(), Some(stdout(&sent).as_str()));
+    assert_eq!(streams[0]["streams"][0]["destination"], "127.0.0.1");
+    assert_eq!(
+        streams[0]["by"],
+        serde_json::json!([{"by": "sap", "announcer": "127.0.0.1", "heard_s": streams[0]["by"][0]["heard_s"]}])
+    );
+    assert_eq!(json["looking"], serde_json::json!([format!("SAP announcements to {sap}")]));
+    let saved = format!("{found}/Studio tone.sdp");
+    assert_eq!(json["saved"], serde_json::json!([saved]));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), stdout(&sent));
+    // The file it saved is one to receive or check.
+    assert_eq!(st2110(&["lint", "--quiet", &saved]).status.code(), Some(0));
+}
+
+#[test]
+fn discover_says_when_it_finds_nothing_or_cannot_look() {
+    let sap = format!("127.0.0.1:{}", free_udp_port());
+    let nothing = st2110(&["discover", "--no-nmos", "--sap", &sap, "--duration", "0.2"]);
+    assert_eq!(nothing.status.code(), Some(1));
+    assert_eq!(stdout(&nothing), format!("0 streams found.\nLooked for 0.2 s for SAP announcements to {sap}.\n"));
+    // Another program holds the port alone.
+    let _held = std::net::UdpSocket::bind(&sap).unwrap();
+    let held = st2110(&["discover", "--no-nmos", "--sap", &sap, "--duration", "0.2"]);
+    assert_eq!(held.status.code(), Some(2));
+    let text = stdout(&held);
+    assert!(text.starts_with(&format!("0 streams found.\nnote: Cannot hear SAP announcements to {sap}: ")), "{text}");
+    // A registry that does not answer is nowhere to look either.
+    let registry = format!("http://127.0.0.1:{}", free_udp_port());
+    let unread = st2110(&["discover", "--no-sap", "--registry", &registry, "--duration", "0.2", "--timeout", "1"]);
+    assert_eq!(unread.status.code(), Some(2));
+    let text = stdout(&unread);
+    assert!(
+        text.starts_with(&format!("0 streams found.\nnote: Cannot read the NMOS registry at {registry}: ")),
+        "{text}"
+    );
+    let refused = st2110(&["discover", "--no-sap", "--no-nmos"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(stderr(&refused).contains("there is nothing to look for"), "{}", stderr(&refused));
+    assert_eq!(st2110(&["discover", "--timeout", "0"]).status.code(), Some(2));
+    assert_eq!(st2110(&["discover", "--duration", "-1"]).status.code(), Some(2));
+    assert_eq!(st2110(&["send", "audio", "--to", "127.0.0.1:5004", "--sap=nowhere"]).status.code(), Some(2));
+}
+
+/// An HTTP server on a free port that answers each GET with `route`, given the port and
+/// the request target.
+fn serve(route: impl Fn(u16, &str) -> (u16, String) + Send + 'static) -> u16 {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+            }
+            let (status, body) = route(port, request.split_whitespace().nth(1).unwrap_or("/"));
+            let response =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn nmos_reads_a_node_at_its_address() {
+    let facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    // Camera 1, as its Node API serves it, with its SDP files.
+    let port = serve(move |port, target| {
+        let mut camera = facility.clone();
+        for sender in camera["senders"].as_array_mut().unwrap() {
+            sender["manifest_href"] = format!("http://127.0.0.1:{port}/sdp/{}", sender["id"].as_str().unwrap()).into();
+        }
+        let node = &camera["nodes"][0];
+        let device = &camera["devices"][0];
+        let mine = |collection: &str| -> serde_json::Value {
+            let items = camera[collection].as_array().unwrap();
+            items.iter().filter(|item| item["device_id"] == device["id"]).cloned().collect()
+        };
+        let body = match target {
+            "/x-nmos/node/" => serde_json::json!(["v1.3/"]),
+            "/x-nmos/node/v1.3/self/" => node.clone(),
+            "/x-nmos/node/v1.3/devices/" => serde_json::json!([device]),
+            "/x-nmos/node/v1.3/sources/" => mine("sources"),
+            "/x-nmos/node/v1.3/flows/" => mine("flows"),
+            "/x-nmos/node/v1.3/senders/" => mine("senders"),
+            "/x-nmos/node/v1.3/receivers/" => mine("receivers"),
+            _ => match target.strip_prefix("/sdp/") {
+                Some(id) => return (200, camera["manifests"][id]["sdp"].as_str().unwrap().to_string()),
+                None => return (404, String::new()),
+            },
+        };
+        (200, body.to_string())
+    });
+    for url in [format!("http://127.0.0.1:{port}"), format!("http://127.0.0.1:{port}/x-nmos/node/v1.3/")] {
+        let output = st2110(&["nmos", &url]);
+        assert_eq!(output.status.code(), Some(0), "{url}: {}{}", stdout(&output), stderr(&output));
+        let text = stdout(&output);
+        assert!(text.contains("  1 node, 1 device, 2 sources, 2 flows, 2 senders (2 active), 0 receivers"), "{text}");
+        assert!(text.contains("  \"CAM 1 video\" (5e0d0001) on Camera 1: active, rtp.mcast, video/raw"), "{text}");
+    }
+    // Neither a registry nor a Node: the registry it looked for is named.
+    let output = st2110(&["nmos", &format!("http://127.0.0.1:{port}/elsewhere")]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("/elsewhere/x-nmos/query/"), "{}", stderr(&output));
+}

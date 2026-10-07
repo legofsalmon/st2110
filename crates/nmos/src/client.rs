@@ -1,4 +1,4 @@
-//! Reads a [`Snapshot`] from a registry's IS-04 Query API.
+//! Reads a [`Snapshot`] from a registry's IS-04 Query API, or from one Node's Node API.
 //!
 //! ```no_run
 //! use st2110_nmos::client::{Options, QueryClient};
@@ -99,22 +99,15 @@ enum Page {
     UpTo(String),
 }
 
-/// A client for one registry's Query API.
+/// What the clients share: the HTTP agent, and how they ask.
 #[derive(Clone, Debug)]
-pub struct QueryClient {
+struct Http {
     agent: Agent,
-    base: String,
-    version: String,
     options: Options,
 }
 
-impl QueryClient {
-    /// Connects to a Query API and picks the newest IS-04 version it offers, up to v1.3.
-    ///
-    /// `url` may name the host (`http://registry:8080`), the API's root
-    /// (`…/x-nmos/query/`) or one version of it (`…/x-nmos/query/v1.3/`), which is then
-    /// used as it is.
-    pub fn connect(url: &str, options: &Options) -> Result<Self, Error> {
+impl Http {
+    fn new(options: &Options) -> Self {
         let proxy = if options.env_proxy { ureq::Proxy::try_from_env() } else { None };
         let agent: Agent = Agent::config_builder()
             .timeout_global(Some(options.timeout))
@@ -124,27 +117,32 @@ impl QueryClient {
             .user_agent(concat!("st2110-nmos/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
+        Self { agent, options: options.clone() }
+    }
+
+    /// Finds the API at `url`, which may name the host (`http://registry:8080`), the
+    /// API's root (`…/x-nmos/query/`) or one version of it (`…/x-nmos/query/v1.3/`),
+    /// which is then used as it is. Otherwise picks the newest IS-04 version the API
+    /// offers, up to v1.3. Gives the versioned base URL, ending in `/`, and the version.
+    fn find(&self, url: &str, api: &str, name: &str) -> Result<(String, String), Error> {
         let trimmed = url.trim().trim_end_matches('/');
         let scheme = trimmed.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
         if !matches!(scheme.as_deref(), Some("http" | "https")) {
             return Err(error(url, "not an http:// or https:// URL"));
         }
-        let mut client = Self { agent, base: String::new(), version: String::new(), options: options.clone() };
+        let path = format!("/x-nmos/{api}");
         if let Some((root, version)) = trimmed.rsplit_once('/')
-            && root.ends_with("/x-nmos/query")
+            && root.ends_with(&path)
         {
             if !VERSIONS.contains(&version) {
                 return Err(error(url, format!("{version} is not an IS-04 version this client reads (v1.0 to v1.3)")));
             }
-            client.base = format!("{trimmed}/");
-            client.version = version.to_string();
-            return Ok(client);
+            return Ok((format!("{trimmed}/"), version.to_string()));
         }
-        let root =
-            if trimmed.ends_with("/x-nmos/query") { format!("{trimmed}/") } else { format!("{trimmed}/x-nmos/query/") };
-        let response = client.get(&root, "application/json", BODY_LIMIT)?;
+        let root = if trimmed.ends_with(&path) { format!("{trimmed}/") } else { format!("{trimmed}{path}/") };
+        let response = self.get(&root, "application/json", BODY_LIMIT)?;
         if response.status != 200 {
-            return Err(error(&root, format!("HTTP {}: no IS-04 Query API here", response.status)));
+            return Err(error(&root, format!("HTTP {}: no IS-04 {name} here", response.status)));
         }
         let offered: Vec<String> = serde_json::from_str(&response.body)
             .map_err(|e| error(&root, format!("expected the list of API versions: {e}")))?;
@@ -153,19 +151,7 @@ impl QueryClient {
             .rev()
             .find(|v| offered.iter().any(|o| o.trim_end_matches('/') == **v))
             .ok_or_else(|| error(&root, format!("offers {}, none of v1.0 to v1.3", offered.join(", "))))?;
-        client.base = format!("{root}{version}/");
-        client.version = version.to_string();
-        Ok(client)
-    }
-
-    /// The Query API version in use, such as `v1.3`.
-    pub fn version(&self) -> &str {
-        &self.version
-    }
-
-    /// The versioned base URL, ending in `/`.
-    pub fn base(&self) -> &str {
-        &self.base
+        Ok((format!("{root}{version}/"), version.to_string()))
     }
 
     fn get(&self, url: &str, accept: &str, limit: u64) -> Result<Response, Error> {
@@ -192,6 +178,124 @@ impl QueryClient {
         Ok(Response { status, paged, since, until, body })
     }
 
+    /// Reads a JSON response that must be there: HTTP 200.
+    fn json<T: serde::de::DeserializeOwned>(&self, url: &str, what: &str) -> Result<T, Error> {
+        let response = self.get(url, "application/json", BODY_LIMIT)?;
+        if response.status != 200 {
+            return Err(error(url, format!("HTTP {}", response.status)));
+        }
+        serde_json::from_str(&response.body).map_err(|e| error(url, format!("expected {what}: {e}")))
+    }
+
+    fn manifest(&self, href: &str) -> Manifest {
+        match self.get(href, "application/sdp, text/plain;q=0.9, */*;q=0.8", SDP_LIMIT) {
+            Ok(response) if (200..300).contains(&response.status) => {
+                Manifest { url: href.to_string(), status: Some(response.status), sdp: Some(response.body), error: None }
+            }
+            Ok(response) => Manifest { url: href.to_string(), status: Some(response.status), sdp: None, error: None },
+            Err(e) => Manifest { url: href.to_string(), status: None, sdp: None, error: Some(e.message) },
+        }
+    }
+
+    /// Fetches transport files, several at once, in the order of `urls`.
+    fn fetch(&self, urls: &[&str]) -> Vec<Manifest> {
+        let next = AtomicUsize::new(0);
+        let fetched = Mutex::new(Vec::with_capacity(urls.len()));
+        std::thread::scope(|scope| {
+            for _ in 0..self.options.parallel.clamp(1, urls.len().max(1)) {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(url) = urls.get(i) else { break };
+                        let manifest = self.manifest(url);
+                        fetched.lock().expect("no fetch panics while holding the lock").push((i, manifest));
+                    }
+                });
+            }
+        });
+        let mut fetched = fetched.into_inner().expect("no fetch panics while holding the lock");
+        fetched.sort_unstable_by_key(|(i, _)| *i);
+        fetched.into_iter().map(|(_, manifest)| manifest).collect()
+    }
+
+    /// Reads every resource with `list` and, unless [`Options::fetch_sdp`] is off, each
+    /// RTP Sender's SDP file: from its `manifest_href`, and from its Connection API's
+    /// `/transportfile` too where that is another URL.
+    fn snapshot(
+        &self,
+        base: &str,
+        version: &str,
+        list: impl Fn(Kind) -> Result<Vec<Value>, Error>,
+    ) -> Result<Snapshot, Error> {
+        let mut snapshot = Snapshot {
+            source: Some(base.to_string()),
+            api_version: Some(version.to_string()),
+            nodes: list(Kind::Node)?,
+            devices: list(Kind::Device)?,
+            sources: list(Kind::Source)?,
+            flows: list(Kind::Flow)?,
+            senders: list(Kind::Sender)?,
+            receivers: list(Kind::Receiver)?,
+            ..Snapshot::default()
+        };
+        if self.options.fetch_sdp {
+            let manifests = manifest_urls(&snapshot.senders);
+            let transport_files = transport_file_urls(&snapshot);
+            let urls: Vec<&str> = manifests.iter().chain(&transport_files).map(|(_, url)| url.as_str()).collect();
+            let mut fetched = self.fetch(&urls).into_iter();
+            let split = manifests.len();
+            snapshot.manifests = manifests.into_iter().map(|(id, _)| id).zip(fetched.by_ref().take(split)).collect();
+            snapshot.transport_files = transport_files.into_iter().map(|(id, _)| id).zip(fetched).collect();
+        }
+        Ok(snapshot)
+    }
+}
+
+/// Each RTP Sender with an HTTP(S) `manifest_href`, and that URL.
+fn manifest_urls(senders: &[Value]) -> Vec<(String, String)> {
+    senders
+        .iter()
+        .filter(|s| {
+            s.get("transport").and_then(Value::as_str).is_some_and(|t| t.starts_with("urn:x-nmos:transport:rtp"))
+        })
+        .filter_map(|s| {
+            let id = s.get("id")?.as_str()?;
+            let href = s.get("manifest_href")?.as_str()?;
+            is_http(href).then(|| (id.to_string(), href.to_string()))
+        })
+        .collect()
+}
+
+/// A client for one registry's Query API.
+#[derive(Clone, Debug)]
+pub struct QueryClient {
+    http: Http,
+    base: String,
+    version: String,
+}
+
+impl QueryClient {
+    /// Connects to a Query API and picks the newest IS-04 version it offers, up to v1.3.
+    ///
+    /// `url` may name the host (`http://registry:8080`), the API's root
+    /// (`…/x-nmos/query/`) or one version of it (`…/x-nmos/query/v1.3/`), which is then
+    /// used as it is.
+    pub fn connect(url: &str, options: &Options) -> Result<Self, Error> {
+        let http = Http::new(options);
+        let (base, version) = http.find(url, "query", "Query API")?;
+        Ok(Self { http, base, version })
+    }
+
+    /// The Query API version in use, such as `v1.3`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The versioned base URL, ending in `/`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// Lists every resource of one type, paging through the collection in creation
     /// order. Resources registered at older IS-04 versions are included where the
     /// registry supports downgrade queries.
@@ -215,15 +319,17 @@ impl QueryClient {
             let mut query = Vec::new();
             match &page {
                 Page::First => {}
-                Page::After(since) => query
-                    .push(format!("paging.order=create&paging.since={since}&paging.limit={}", self.options.page_size)),
+                Page::After(since) => query.push(format!(
+                    "paging.order=create&paging.since={since}&paging.limit={}",
+                    self.http.options.page_size
+                )),
                 Page::UpTo(until) => query.push(format!("paging.until={until}")),
             }
             if downgrade {
                 query.push("query.downgrade=v1.0".to_string());
             }
             let url = if query.is_empty() { collection.clone() } else { format!("{collection}?{}", query.join("&")) };
-            let response = self.get(&url, "application/json", BODY_LIMIT)?;
+            let response = self.http.get(&url, "application/json", BODY_LIMIT)?;
             if response.status == 501
                 && resources.is_empty()
                 && let Some(next) = attempts.next()
@@ -273,11 +379,11 @@ impl QueryClient {
         if self.version != "v1.0" {
             url.push_str("?query.downgrade=v1.0");
         }
-        let mut response = self.get(&url, "application/json", BODY_LIMIT)?;
+        let mut response = self.http.get(&url, "application/json", BODY_LIMIT)?;
         // A registry without downgrade queries answers 501, or 400.
         if url != plain && matches!(response.status, 400 | 501) {
             url = plain;
-            response = self.get(&url, "application/json", BODY_LIMIT)?;
+            response = self.http.get(&url, "application/json", BODY_LIMIT)?;
         }
         match response.status {
             200 => serde_json::from_str(&response.body)
@@ -290,75 +396,85 @@ impl QueryClient {
 
     /// Fetches a transport file. Failures are recorded in the result, not returned.
     pub fn manifest(&self, href: &str) -> Manifest {
-        match self.get(href, "application/sdp, text/plain;q=0.9, */*;q=0.8", SDP_LIMIT) {
-            Ok(response) if (200..300).contains(&response.status) => {
-                Manifest { url: href.to_string(), status: Some(response.status), sdp: Some(response.body), error: None }
-            }
-            Ok(response) => Manifest { url: href.to_string(), status: Some(response.status), sdp: None, error: None },
-            Err(e) => Manifest { url: href.to_string(), status: None, sdp: None, error: Some(e.message) },
-        }
+        self.http.manifest(href)
+    }
+
+    /// Fetches transport files, several at once, in the order of `hrefs`.
+    pub fn manifests(&self, hrefs: &[&str]) -> Vec<Manifest> {
+        self.http.fetch(hrefs)
     }
 
     /// Reads every resource and, unless [`Options::fetch_sdp`] is off, each RTP
     /// Sender's SDP file: from its `manifest_href`, and from its Connection API's
     /// `/transportfile` too where that is another URL.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        let mut snapshot = Snapshot {
-            source: Some(self.base.clone()),
-            api_version: Some(self.version.clone()),
-            nodes: self.list(Kind::Node)?,
-            devices: self.list(Kind::Device)?,
-            sources: self.list(Kind::Source)?,
-            flows: self.list(Kind::Flow)?,
-            senders: self.list(Kind::Sender)?,
-            receivers: self.list(Kind::Receiver)?,
-            ..Snapshot::default()
-        };
-        if self.options.fetch_sdp {
-            let manifests = Self::manifest_urls(&snapshot.senders);
-            let transport_files = transport_file_urls(&snapshot);
-            let urls: Vec<&str> = manifests.iter().chain(&transport_files).map(|(_, url)| url.as_str()).collect();
-            let mut fetched = self.fetch(&urls).into_iter();
-            let split = manifests.len();
-            snapshot.manifests = manifests.into_iter().map(|(id, _)| id).zip(fetched.by_ref().take(split)).collect();
-            snapshot.transport_files = transport_files.into_iter().map(|(id, _)| id).zip(fetched).collect();
+        self.http.snapshot(&self.base, &self.version, |kind| self.list(kind))
+    }
+}
+
+/// A client for one Node's Node API, which a controller reads peer to peer where it
+/// finds no registry.
+///
+/// ```no_run
+/// use st2110_nmos::client::{NodeClient, Options};
+///
+/// let node = NodeClient::connect("http://192.168.10.21", &Options::default())?;
+/// let snapshot = node.snapshot()?;
+/// println!("{} senders on {}", snapshot.senders.len(), node.base());
+/// # Ok::<_, st2110_nmos::client::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct NodeClient {
+    http: Http,
+    base: String,
+    version: String,
+}
+
+impl NodeClient {
+    /// Connects to a Node API and picks the newest IS-04 version it offers, up to v1.3.
+    ///
+    /// `url` may name the host (`http://192.168.10.21`), the API's root
+    /// (`…/x-nmos/node/`) or one version of it (`…/x-nmos/node/v1.3/`), which is then
+    /// used as it is.
+    pub fn connect(url: &str, options: &Options) -> Result<Self, Error> {
+        let http = Http::new(options);
+        let (base, version) = http.find(url, "node", "Node API")?;
+        Ok(Self { http, base, version })
+    }
+
+    /// The Node API version in use, such as `v1.3`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The versioned base URL, ending in `/`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Lists the Node's resources of one type: for [`Kind::Node`], the Node itself.
+    pub fn list(&self, kind: Kind) -> Result<Vec<Value>, Error> {
+        if kind == Kind::Node {
+            let url = format!("{}self/", self.base);
+            return self.http.json(&url, "the Node's own resource").map(|node: Value| vec![node]);
         }
-        Ok(snapshot)
+        let url = format!("{}{}/", self.base, kind.plural());
+        self.http.json(&url, &format!("a JSON array of {}", kind.plural()))
     }
 
-    /// Each RTP Sender with an HTTP(S) `manifest_href`, and that URL.
-    fn manifest_urls(senders: &[Value]) -> Vec<(String, String)> {
-        senders
-            .iter()
-            .filter(|s| {
-                s.get("transport").and_then(Value::as_str).is_some_and(|t| t.starts_with("urn:x-nmos:transport:rtp"))
-            })
-            .filter_map(|s| {
-                let id = s.get("id")?.as_str()?;
-                let href = s.get("manifest_href")?.as_str()?;
-                is_http(href).then(|| (id.to_string(), href.to_string()))
-            })
-            .collect()
+    /// Fetches a transport file. Failures are recorded in the result, not returned.
+    pub fn manifest(&self, href: &str) -> Manifest {
+        self.http.manifest(href)
     }
 
-    /// Fetches transport files, several at once, in the order of `urls`.
-    fn fetch(&self, urls: &[&str]) -> Vec<Manifest> {
-        let next = AtomicUsize::new(0);
-        let fetched = Mutex::new(Vec::with_capacity(urls.len()));
-        std::thread::scope(|scope| {
-            for _ in 0..self.options.parallel.clamp(1, urls.len().max(1)) {
-                scope.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(url) = urls.get(i) else { break };
-                        let manifest = self.manifest(url);
-                        fetched.lock().expect("no fetch panics while holding the lock").push((i, manifest));
-                    }
-                });
-            }
-        });
-        let mut fetched = fetched.into_inner().expect("no fetch panics while holding the lock");
-        fetched.sort_unstable_by_key(|(i, _)| *i);
-        fetched.into_iter().map(|(_, manifest)| manifest).collect()
+    /// Fetches transport files, several at once, in the order of `hrefs`.
+    pub fn manifests(&self, hrefs: &[&str]) -> Vec<Manifest> {
+        self.http.fetch(hrefs)
+    }
+
+    /// Reads the Node, its resources and, unless [`Options::fetch_sdp`] is off, each
+    /// RTP Sender's SDP file, as [`QueryClient::snapshot`] reads a registry.
+    pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        self.http.snapshot(&self.base, &self.version, |kind| self.list(kind))
     }
 }

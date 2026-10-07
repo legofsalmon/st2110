@@ -12,8 +12,10 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::health::{self, Doing, Seen, Tone};
+use crate::network::{self, Network};
 use crate::picture::Picture;
-use crate::receiving::{Port, Run, Source, Stream, file_name, ports};
+use crate::receiving::{Origin, Port, Run, Source, Stream, file_name, ports};
+use st2110_discover::Found;
 
 /// How many SDP files the app remembers opening.
 const RECENT: usize = 8;
@@ -29,13 +31,21 @@ const ON_BLACK_WEAK: Color32 = Color32::from_gray(140);
 const AMBER: Color32 = Color32::from_rgb(255, 176, 32);
 
 /// What the app remembers between launches.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     /// The port to receive on, by name, or the one the system picks when `None`.
     pub(crate) port: Option<String>,
     /// SDP files opened, the newest first.
     pub(crate) recent: Vec<PathBuf>,
+    /// Whether to find the streams on the network and list them.
+    pub(crate) find: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { port: None, recent: Vec::new(), find: true }
+    }
 }
 
 impl Settings {
@@ -92,6 +102,8 @@ pub(crate) struct Viewer {
     /// What went wrong last, until something else is started.
     error: Option<String>,
     check: Option<Check>,
+    /// The streams found on the network, while they are listed.
+    network: Option<Network>,
 }
 
 impl Viewer {
@@ -115,6 +127,7 @@ impl Viewer {
             seen: Seen::default(),
             error: None,
             check: start.check,
+            network: None,
         };
         if let Some(sdp) = start.sdp
             && viewer.load(&cc.egui_ctx, &sdp)
@@ -129,16 +142,84 @@ impl Viewer {
     fn load(&mut self, ctx: &egui::Context, path: &Path) -> bool {
         match Stream::open(path) {
             Ok(stream) => {
-                self.halt();
                 self.settings.opened(path);
-                ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — ST 2110 Viewer", stream.name())));
-                self.stream = Some(stream);
+                self.show(ctx, stream);
                 true
             }
             Err(e) => {
                 self.error = Some(e);
                 false
             }
+        }
+    }
+
+    /// Opens a stream found on the network and receives it from the network, or says
+    /// why not and leaves the one open be.
+    fn load_found(&mut self, ctx: &egui::Context, found: &Found) {
+        let Some(sdp) = &found.sdp else {
+            return;
+        };
+        let origin = Origin::Network { name: found.name.clone(), by: network::by(found) };
+        match Stream::read(sdp.clone(), origin) {
+            Ok(stream) => {
+                self.show(ctx, stream);
+                self.from_capture = false;
+                self.start(ctx);
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Puts a stream in place of the one open.
+    fn show(&mut self, ctx: &egui::Context, stream: Stream) {
+        self.halt();
+        ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — ST 2110 Viewer", stream.name())));
+        self.stream = Some(stream);
+    }
+
+    /// Saves the SDP file of the stream open, as found on the network.
+    fn save_sdp(&mut self) {
+        let Some(stream) = &self.stream else {
+            return;
+        };
+        let name: String =
+            stream.name().chars().map(|c| if c.is_alphanumeric() || " ._-()".contains(c) { c } else { '_' }).collect();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save the SDP file")
+            .add_filter("SDP files", &["sdp"])
+            .set_file_name(format!("{}.sdp", name.trim_matches([' ', '.'])));
+        if let Some(folder) = self.settings.recent.first().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        match std::fs::write(&path, &stream.sdp) {
+            Ok(()) => self.settings.opened(&path),
+            Err(e) => self.error = Some(format!("{}: {e}", file_name(&path))),
+        }
+    }
+
+    /// Looks for streams on the network while they are listed, and stops when they are
+    /// not. A test looks for none.
+    fn discover(&mut self, ctx: &egui::Context) {
+        if !self.settings.find || self.check.is_some() {
+            self.network = None;
+            return;
+        }
+        self.network.get_or_insert_with(|| Network::start(ctx)).update();
+        // How long ago each announcement was heard moves on its own.
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// The streams found on the network, to pick one to play.
+    fn network(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let current =
+            self.stream.as_ref().filter(|s| matches!(s.origin, Origin::Network { .. })).map(|s| s.sdp.as_str());
+        let picked = self.network.as_mut().and_then(|network| network.show(ui, current));
+        if let Some(found) = picked {
+            self.load_found(&ctx, &found);
         }
     }
 
@@ -270,6 +351,11 @@ impl Viewer {
     fn bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
+            if self.check.is_none() {
+                ui.toggle_value(&mut self.settings.find, "Find streams")
+                    .on_hover_text("List the streams on the network, announced by SAP or published by NMOS");
+                ui.separator();
+            }
             let open = ui.button("Open SDP file…").on_hover_text(ctx.format_shortcut(&OPEN));
             if open.clicked() {
                 self.pick_sdp(&ctx);
@@ -365,7 +451,11 @@ impl Viewer {
                     true
                 }
                 None if self.stream.is_none() && self.error.is_none() => {
-                    ui.weak("Open an SDP file to watch its stream.");
+                    ui.weak(if self.network.is_some() {
+                        "Pick a stream found on the network, or open an SDP file, to watch it."
+                    } else {
+                        "Open an SDP file to watch its stream."
+                    });
                     true
                 }
                 None => false,
@@ -380,10 +470,11 @@ impl Viewer {
     }
 
     /// The panel beside the picture: the stream, and what has arrived.
-    fn panel(&self, ui: &mut egui::Ui) {
+    fn panel(&mut self, ui: &mut egui::Ui) {
         let Some(stream) = &self.stream else {
             return;
         };
+        let mut save = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(4.0);
             let (name, format) = (stream.name(), stream.format());
@@ -396,6 +487,10 @@ impl Viewer {
             for (i, leg) in legs.iter().enumerate() {
                 let label = if legs.len() > 1 { format!("Leg {}: {leg}", i + 1) } else { leg.to_string() };
                 ui.weak(label);
+            }
+            if let Origin::Network { by, .. } = &stream.origin {
+                ui.weak(format!("Found by {by}"));
+                save = ui.small_button("Save SDP file…").clicked();
             }
             ui.separator();
             egui::Grid::new("arrived").num_columns(2).striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -427,6 +522,9 @@ impl Viewer {
                 }
             }
         });
+        if save {
+            self.save_sdp();
+        }
     }
 
     /// The picture, or what to do to see one, on black.
@@ -440,8 +538,15 @@ impl Viewer {
         let small = FontId::proportional(14.0);
         match (&self.stream, &self.picture) {
             (None, _) => {
-                painter.text(middle - vec2(0.0, 40.0), Align2::CENTER_CENTER, "Open an SDP file", big, ON_BLACK);
-                let hint = "or drop one here. A capture plays with its stream's SDP file: drop both.";
+                let (title, hint) = if self.network.is_some() {
+                    (
+                        "Pick a stream found on the network",
+                        "or open an SDP file, or drop one here, with a capture to play it.",
+                    )
+                } else {
+                    ("Open an SDP file", "or drop one here. A capture plays with its stream's SDP file: drop both.")
+                };
+                painter.text(middle - vec2(0.0, 40.0), Align2::CENTER_CENTER, title, big, ON_BLACK);
                 painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, hint, small, ON_BLACK_WEAK);
                 let button = egui::Rect::from_center_size(middle + vec2(0.0, 24.0), vec2(140.0, 28.0));
                 if ui.put(button, egui::Button::new("Open SDP file…")).clicked() {
@@ -554,6 +659,7 @@ impl eframe::App for Viewer {
             self.pick_sdp(&ctx);
         }
         self.follow(&ctx);
+        self.discover(&ctx);
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if fullscreen && ctx.input(|i| i.key_pressed(Key::Escape)) {
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
@@ -561,6 +667,11 @@ impl eframe::App for Viewer {
         if !fullscreen {
             egui::Panel::top("bar").show(ui, |ui| self.bar(ui));
             egui::Panel::bottom("state").show(ui, |ui| self.state_line(ui));
+            if self.network.is_some() {
+                egui::Panel::left("network").resizable(true).default_size(280.0).min_size(200.0).show(ui, |ui| {
+                    self.network(ui);
+                });
+            }
             if self.stream.is_some() {
                 egui::Panel::right("arrived").resizable(true).default_size(320.0).min_size(220.0).show(ui, |ui| {
                     self.panel(ui);

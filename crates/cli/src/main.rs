@@ -1,8 +1,9 @@
 //! `st2110`: check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet
 //! captures from the command line, connect Receivers to Senders through IS-05, work out
-//! ST 2059-1 timing, and send and receive streams.
+//! ST 2059-1 timing, find the streams on a network, and send and receive streams.
 
 mod connect;
+mod discover;
 mod nmos;
 mod pcap;
 mod ptp;
@@ -26,7 +27,7 @@ use st2110_sdp::{Diagnostic, Report, Rule, Severity, Stream};
 #[command(
     name = "st2110",
     version,
-    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards, connect Receivers to Senders, and send and receive streams"
+    about = "Check SMPTE ST 2110 SDP files, NMOS registries, PTP messages and packet captures against the standards, connect Receivers to Senders, find the streams on a network, and send and receive streams"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -56,11 +57,13 @@ enum Command {
     /// Check an NMOS registry: its resources, PTP clocks, connections and every
     /// Sender's SDP file.
     ///
-    /// TARGET is a registry's Query API URL, or a snapshot saved with --save (`-` reads
-    /// standard input). Exits with 0 when nothing is an error, 1 when something is (or
-    /// is a warning, with --deny-warnings), and 2 when the registry or file cannot be read.
+    /// TARGET is a registry's Query API URL, a Node's Node API URL to check it alone, or
+    /// a snapshot saved with --save (`-` reads standard input). Exits with 0 when nothing
+    /// is an error, 1 when something is (or is a warning, with --deny-warnings), and 2
+    /// when the registry, Node or file cannot be read.
     Nmos {
-        /// Query API URL, such as http://registry.example:8080, or a saved snapshot.
+        /// Query API URL, such as http://registry.example:8080, Node API URL, such as
+        /// http://camera.example/x-nmos/node/, or a saved snapshot.
         target: String,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
@@ -274,6 +277,19 @@ enum Command {
         #[arg(long)]
         deny_warnings: bool,
     },
+    /// Find the ST 2110 streams on the network: from SAP announcements, and from the
+    /// Senders of NMOS registries and Nodes found by DNS-SD.
+    ///
+    /// Listens for SAP announcements to 239.255.255.255 and 224.2.127.254 on port 9875,
+    /// as AES67 devices and `st2110 send --sap` make them. Browses for NMOS registries'
+    /// Query APIs (_nmos-query._tcp) and Nodes' Node APIs (_nmos-node._tcp) by multicast
+    /// DNS on every port that is up, and for registries by unicast DNS in the system's
+    /// search domains, as IS-04 has controllers do; reads the Senders from the registry
+    /// a controller would choose or, where none answers, from each Node peer to peer,
+    /// with each one's SDP file. Lists every stream once, with what it carries, where it
+    /// goes and how it was found. Exits with 0 when it found a stream, 1 when it found
+    /// none, and 2 when it could not look.
+    Discover(discover::DiscoverArgs),
     /// Work out where a PTP time falls, by ST 2059-1: each video frame rate's frame,
     /// RTP timestamps and time code, and each audio rate's RTP timestamp and AES3 block.
     ///
@@ -328,8 +344,10 @@ enum Command {
     /// clock, taken as UTC, with TAI --tai-utc ahead: PTP time when the clock follows
     /// PTP, as phc2sys keeps it. Writes the stream's SDP file to standard output, or to
     /// --sdp, before the first packet. Give --to twice for the two legs of an ST 2022-7
-    /// pair. With --pcap, writes the packets into a capture file at their times instead,
-    /// as fast as it can. Exits with 0 when the stream was sent, and 2 when it cannot be.
+    /// pair. With --sap, announces it by SAP too, for `st2110 discover` and ST 2110
+    /// Viewer to find. With --pcap, writes the packets into a capture file at their times
+    /// instead, as fast as it can. Exits with 0 when the stream was sent, and 2 when it
+    /// cannot be.
     Send {
         #[command(subcommand)]
         signal: stream::Signal,
@@ -462,6 +480,7 @@ fn main() -> ExitCode {
             let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
             timing::run(&args, format)
         }
+        Command::Discover(args) => discover::run(&args),
         Command::Send { signal } => stream::send(&signal),
         Command::Receive(args) => stream::receive(&args),
         #[cfg(feature = "view")]

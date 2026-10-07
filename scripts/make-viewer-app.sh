@@ -91,7 +91,9 @@ cat > "$app/Contents/Info.plist" <<EOF
          person about. Without this key the app is not asked about but refused, and
          the refusal looks like a stream that never arrives. A run from Terminal does
          not show it, because it has Terminal's permission. -->
-    <key>NSLocalNetworkUsageDescription</key><string>ST 2110 Viewer receives video streams that devices send on your local network.</string>
+    <key>NSLocalNetworkUsageDescription</key><string>ST 2110 Viewer finds and receives the video streams that devices send on your local network.</string>
+    <!-- The DNS-SD services it browses for, to find NMOS registries and Nodes. -->
+    <key>NSBonjourServices</key><array><string>_nmos-query._tcp</string><string>_nmos-node._tcp</string></array>
 </dict>
 </plist>
 EOF
