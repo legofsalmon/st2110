@@ -18,9 +18,21 @@ use st2110_media::pixels::Converter;
 use st2110_media::receive::Session;
 use st2110_media::replay::{as_captured, replay};
 
+/// Where a stream's SDP file came from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Origin {
+    /// A file.
+    File(PathBuf),
+    /// The network: a stream found there, by the name the list gives it, and how it was
+    /// found.
+    Network { name: String, by: String },
+}
+
 /// A stream's SDP file, read.
 pub(crate) struct Stream {
-    pub(crate) path: PathBuf,
+    pub(crate) origin: Origin,
+    /// The SDP file, as it was read.
+    pub(crate) sdp: String,
     pub(crate) description: Description,
     /// How the SDP file's legs were read.
     pub(crate) notes: Vec<String>,
@@ -31,23 +43,44 @@ pub(crate) struct Stream {
 impl Stream {
     /// Reads an SDP file, or says why its stream cannot be received.
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let failed = |e: &dyn fmt::Display| format!("{}: {e}", file_name(path));
-        let text = fs::read_to_string(path).map_err(|e| failed(&e))?;
-        let (description, notes) = Description::parse(&text).map_err(|e| failed(&e))?;
-        // What a session would refuse, refused now rather than when receiving starts.
-        Session::new(&description).map_err(|e| failed(&e))?;
-        let video = match &description.media {
-            Media::Video(format) => Some((format.clone(), Converter::new(format).map_err(|e| failed(&e))?)),
-            Media::Audio(_) => None,
-        };
-        Ok(Self { path: path.to_path_buf(), description, notes, video })
+        let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", file_name(path)))?;
+        Self::read(text, Origin::File(path.to_path_buf()))
     }
 
-    /// The stream's name, or its file's when the SDP file gives it none.
+    /// Reads an SDP file's text, or says why its stream cannot be received.
+    pub(crate) fn read(sdp: String, origin: Origin) -> Result<Self, String> {
+        let name = match &origin {
+            Origin::File(path) => file_name(path),
+            Origin::Network { name, .. } => name.clone(),
+        };
+        Self::understand(sdp, origin).map_err(|e| format!("{name}: {e}"))
+    }
+
+    fn understand(sdp: String, origin: Origin) -> Result<Self, String> {
+        let (description, notes) = Description::parse(&sdp)?;
+        // What a session would refuse, refused now rather than when receiving starts.
+        Session::new(&description)?;
+        let video = match &description.media {
+            Media::Video(format) => Some((format.clone(), Converter::new(format)?)),
+            Media::Audio(_) => None,
+        };
+        Ok(Self { origin, sdp, description, notes, video })
+    }
+
+    /// What playing the stream an SDP file describes would show, such as
+    /// `1920x1080p50 YCbCr-4:2:2 10-bit`, or why it cannot be played.
+    pub(crate) fn playable(sdp: &str) -> Result<String, String> {
+        let origin = Origin::Network { name: String::new(), by: String::new() };
+        Self::understand(sdp.to_string(), origin).map(|stream| stream.format())
+    }
+
+    /// The stream's name: as the list of streams found names it, or as its SDP file
+    /// does, or its file's.
     pub(crate) fn name(&self) -> String {
-        match self.description.name.trim() {
-            "" => file_name(&self.path),
-            name => name.to_string(),
+        match (&self.origin, self.description.name.trim()) {
+            (Origin::Network { name, .. }, _) => name.clone(),
+            (Origin::File(path), "") => file_name(path),
+            (Origin::File(_), name) => name.to_string(),
         }
     }
 

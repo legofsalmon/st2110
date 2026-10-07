@@ -156,6 +156,15 @@ fn receiver_endpoint(model: &Model<'_>, receiver: &Receiver<'_>) -> Endpoint {
     }
 }
 
+/// Every Sender with an `id`, as a controller lists them: in label order.
+pub fn senders(snapshot: &Snapshot) -> Vec<Endpoint> {
+    let model = Model::read(snapshot);
+    let mut senders: Vec<Endpoint> =
+        model.senders.iter().filter(|s| s.core.id.is_some()).map(|s| sender_endpoint(&model, s)).collect();
+    senders.sort_by_cached_key(|e| (e.label.to_lowercase(), e.id.clone()));
+    senders
+}
+
 /// Finds the Sender or Receiver that `selector` names: by its `id`, its `label`
 /// (ignoring case), or the start of its `id`, in that order.
 ///

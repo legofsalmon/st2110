@@ -46,6 +46,20 @@ fn finds_by_id_label_or_the_start_of_the_id() {
 }
 
 #[test]
+fn lists_senders_in_label_order() {
+    let snapshot = with(|value| {
+        // A Sender with no id cannot be named, so is not listed.
+        let mut nameless = value["senders"][0].clone();
+        nameless.as_object_mut().unwrap().remove("id");
+        value["senders"].as_array_mut().unwrap().push(nameless);
+    });
+    let senders = routing::senders(&snapshot);
+    let listed: Vec<(&str, &str)> = senders.iter().map(|s| (s.label.as_str(), s.id.as_str())).collect();
+    assert_eq!(listed, [("CAM 1 audio", AUDIO_SENDER), ("CAM 1 video", VIDEO_SENDER)]);
+    assert!(senders.iter().all(|s| s.kind == Kind::Sender && s.node.as_deref() == Some("Camera 1")));
+}
+
+#[test]
 fn says_why_a_name_finds_nothing_or_too_much() {
     let snapshot = with(|_| {});
     let error = |kind, selector| routing::find(&snapshot, kind, selector).unwrap_err();

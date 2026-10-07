@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use st2110_nmos::client::{Options, QueryClient};
+use st2110_nmos::client::{NodeClient, Options, QueryClient};
 use st2110_nmos::{Finding, Report, ResourceRef, Snapshot};
 use st2110_sdp::Severity;
 
@@ -54,7 +54,7 @@ pub(crate) fn run(
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
-/// Reads a snapshot from a registry URL or a saved file.
+/// Reads a snapshot from a registry's or a Node's URL, or a saved file.
 fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
     let lower = target.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -63,8 +63,21 @@ fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
             return Err(format!("--timeout {} is not a number of seconds above 0", fetch.timeout));
         }
         let options = Options { timeout, fetch_sdp: fetch.sdp, ..Options::default() };
-        let client = QueryClient::connect(target, &options).map_err(|e| e.to_string())?;
-        return client.snapshot().map_err(|e| e.to_string());
+        if lower.contains("/x-nmos/node") {
+            let node = NodeClient::connect(target, &options).map_err(|e| e.to_string())?;
+            return node.snapshot().map_err(|e| e.to_string());
+        }
+        return match QueryClient::connect(target, &options) {
+            Ok(client) => client.snapshot().map_err(|e| e.to_string()),
+            // No registry at a bare address: it may be a Node's.
+            Err(e) if !lower.contains("/x-nmos/") && e.message.starts_with("HTTP 404") => {
+                match NodeClient::connect(target, &options) {
+                    Ok(node) => node.snapshot().map_err(|e| e.to_string()),
+                    Err(_) => Err(e.to_string()),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
     }
     let text = read(Path::new(target)).map_err(|e| format!("{target}: {e}"))?;
     Snapshot::from_json(&text).map_err(|e| format!("{target}: not a registry snapshot: {e}"))

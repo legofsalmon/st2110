@@ -175,6 +175,21 @@ tests a converter's Connection API by its URL, and IS-04-02 tests the registry.
 **Keep:** `registry.json`, which holds every Sender's SDP file too. Before it is
 committed, check that its labels and descriptions carry nothing private.
 
+Then see what discovery finds, as ST 2110 Viewer's list does, over 35 seconds so that
+every SAP announcement comes round:
+
+```console
+$ st2110 discover --duration 35 --format json > discover.json
+$ st2110 discover --registry http://10.21.10.100:8010 --duration 35
+```
+
+The first finds whatever the converters advertise by multicast DNS while registered,
+and whatever they announce by SAP; the registry's own advertisement stays inside Docker.
+The second reads the registry by its address, and should list every Sender's stream that
+`registry.json` holds, with each one SAP announces too listed once, not twice.
+
+**Keep:** `discover.json`, which says how the converters can be found without a registry.
+
 ### 4. The SDP files
 
 Write each Sender's SDP file out of the snapshot, named by its label:

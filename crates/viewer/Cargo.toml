@@ -1,6 +1,6 @@
 [package]
 name = "st2110-viewer"
-description = "ST 2110 Viewer: a desktop app that plays an ST 2110-20 video stream as it arrives, with what arrived beside it"
+description = "ST 2110 Viewer: a desktop app that finds the ST 2110 streams on a network and plays one as it arrives, with what arrived beside it"
 version.workspace = true
 edition.workspace = true
 # eframe 0.36 needs it.
@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 st2110-media = { workspace = true, features = ["net"] }
 st2110-pcap.workspace = true
+st2110-discover.workspace = true
 clap.workspace = true
 serde.workspace = true
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "persistence", "wayland", "wgpu", "x11"] }

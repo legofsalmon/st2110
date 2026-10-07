@@ -2,10 +2,12 @@
 //! from the network or from a capture, with what has arrived beside the picture.
 //!
 //! It receives as `st2110 view` does, counts what `st2110 receive` counts, and keeps
-//! going: open an SDP file, or drop one on the window, and pick the port.
+//! going: pick a stream found on the network, as `st2110 discover` finds them, or open
+//! an SDP file or drop one on the window, and pick the port.
 
 mod app;
 mod health;
+mod network;
 mod picture;
 mod receiving;
 

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use st2110_nmos::client::{Options, QueryClient};
+use st2110_nmos::client::{NodeClient, Options, QueryClient};
 use st2110_nmos::{Kind, check};
 
 const FACILITY: &str = include_str!("fixtures/facility.json");
@@ -342,4 +342,76 @@ fn fetches_sdp_files_within_bounds() {
     let huge = client.manifest(&format!("http://127.0.0.1:{port}/huge"));
     assert_eq!(huge.sdp, None);
     assert!(huge.error.is_some_and(|e| e.starts_with("reading the response")));
+}
+
+/// The test facility's Camera 1 as a Node API serves it, its SDP files beside it.
+fn camera_node(port: u16, target: &str) -> Reply {
+    let mut facility: Value = serde_json::from_str(FACILITY).unwrap();
+    let node = facility["nodes"][0].clone();
+    let mine = |collection: &str, key: &str, id: &Value| -> Vec<Value> {
+        let items = facility[collection].as_array().unwrap();
+        items.iter().filter(|item| &item[key] == id).cloned().collect()
+    };
+    let mut devices = mine("devices", "node_id", &node["id"]);
+    devices[0]["controls"][0]["href"] = json!(format!("http://127.0.0.1:{port}/x-nmos/connection/v1.1/"));
+    let device = &devices[0]["id"].clone();
+    let (sources, flows, receivers) = (
+        mine("sources", "device_id", device),
+        mine("flows", "device_id", device),
+        mine("receivers", "device_id", device),
+    );
+    let mut senders = mine("senders", "device_id", device);
+    for sender in &mut senders {
+        let id = sender["id"].as_str().unwrap().to_string();
+        sender["manifest_href"] = json!(format!("http://127.0.0.1:{port}/sdp/{id}"));
+    }
+    let json = |value: Value| (200, String::new(), value.to_string());
+    match target {
+        "/x-nmos/node/" => json(json!(["v1.0/", "v1.1/", "v1.2/", "v1.3/"])),
+        "/x-nmos/node/v1.3/self/" => json(node),
+        "/x-nmos/node/v1.3/devices/" => json(Value::Array(devices)),
+        "/x-nmos/node/v1.3/sources/" => json(Value::Array(sources)),
+        "/x-nmos/node/v1.3/flows/" => json(Value::Array(flows)),
+        "/x-nmos/node/v1.3/senders/" => json(Value::Array(senders)),
+        "/x-nmos/node/v1.3/receivers/" => json(Value::Array(receivers)),
+        _ => {
+            let transport_file = target
+                .strip_prefix("/x-nmos/connection/v1.1/single/senders/")
+                .and_then(|rest| rest.strip_suffix("/transportfile"));
+            match target.strip_prefix("/sdp/").or(transport_file).map(|id| facility["manifests"][id]["sdp"].take()) {
+                Some(Value::String(sdp)) => (200, String::new(), sdp),
+                _ => (404, String::new(), String::new()),
+            }
+        }
+    }
+}
+
+#[test]
+fn reads_a_node() {
+    let (port, requests) = serve(camera_node);
+    let node = NodeClient::connect(&format!("http://127.0.0.1:{port}"), &options()).expect("connects");
+    assert_eq!((node.version(), node.base()), ("v1.3", format!("http://127.0.0.1:{port}/x-nmos/node/v1.3/").as_str()));
+    let snapshot = node.snapshot().expect("reads");
+    assert_eq!(snapshot.source.as_deref(), Some(node.base()));
+    let labels = |list: &[Value]| list.iter().map(|r| r["label"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(labels(&snapshot.nodes), ["Camera 1"]);
+    assert_eq!(labels(&snapshot.devices), ["Camera 1"]);
+    assert_eq!(labels(&snapshot.senders), ["CAM 1 video", "CAM 1 audio"]);
+    assert_eq!((snapshot.flows.len(), snapshot.sources.len(), snapshot.receivers.len()), (2, 2, 0));
+    let facility: Value = serde_json::from_str(FACILITY).unwrap();
+    for id in [VIDEO_SENDER, AUDIO_SENDER] {
+        assert_eq!(snapshot.manifests[id].sdp.as_deref(), facility["manifests"][id]["sdp"].as_str());
+        assert_eq!(snapshot.transport_files[id].sdp, snapshot.manifests[id].sdp);
+    }
+    // Read as a registry is, it passes the same checks.
+    assert_eq!(check(&snapshot).findings.iter().map(|f| f.rule).collect::<Vec<_>>(), Vec::<&str>::new());
+    assert_eq!(requests.lock().unwrap()[0], "/x-nmos/node/");
+
+    let versioned = NodeClient::connect(&format!("http://127.0.0.1:{port}/x-nmos/node/v1.3"), &options()).unwrap();
+    assert_eq!(versioned.base(), node.base());
+    let error = QueryClient::connect(&format!("http://127.0.0.1:{port}"), &options()).unwrap_err();
+    assert!(error.to_string().contains("HTTP 404: no IS-04 Query API here"), "{error}");
+    let unused = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let error = NodeClient::connect(&format!("http://127.0.0.1:{unused}"), &options()).unwrap_err();
+    assert_eq!(error.url, format!("http://127.0.0.1:{unused}/x-nmos/node/"));
 }

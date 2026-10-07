@@ -6,9 +6,13 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
+use st2110_discover::Announcer;
 use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::files::{Capture, UNKNOWN_SOURCE, WavWriter, write_png};
 use st2110_media::format::{AudioFormat, Packing, Range, SenderType, VideoFormat};
@@ -21,6 +25,10 @@ use st2110_media::video::FrameInfo;
 use crate::{Format, Style, read, seconds};
 
 const NANOS: i128 = 1_000_000_000;
+
+/// How often the stream is announced by SAP: as AES67 devices do, rather than the five
+/// minutes RFC 2974 suggests, for listeners to see soon that a sender has stopped.
+const SAP_EVERY: Duration = Duration::from_secs(30);
 
 /// What to send.
 #[derive(Subcommand)]
@@ -151,6 +159,18 @@ pub(crate) struct SendArgs {
     /// Write the SDP file here, rather than to standard output.
     #[arg(long, value_name = "FILE")]
     sdp: Option<PathBuf>,
+    /// Announce the stream by SAP, as AES67 devices do, for `st2110 discover` and ST
+    /// 2110 Viewer to find: to 239.255.255.255:9875, or --sap=ADDRESS:PORT, every 30
+    /// seconds, and withdrawn when --duration ends.
+    #[arg(
+        long,
+        value_name = "ADDRESS:PORT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "239.255.255.255:9875",
+        conflicts_with = "pcap"
+    )]
+    sap: Option<SocketAddrV4>,
     /// Write the packets into a capture file, each stamped with its time, instead of
     /// sending them. Needs --duration.
     #[arg(long, value_name = "FILE", requires = "duration")]
@@ -238,6 +258,37 @@ struct Ready<'a> {
     description: Description,
     sender: Sender,
     transmitter: Option<Transmitter>,
+    /// What announces it by SAP, having announced it once.
+    announcer: Option<Announcer>,
+}
+
+/// Announces a stream by SAP every 30 seconds on a thread of its own, until dropped,
+/// which withdraws the announcement.
+struct Announcing {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Announcing {
+    fn start(announcer: Announcer) -> Self {
+        let (stop, stopped) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(SAP_EVERY) {
+                let _ = announcer.announce();
+            }
+            let _ = announcer.delete();
+        });
+        Self { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for Announcing {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
@@ -291,6 +342,14 @@ fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
     let ssrc = scramble(1) as u32;
     let sender = Sender::new(&description, tone, level, ssrc, scramble(2) as u32)?;
     let sdp = description.sdp(u64::try_from(net::tai_now(0) / NANOS).unwrap_or(0));
+    let announcer = match args.sap {
+        Some(to) => Some(
+            Announcer::new(&sdp, to, interfaces[0], args.ttl)
+                .and_then(|announcer| announcer.announce().map(|()| announcer))
+                .map_err(|e| format!("cannot announce the stream by SAP to {to}: {e}"))?,
+        ),
+        None => None,
+    };
     match &args.sdp {
         Some(path) => fs::write(path, &sdp).map_err(|e| format!("{}: {e}", path.display()))?,
         None => {
@@ -298,7 +357,7 @@ fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
             out.write_all(sdp.as_bytes()).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
         }
     }
-    Ok(Ready { args, description, sender, transmitter })
+    Ok(Ready { args, description, sender, transmitter, announcer })
 }
 
 impl Ready<'_> {
@@ -327,6 +386,7 @@ impl Ready<'_> {
             }
             line
         };
+        let announcing = self.announcer.take().map(Announcing::start);
         match (&args.pcap, self.transmitter.take()) {
             (Some(path), _) => {
                 let file =
@@ -358,6 +418,10 @@ impl Ready<'_> {
                 }
                 if t.refused > 0 {
                     line.push_str(&format!("; the system's buffers had no room for {}", plural(t.refused, "packet")));
+                }
+                if let Some(to) = args.sap {
+                    drop(announcing);
+                    line.push_str(&format!("; announced it by SAP to {to}, and withdrew it"));
                 }
                 eprintln!("st2110: {line}");
             }
