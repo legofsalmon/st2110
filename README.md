@@ -8,7 +8,8 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are seven so far:
   resources, PTP clocks and connections, and every Sender's SDP file;
 - an IS-05 connection controller, which connects Receivers to Senders one at a time
   or as a salvo that switches at one PTP time, checking each against the Receiver's
-  constraints and capabilities first and on the Receiver and in the registry after;
+  constraints and capabilities first and on the Receiver and in the registry after,
+  with a router panel that does the same from a browser;
 - stream discovery, which finds the streams on a network as a monitor does: from the
   SDP files senders announce by SAP, and from the Senders of the NMOS registries and
   Nodes it finds by DNS-SD, read peer to peer where there is no registry;
@@ -37,7 +38,7 @@ Every finding cites the clause behind it.
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
 | [`crates/discover`](crates/discover) (`st2110-discover`) | Stream discovery: SAP (RFC 2974) listening and announcing, a DNS-SD browser over multicast and unicast DNS for NMOS registries and Nodes, and the reader that lists their Senders' streams with those SAP announces, each once. |
-| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 discover`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
+| [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 router`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 discover`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
 | [`crates/viewer`](crates/viewer) (`st2110-viewer`) | ST 2110 Viewer, a desktop app that lists the streams on the network and plays one, or a capture, with what has arrived beside it. Built with egui, and needs Rust 1.95; the rest builds with 1.88. |
 | [`crates/wasm`](crates/wasm) (`st2110-wasm`) | WebAssembly bindings for browsers and Node. |
 
@@ -140,6 +141,27 @@ receiver "MON 1 video" (7ecf0001) ← sender "CAM 1 audio" (5e0d0002): refused
 - It exits with 0 when every connection was made, scheduled or planned, 1 when one was refused, failed or differs, and 2 when the registry or a file cannot be read, or a name finds no Sender or Receiver or more than one.
 
 It connects Receivers only: it does not yet set a unicast Sender's destination or turn Senders on and off. It polls rather than following the Query API's WebSocket subscriptions, and like `st2110 nmos` it does not browse DNS-SD or send IS-10 access tokens.
+
+## Route from a browser
+
+`st2110 router` serves a router panel: a crosspoint grid with a row for each Receiver and a column for each Sender, grouped into video, audio and data levels.
+
+```console
+$ st2110 router http://registry.example:8080 --open
+Router: http://127.0.0.1:8110/
+Registry: http://registry.example:8080
+Ctrl-C stops the router.
+```
+
+- A lit crosspoint is the Sender a Receiver takes now. A plain one can be taken: click it and the Receiver switches at once. A hatched one cannot, by transport, format or BCP-004-01 capabilities, and clicking it says why.
+- In Salvo mode, clicks arm crosspoints (and Off, to disconnect), and Take switches them together at one PTP time, `--lead` seconds ahead. Check only plans and checks them without sending anything.
+- The connections are made by this command, exactly as `st2110 connect` makes them: checked against each Receiver's constraints and capabilities first, rolled back when one fails, and checked on each `/active` endpoint and in the registry after. Each outcome, with its problems and notes, is listed under the grid.
+- Above the grid, a card for each Sender shows its stream live: a picture of video, a meter for each audio channel, and what arrived (bit rate, frame rate, packets lost, the ST 2022-7 class of a pair). It says which Receivers take the Sender. Clicking the card opens the Sender's details: its Flow and Source, every leg of its SDP file with the file's checks, and what this machine receives of it. Each video Receiver's row shows a small picture of what it takes.
+- The previews are received by `st2110 router` itself, from the Senders' SDP files, only while the page is open and shows them, and at most `--previews` at once (8 unless set; `--previews 0` turns them off). Each takes its stream's full bandwidth on this machine's link, whatever the size of its picture, so they start off for a real facility; tick Live previews to turn them on, and `--interface` names the interface to join the multicast groups on. The browser receives only small PNG pictures and numbers.
+- The browser talks only to `st2110 router`, which talks to the registry and the Devices. So Devices need not accept requests from a web page (most refuse them), and no ST 2110 stream reaches the browser.
+- `st2110 router --demo` serves a demo facility instead: an IS-04 registry and each Node's IS-05 Connection API, with four cameras, a graphics machine and four monitors, one of which takes only the graphics machine's smaller picture. The demo sends each Sender's stream from this machine on the loopback interface (small 25 fps pictures, an ST 2022-7 pair for each camera, and a tone at its own level for each camera's sound), so its previews are live on a Mac with no network at all. It is a registry like any other, so `st2110 nmos` and `st2110 connect` work on it too, at `http://127.0.0.1:8110`.
+
+Anyone who can reach the page can make connections. It listens on `127.0.0.1:8110` unless `--listen` says otherwise (`0.0.0.0:8110` lets other machines in), answers only requests addressed to an IP address or `localhost`, and takes connections only from its own page, so another web site cannot make them through a visitor's browser. Like `st2110 connect`, it does not yet send IS-10 access tokens, so it cannot control Devices that require them.
 
 ## Decode PTP messages
 

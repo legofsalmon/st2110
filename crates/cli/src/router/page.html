@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ST 2110 Router</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --dim: #8a93a1;
+  --fit: #222934; --fit-hover: #2f3a49; --live: #22c55e; --live-ink: #06240f;
+  --armed: #f59e0b; --armed-ink: #2a1a00; --bad: #ef4444; --warn: #f59e0b; --ok: #22c55e;
+  --cross: rgba(96, 165, 250, 0.10); --focus: #60a5fa;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --line: #dde1e7; --text: #14181f; --dim: #5d6673;
+    --fit: #e9edf2; --fit-hover: #d6dde7; --live-ink: #ffffff; --armed-ink: #ffffff;
+    --cross: rgba(37, 99, 235, 0.08); --focus: #2563eb;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: 0.01em; }
+.registry { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+.badge { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; background: var(--armed); color: var(--armed-ink); }
+.status { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 16px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: transparent; }
+.seg button[aria-pressed="true"] { background: var(--fit-hover); color: var(--text); }
+button { font: inherit; color: var(--text); background: var(--fit); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+button:hover { background: var(--fit-hover); }
+button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+button.primary { background: var(--armed); color: var(--armed-ink); border-color: transparent; font-weight: 650; }
+button:disabled { opacity: 0.45; cursor: default; }
+label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
+.spacer { flex: 1; }
+.banner { margin: 0 16px 10px; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--bad); color: var(--text); background: rgba(239, 68, 68, 0.12); }
+.info { margin: 0 16px 10px; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); }
+.grid-wrap { margin: 0 16px; overflow: auto; max-height: calc(100vh - 230px); border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+table { border-collapse: separate; border-spacing: 0; }
+th, td { padding: 0; }
+thead th { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); vertical-align: bottom; }
+thead th.corner { left: 0; z-index: 3; text-align: left; padding: 8px 10px; color: var(--dim); font-weight: 500; font-size: 12px; min-width: 180px; }
+th.src { padding: 8px 2px; }
+th.src span { writing-mode: vertical-rl; transform: rotate(180deg); display: block; margin: 0 auto; white-space: nowrap; font-weight: 600; font-size: 12px; }
+th.src small, th.dst small { display: block; color: var(--dim); font-weight: 400; font-size: 11px; }
+th.src small { writing-mode: vertical-rl; transform: rotate(180deg); margin: 0 auto; }
+th.src .stack { display: flex; justify-content: center; gap: 1px; }
+th.dst { position: sticky; left: 0; z-index: 1; background: var(--panel); text-align: left; padding: 4px 10px; border-right: 1px solid var(--line); font-weight: 600; white-space: nowrap; }
+th.group { position: sticky; left: 0; text-align: left; padding: 10px 10px 4px; color: var(--dim); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; background: var(--panel); }
+td.cell { padding: 2px; }
+.cell button { width: 30px; height: 30px; padding: 0; border-radius: 5px; border: 1px solid transparent; background: var(--fit); display: block; }
+.cell button:hover { background: var(--fit-hover); }
+.cell button.live { background: var(--live); color: var(--live-ink); }
+.cell button.live::after { content: "●"; font-size: 12px; }
+.cell button.armed { background: var(--armed); color: var(--armed-ink); }
+.cell button.armed::after { content: "◆"; font-size: 11px; }
+.cell button.unfit { background: repeating-linear-gradient(45deg, transparent 0 4px, var(--line) 4px 6px); cursor: help; }
+.cell button.na { background: transparent; border-color: transparent; cursor: default; visibility: hidden; }
+.cell button.busy { animation: pulse 0.8s ease-in-out infinite alternate; }
+.cell button.off { width: 38px; font-size: 11px; color: var(--dim); }
+.cell button.off.armed { color: var(--armed-ink); }
+.cell button.off.armed::after { content: none; }
+@keyframes pulse { from { background: var(--armed); } to { background: var(--fit); } }
+@media (prefers-reduced-motion: reduce) { .cell button.busy { animation: none; background: var(--armed); } }
+tr.hover th.dst, th.src.hover { color: var(--focus); }
+tr.hover td.cell, td.cell.hover { background: var(--cross); }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 16px; color: var(--dim); font-size: 12px; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 5px; background: var(--fit); }
+.legend i.live { background: var(--live); } .legend i.armed { background: var(--armed); }
+.legend i.unfit { background: repeating-linear-gradient(45deg, transparent 0 3px, var(--dim) 3px 4px); }
+section.log { margin: 4px 16px 24px; }
+section.log h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin: 12px 0 6px; }
+.entry { border-left: 3px solid var(--line); padding: 4px 10px; margin: 6px 0; background: var(--panel); border-radius: 0 6px 6px 0; }
+.entry.ok { border-left-color: var(--ok); } .entry.warn { border-left-color: var(--warn); } .entry.bad { border-left-color: var(--bad); }
+.entry time { color: var(--dim); font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+.entry ul { margin: 2px 0 2px 18px; padding: 0; color: var(--dim); font-size: 12px; }
+.empty { padding: 24px; color: var(--dim); }
+section.sources { margin: 0 16px 12px; }
+.sources-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 6px; }
+.sources-head h2, section.details h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin: 0; }
+.sources-head small { color: var(--dim); font-size: 12px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.card { display: block; width: 100%; text-align: left; padding: 0; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.card:hover { background: var(--panel); border-color: var(--focus); }
+.card.open { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
+.screen { position: relative; aspect-ratio: 16 / 9; background: #000; display: flex; align-items: center; justify-content: center; color: #9aa3b0; font-size: 11px; text-align: center; padding: 0; }
+.screen img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.screen .note { padding: 6px; }
+.meters { position: absolute; inset: 10px 14px; display: flex; gap: 6px; align-items: stretch; }
+.meter { flex: 1; position: relative; background: linear-gradient(to top, #22c55e 0 70%, #eab308 70% 85%, #ef4444 85%); border-radius: 3px; overflow: hidden; }
+.meter i { position: absolute; left: 0; right: 0; top: 0; height: 100%; background: #1d232b; }
+.meter span { position: absolute; left: 0; right: 0; bottom: 2px; text-align: center; font-size: 10px; color: #fff; text-shadow: 0 0 2px #000; font-variant-numeric: tabular-nums; }
+.tally { margin-left: auto; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--bad); color: #fff; }
+.card.routed .screen { box-shadow: inset 0 0 0 2px var(--bad); }
+.card .meta { padding: 6px 8px 8px; }
+.card .title { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.card .title .dot { flex: none; }
+.card .line { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.dot.warn { background: var(--warn); }
+th.dst img.thumb { display: block; width: 64px; height: 36px; object-fit: contain; background: #000; border-radius: 3px; margin: 2px 0; }
+section.details { margin: 0 16px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.details-head { display: flex; align-items: center; gap: 10px; }
+section.details .details-head h2 { color: var(--text); font-size: 15px; }
+.details-head .spacer { flex: 1; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; font-size: 12px; }
+.facts dt { color: var(--dim); } .facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+section.details h3 { font-size: 12px; color: var(--dim); font-weight: 600; margin: 12px 0 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.chips span { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--fit); font-family: ui-monospace, Menlo, monospace; }
+section.details ul { margin: 2px 0 2px 18px; padding: 0; font-size: 12px; }
+li.problem { color: var(--bad); } li.warning { color: var(--warn); }
+pre.sdp { font: 11px/1.45 ui-monospace, Menlo, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; overflow: auto; max-height: 260px; }
+details summary { cursor: pointer; color: var(--dim); font-size: 12px; margin-top: 8px; }
+@media (max-width: 600px) { .status { margin-left: 0; width: 100%; } .grid-wrap { max-height: none; } thead th.corner { min-width: 120px; } th.dst { white-space: normal; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>ST 2110 Router</h1>
+  <span id="demo" class="badge" hidden>DEMO</span>
+  <span id="registry" class="registry"></span>
+  <span class="status"><span id="dot" class="dot"></span><span id="read">Reading the registry…</span></span>
+</header>
+<div class="toolbar">
+  <div class="seg" role="group" aria-label="Level" id="levels"></div>
+  <div class="seg" role="group" aria-label="Mode">
+    <button id="mode-take" aria-pressed="true" title="Each click connects at once">Take on click</button>
+    <button id="mode-salvo" aria-pressed="false" title="Arm several crosspoints, then take them together at one PTP time">Salvo</button>
+  </div>
+  <button id="fire" class="primary" hidden>Take</button>
+  <button id="clear" hidden>Clear</button>
+  <label class="check"><input type="checkbox" id="dry"> Check only</label>
+  <label class="check" title="Receive each source's stream on this machine to show its picture or sound"><input type="checkbox" id="live"> Live previews</label>
+  <span class="spacer"></span>
+  <button id="refresh" title="Read the registry again">Refresh</button>
+</div>
+<div id="banner" class="banner" hidden></div>
+<div id="info" class="info" hidden></div>
+<section class="sources" aria-label="Sources">
+  <div class="sources-head"><h2>Sources</h2><small id="sources-note"></small></div>
+  <div id="cards" class="cards"></div>
+</section>
+<section id="details" class="details" hidden aria-live="polite"></section>
+<div class="grid-wrap"><div id="grid" class="empty">Reading the registry…</div></div>
+<div class="legend">
+  <span><i class="live"></i>taking now</span>
+  <span><i></i>can take</span>
+  <span><i class="unfit"></i>cannot take (click for why)</span>
+  <span><i class="armed"></i>armed for the salvo</span>
+</div>
+<section class="log" aria-live="polite">
+  <h2>Connections</h2>
+  <div id="log"><div class="empty">Nothing switched yet.</div></div>
+</section>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (key === "text") node.textContent = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) if (child != null) node.append(child);
+  return node;
+};
+
+let state = null;          // the registry, as /api/state last answered
+let level = "all";         // the format shown, or every one
+let salvo = false;         // whether clicks arm crosspoints rather than take them
+const armed = new Map();   // receiver id -> sender id, or null to disconnect
+const busy = new Set();    // receiver ids being switched
+let reading = false;
+let taking = false;
+
+async function call(url, options) {
+  const response = await fetch(url, options);
+  let body = null;
+  try { body = await response.json(); } catch (_) { /* not JSON */ }
+  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  return body;
+}
+
+async function read() {
+  if (reading || taking) return;
+  reading = true;
+  try {
+    state = await call("/api/state");
+    if (live === null) setLive(remembered() ?? (state.demo && state.previews > 0));
+    $("dot").className = "dot ok";
+    $("read").textContent = `Read at ${new Date(state.read_at).toLocaleTimeString()}`;
+    $("banner").hidden = true;
+    render();
+  } catch (e) {
+    $("dot").className = "dot bad";
+    $("read").textContent = "Registry unreachable";
+    $("banner").textContent = e.message;
+    $("banner").hidden = false;
+  } finally {
+    reading = false;
+  }
+}
+
+function formats() {
+  const seen = new Set();
+  for (const r of state.receivers) if (r.format) seen.add(r.format);
+  const order = ["video", "audio", "data", "mux"];
+  return [...seen].sort((a, b) => (order.indexOf(a) + 1 || 9) - (order.indexOf(b) + 1 || 9) || a.localeCompare(b));
+}
+
+function renderLevels() {
+  const box = $("levels");
+  box.replaceChildren();
+  const all = ["all", ...formats()];
+  if (!all.includes(level)) level = "all";
+  for (const name of all) {
+    box.append(el("button", {
+      "aria-pressed": String(name === level),
+      text: name === "all" ? "All" : name[0].toUpperCase() + name.slice(1),
+      onclick: () => { level = name; render(); },
+    }));
+  }
+}
+
+function name(resource) {
+  return resource.label || resource.id.slice(0, 8);
+}
+
+function render() {
+  if (!state) return;
+  $("registry").textContent = state.registry;
+  $("demo").hidden = !state.demo;
+  renderLevels();
+  const shown = (format) => level === "all" || format === level;
+  // Grouped by format, video first, and in label order within each, as the registry lists them.
+  const rank = (format) => { const i = formats().indexOf(format); return i < 0 ? 99 : i; };
+  const byFormat = (a, b) => rank(a.format) - rank(b.format);
+  const columns = state.senders.map((s, i) => ({ ...s, i })).filter((s) => shown(s.format)).sort(byFormat);
+  const rows = state.receivers.filter((r) => shown(r.format)).sort(byFormat);
+  renderSources(columns);
+  if (!rows.length) {
+    $("grid").className = "empty";
+    $("grid").textContent = state.receivers.length ? "No receivers at this level." : "No receivers are registered.";
+    return;
+  }
+  const head = el("tr", {}, el("th", { class: "corner", text: `${rows.length} receivers × ${columns.length} senders` }));
+  columns.forEach((s, c) => {
+    const where = s.device && s.device !== s.label ? s.device : "";
+    head.append(el("th", { class: "src", "data-col": c, title: `${name(s)}${where ? " (" + where + ")" : ""}\n${s.id}` },
+      el("div", { class: "stack" }, el("span", { text: name(s) }), where ? el("small", { text: where }) : null)));
+  });
+  head.append(el("th", { class: "src" }, el("div", { class: "stack" }, el("span", { text: "Off" }))));
+  const body = el("tbody");
+  let group = null;
+  for (const r of rows) {
+    if (level === "all" && r.format !== group) {
+      group = r.format;
+      body.append(el("tr", {}, el("th", { class: "group", colspan: String(columns.length + 2), text: group || "other" })));
+    }
+    const fits = new Set(r.fits);
+    const where = r.device && r.device !== r.label ? r.device : "";
+    const thumb = live && r.format === "video" && r.active && r.sender_id
+      ? el("img", { class: "thumb", alt: "", "data-thumb": r.sender_id }) : null;
+    const tr = el("tr", {}, el("th", { class: "dst", title: r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
+    columns.forEach((s, c) => {
+      let kind = "fit", label = `Connect ${name(r)} to ${name(s)}`;
+      if (r.current === s.i) { kind = "live"; label = `${name(r)} is taking ${name(s)}`; }
+      else if (s.format && r.format && s.format !== r.format) { kind = "na"; label = ""; }
+      else if (!fits.has(s.i)) { kind = "unfit"; label = `${name(r)} cannot take ${name(s)}: click for why`; }
+      const classes = [kind];
+      if (armed.has(r.id) && armed.get(r.id) === s.id) classes.push("armed");
+      if (busy.has(r.id) && (armed.get(r.id) === s.id || pendingTake.get(r.id) === s.id)) classes.push("busy");
+      const button = el("button", {
+        class: classes.join(" "), "aria-label": label, title: label,
+        onclick: () => click(r, s, kind),
+      });
+      if (kind === "na") button.tabIndex = -1;
+      tr.append(el("td", { class: "cell", "data-col": c }, button));
+    });
+    const takes = r.active && r.sender_id;
+    const offArmed = armed.has(r.id) && armed.get(r.id) === null;
+    const off = el("button", {
+      class: "off" + (offArmed ? " armed" : "") + (busy.has(r.id) && pendingTake.get(r.id) === null ? " busy" : ""),
+      text: "off", title: takes ? `Disconnect ${name(r)}` : `${name(r)} is not taking a stream`,
+      "aria-label": `Disconnect ${name(r)}`,
+      onclick: () => click(r, null, takes ? "fit" : "idle"),
+    });
+    if (!takes && !offArmed) off.disabled = true;
+    tr.append(el("td", { class: "cell" }, off));
+    if (r.active && r.sender_id && r.current == null) {
+      tr.firstChild.append(el("small", { text: `taking unregistered sender ${r.sender_id.slice(0, 8)}` }));
+    }
+    body.append(tr);
+  }
+  const table = el("table", {}, el("thead", {}, head), body);
+  table.addEventListener("mouseover", (e) => crosshair(e.target.closest("td.cell, th.src"), table));
+  table.addEventListener("mouseleave", () => crosshair(null, table));
+  $("grid").className = "";
+  $("grid").replaceChildren(table);
+  renderSalvo();
+  showLive();
+}
+
+function crosshair(cell, table) {
+  for (const node of table.querySelectorAll(".hover")) node.classList.remove("hover");
+  if (!cell) return;
+  const col = cell.getAttribute("data-col");
+  if (cell.tagName === "TD") cell.parentElement.classList.add("hover");
+  if (col != null) for (const node of table.querySelectorAll(`[data-col="${col}"]`)) node.classList.add("hover");
+}
+
+const pendingTake = new Map();
+
+async function click(receiver, sender, kind) {
+  if (kind === "na" || kind === "idle" && !salvo) return;
+  if (kind === "unfit") return explain(receiver, sender);
+  $("info").hidden = true;
+  if (kind === "live" && !salvo) return;
+  const senderId = sender ? sender.id : null;
+  if (salvo) {
+    if (armed.has(receiver.id) && armed.get(receiver.id) === senderId) armed.delete(receiver.id);
+    else if (kind === "live") armed.delete(receiver.id);
+    else armed.set(receiver.id, senderId);
+    render();
+    return;
+  }
+  await take([{ receiver: receiver.id, sender: senderId }]);
+}
+
+async function explain(receiver, sender) {
+  const info = $("info");
+  info.hidden = false;
+  info.textContent = `Checking why ${name(receiver)} cannot take ${name(sender)}…`;
+  try {
+    const why = await call(`/api/why?sender=${encodeURIComponent(sender.id)}&receiver=${encodeURIComponent(receiver.id)}`);
+    info.textContent = why.fits ? `${name(receiver)} can take ${name(sender)} now.` : `${name(receiver)} cannot take ${name(sender)}: ${why.reason}`;
+  } catch (e) {
+    info.textContent = e.message;
+  }
+}
+
+async function take(routes) {
+  if (taking) return;
+  taking = true;
+  for (const route of routes) { busy.add(route.receiver); pendingTake.set(route.receiver, route.sender); }
+  render();
+  try {
+    const outcome = await call("/api/take", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ routes, dry_run: $("dry").checked }),
+    });
+    log(outcome);
+    if (outcome.succeeded && !$("dry").checked) for (const route of routes) armed.delete(route.receiver);
+  } catch (e) {
+    logError(e.message);
+  } finally {
+    for (const route of routes) { busy.delete(route.receiver); pendingTake.delete(route.receiver); }
+    taking = false;
+    await read();
+    render();
+  }
+}
+
+function renderSalvo() {
+  $("mode-take").setAttribute("aria-pressed", String(!salvo));
+  $("mode-salvo").setAttribute("aria-pressed", String(salvo));
+  $("fire").hidden = !salvo;
+  $("clear").hidden = !salvo;
+  $("fire").disabled = !armed.size || taking;
+  $("clear").disabled = !armed.size;
+  const lead = state ? state.lead : 2;
+  $("fire").textContent = armed.size > 1 ? `Take ${armed.size} together` : `Take ${armed.size || ""}`.trim();
+  $("fire").title = armed.size > 1 ? `They switch together at one PTP time, ${lead} s after they are sent` : "";
+}
+
+function stamp() {
+  return el("time", { text: new Date().toLocaleTimeString() });
+}
+
+function clearEmpty() {
+  const empty = $("log").querySelector(".empty");
+  if (empty) empty.remove();
+}
+
+function log(outcome) {
+  clearEmpty();
+  const dry = $("dry").checked;
+  for (const c of [...outcome.connections].reverse()) {
+    const good = ["done", "scheduled", "planned"].includes(c.state);
+    const soft = ["held", "rolled-back"].includes(c.state);
+    const entry = el("div", { class: "entry " + (good ? "ok" : soft ? "warn" : "bad") }, stamp(), (dry ? "Check only: " : "") + c.describe);
+    const details = [...c.problems.map((t) => "problem: " + t), ...c.warnings.map((t) => "warning: " + t), ...c.notes.map((t) => "note: " + t)];
+    if (details.length) entry.append(el("ul", {}, ...details.map((t) => el("li", { text: t }))));
+    $("log").prepend(entry);
+  }
+}
+
+function logError(message) {
+  clearEmpty();
+  $("log").prepend(el("div", { class: "entry bad" }, stamp(), message));
+}
+
+// Live previews: the router receives the streams of the sources on show and the page
+// shows what arrived. They start on with the demo; on a real network each stream takes
+// its full bandwidth on this machine's link, so they wait to be turned on.
+let live = null;          // whether previews are on; null until the registry is first read
+let liveStatus = {};      // sender id -> what has arrived of its stream
+let refused = {};         // sender id -> why its stream is not being received
+let watched = [];         // sender ids asked for
+let opened = null;        // the sender whose details are open
+const cards = new Map();  // sender id -> its card
+
+function remembered() {
+  try { const v = localStorage.getItem("st2110-router-live"); return v === null ? null : v === "1"; } catch (_) { return null; }
+}
+
+function setLive(on) {
+  live = Boolean(on) && !!state && state.previews > 0;
+  $("live").checked = live;
+  $("live").disabled = !!state && state.previews === 0;
+  if (!live) { liveStatus = {}; refused = {}; watched = []; }
+  render();
+  if (live) watch();
+}
+
+function routedTo(sender) {
+  return state.receivers.filter((r) => r.active && r.sender_id === sender.id).map(name);
+}
+
+function renderSources(columns) {
+  const box = $("cards");
+  const wanted = columns.map((s) => s.id);
+  for (const id of [...cards.keys()]) if (!wanted.includes(id)) cards.delete(id);
+  box.replaceChildren(...columns.map((s) => {
+    let node = cards.get(s.id);
+    if (!node) {
+      node = el("button", { class: "card", "data-sender": s.id, onclick: () => openDetails(s.id) },
+        el("div", { class: "screen" }),
+        el("div", { class: "meta" },
+          el("div", { class: "title" }, el("span", { class: "dot" }), el("span", { class: "name" })),
+          el("div", { class: "line where" }), el("div", { class: "line format" }), el("div", { class: "line stats" })));
+      cards.set(s.id, node);
+    }
+    node.sender = s;
+    return node;
+  }));
+  if (!columns.length) box.replaceChildren(el("div", { class: "empty", text: "No senders at this level." }));
+}
+
+function fmt(n, digits = 1) { return Number.isFinite(n) ? n.toFixed(digits) : "–"; }
+
+function db(level) { return level == null ? "−∞" : fmt(level, 0); }
+
+function statsLine(report) {
+  if (!report) return "";
+  const parts = [`${fmt(report.megabits_per_second)} Mb/s`];
+  if (report.video) parts.push(`${fmt(report.video.frame_rate)} fps`);
+  parts.push(`${report.lost} lost`);
+  if (report.class) parts.push(`2022-7 class ${report.class}`);
+  return parts.join(" · ");
+}
+
+function screenFor(screen, s, st) {
+  const note = (text) => screen.replaceChildren(el("span", { class: "note", text }));
+  if (!live) return note(state && state.previews === 0 ? "Previews are off (--previews 0)" : "Previews off");
+  if (refused[s.id]) return note(refused[s.id]);
+  if (!watched.includes(s.id)) return note(`Not previewed: at most ${state.previews} at once`);
+  if (st && st.error) return note(st.error);
+  if (s.format === "video") {
+    if (!st || !st.pictures) return note("Waiting for the stream…");
+    const src = `/api/preview?sender=${encodeURIComponent(s.id)}&n=${st.pictures}`;
+    let img = screen.querySelector("img");
+    if (!img) { img = el("img", { alt: `${name(s)}, live` }); screen.replaceChildren(img); }
+    if (img.getAttribute("src") !== src) img.src = src;
+    return;
+  }
+  if (s.format === "audio") {
+    if (!st || !st.report) return note("Waiting for the stream…");
+    let meters = screen.querySelector(".meters");
+    if (!meters || meters.childElementCount !== st.levels.length) {
+      meters = el("div", { class: "meters", role: "img" }, ...st.levels.map(() => el("div", { class: "meter" }, el("i"), el("span"))));
+      screen.replaceChildren(meters);
+    }
+    meters.setAttribute("aria-label", `Levels ${st.levels.map(db).join(", ")} dBFS`);
+    st.levels.forEach((level, i) => {
+      const meter = meters.children[i];
+      // −60 dBFS at the bottom, full scale at the top; the cover hides what is above the level.
+      const height = level == null ? 0 : Math.max(0, Math.min(1, (level + 60) / 60));
+      meter.firstChild.style.height = `${((1 - height) * 100).toFixed(1)}%`;
+      meter.lastChild.textContent = db(level);
+    });
+    return;
+  }
+  note("No preview for this format");
+}
+
+function showLive() {
+  if (!state) return;
+  for (const node of cards.values()) {
+    const s = node.sender;
+    const st = liveStatus[s.id];
+    const to = routedTo(s);
+    node.classList.toggle("open", opened === s.id);
+    node.querySelector(".name").textContent = name(s);
+    node.title = `${name(s)}: click for details`;
+    node.querySelector(".where").textContent = to.length ? `to ${to.join(", ")}` : `${s.device || ""}${s.device ? " · " : ""}not routed`;
+    node.querySelector(".format").textContent = (st && st.report && st.report.stream) || s.summary || s.format || "";
+    node.querySelector(".stats").textContent = live && st ? statsLine(st.report) : "";
+    const dot = node.querySelector(".dot");
+    const problems = st && st.report ? st.report.problems.length : 0;
+    dot.className = "dot" + (!live || !st ? "" : st.error ? " bad" : problems ? " warn" : st.report ? " ok" : "");
+    screenFor(node.querySelector(".screen"), s, st);
+    node.classList.toggle("routed", to.length > 0);
+    const title = node.querySelector(".title");
+    const tally = title.querySelector(".tally");
+    if (to.length && !tally) title.append(el("span", { class: "tally", text: "ROUTED" }));
+    else if (!to.length && tally) tally.remove();
+  }
+  for (const img of document.querySelectorAll("img[data-thumb]")) {
+    const id = img.getAttribute("data-thumb");
+    const st = liveStatus[id];
+    if (st && st.pictures) {
+      const src = `/api/preview?sender=${encodeURIComponent(id)}&n=${st.pictures}`;
+      if (img.getAttribute("src") !== src) img.src = src;
+    }
+  }
+  const shown = cards.size;
+  $("sources-note").textContent = !live ? "" : shown > state.previews
+    ? `previewing ${Math.min(shown, state.previews)} of ${shown}, at most ${state.previews} at once`
+    : `previewing ${shown}, received on this machine`;
+  if (opened) showDetailsLive();
+}
+
+async function watch() {
+  if (!live || document.hidden || !state) return;
+  watched = [...cards.keys()].slice(0, state.previews);
+  try {
+    const answer = await call("/api/watch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ senders: watched }),
+    });
+    refused = answer.refused || {};
+    liveStatus = answer.senders || {};
+    showLive();
+  } catch (e) {
+    for (const id of watched) refused[id] = e.message;
+    showLive();
+  }
+}
+
+async function poll() {
+  if (!live || document.hidden) return;
+  try {
+    const answer = await call("/api/live");
+    if (live) { liveStatus = answer.senders || {}; showLive(); }
+  } catch (_) { /* the next read reports the router unreachable */ }
+}
+
+let details = null;  // what /api/stream answered for the open sender
+
+async function openDetails(id) {
+  if (opened === id) { opened = null; details = null; $("details").hidden = true; showLive(); return; }
+  opened = id;
+  details = null;
+  showLive();
+  const box = $("details");
+  box.hidden = false;
+  box.replaceChildren(el("div", { class: "empty", text: "Reading the stream's details…" }));
+  try {
+    details = await call(`/api/stream?sender=${encodeURIComponent(id)}`);
+    if (opened === id) renderDetails();
+  } catch (e) {
+    if (opened === id) box.replaceChildren(el("div", { text: e.message }));
+  }
+}
+
+function facts(pairs) {
+  const dl = el("dl", { class: "facts" });
+  for (const [key, value] of pairs) if (value != null && value !== "") dl.append(el("dt", { text: key }), el("dd", { text: String(value) }));
+  return dl;
+}
+
+function rational(r) { return r && r.numerator ? (r.denominator && r.denominator !== 1 ? `${r.numerator}/${r.denominator}` : String(r.numerator)) : null; }
+
+function renderDetails() {
+  const d = details, f = d.flow || {}, src = d.source || {}, snd = d.sender || {};
+  const box = $("details");
+  const close = el("button", { text: "Close", onclick: () => openDetails(d.id) });
+  const flowFacts = [
+    ["Device", d.device], ["Node", d.node], ["Format", f.media_type || f.format],
+    ["Picture", f.frame_width ? `${f.frame_width} × ${f.frame_height}${f.interlace_mode && f.interlace_mode !== "progressive" ? " " + f.interlace_mode : ""}` : null],
+    ["Rate", rational(f.grain_rate) && `${rational(f.grain_rate)} per second`],
+    ["Colour", f.colorspace && `${f.colorspace}${f.transfer_characteristic ? ", " + f.transfer_characteristic : ""}`],
+    ["Sampling", f.sample_rate ? `${rational(f.sample_rate)} Hz, ${f.bit_depth || "?"}-bit` : null],
+    ["Channels", src.channels ? src.channels.map((c) => c.symbol || c.label).join(" ") : null],
+    ["Transport", snd.transport], ["Interfaces", (snd.interface_bindings || []).join(", ")],
+    ["Taking it", d.receivers.length ? d.receivers.join(", ") : "nothing"],
+    ["Sender", d.id], ["Flow", f.id], ["Source", src.id], ["SDP file", d.sdp_url],
+  ];
+  const legs = el("div");
+  for (const stream of d.streams || []) {
+    const chips = el("div", { class: "chips" }, ...(stream.parameters || []).map((p) => el("span", { text: p.value == null ? p.name : `${p.name}=${p.value}` })));
+    const clock = stream.reference_clock;
+    legs.append(facts([
+      [stream.mid ? `Leg ${stream.mid}` : `Stream ${stream.index + 1}`, stream.summary],
+      ["To", stream.destination && `${stream.destination}:${stream.port}${stream.source ? " from " + stream.source : ""}`],
+      ["RTP", `payload type ${stream.payload_type}, ${stream.encoding}/${stream.clock_rate}`],
+      ["Clock", clock && (clock.type === "ptp" ? `PTP ${clock.grandmaster || "traceable"}${clock.domain != null ? " domain " + clock.domain : ""}` : clock.type)],
+    ]), chips);
+  }
+  const findings = d.findings.length
+    ? el("ul", {}, ...d.findings.map((x) => el("li", { class: x.severity === "error" ? "problem" : x.severity === "warning" ? "warning" : "", text: `${x.severity}: ${x.message}${x.line ? " (line " + x.line + ")" : ""}` })))
+    : el("div", { class: "line", text: "None: the SDP file passes every check." });
+  box.replaceChildren(
+    el("div", { class: "details-head" }, el("h2", { text: snd.label || d.id }), el("span", { class: "spacer" }), close),
+    facts(flowFacts),
+    el("h3", { text: "Received here" }), el("div", { id: "details-live" }),
+    el("h3", { text: "SDP file" }),
+    d.sdp_error ? el("div", { class: "line", text: `Cannot be read: ${d.sdp_error}` }) : legs,
+    el("h3", { text: "Checks on the SDP file" }), findings,
+    ...(d.sdp ? [el("details", {}, el("summary", { text: "The SDP file" }), el("pre", { class: "sdp", text: d.sdp }))] : []),
+  );
+  showDetailsLive();
+}
+
+function showDetailsLive() {
+  const box = $("details-live");
+  if (!box || !details) return;
+  const st = liveStatus[details.id];
+  const r = st && st.report;
+  if (!live || !r) {
+    box.replaceChildren(el("div", { class: "line", text: !live ? "Turn on live previews to receive this stream here." : (st && st.error) || refused[details.id] || "Waiting for the stream…" }));
+    return;
+  }
+  const pairs = [
+    ["Stream", r.stream], ["Bit rate", `${fmt(r.megabits_per_second)} Mb/s`],
+    ["Packets", `${r.passed} passed, ${r.lost} lost, ${r.too_late} too late`],
+    ["Frames", r.video && `${fmt(r.video.frame_rate, 2)} per second, ${r.video.packets_per_frame} packets each`],
+    ["Levels", st.levels.length ? st.levels.map((l) => `${db(l)} dBFS`).join(", ") : null],
+    ["Latency", r.latency && `${fmt(r.latency.mean / 1000)} ms mean, ${fmt(r.latency.max / 1000)} ms most`],
+    ["ST 2022-7", r.skew ? `legs ${fmt(r.skew.max_ns / 1e6, 2)} ms apart at most, class ${r.class || "beyond C"}` : null],
+    ["Restarts", r.restarts || null],
+  ];
+  r.legs.forEach((leg, i) => pairs.push([`Leg ${i + 1}`, `${leg.leg}: ${leg.datagrams} datagrams`]));
+  const notes = [...r.problems.map((t) => el("li", { class: "problem", text: t })), ...r.notes.map((t) => el("li", { text: t }))];
+  box.replaceChildren(facts(pairs), ...(notes.length ? [el("ul", {}, ...notes)] : []));
+}
+
+$("live").onchange = () => {
+  try { localStorage.setItem("st2110-router-live", $("live").checked ? "1" : "0"); } catch (_) { /* not kept */ }
+  setLive($("live").checked);
+};
+setInterval(watch, 3000);
+setInterval(poll, 500);
+
+$("mode-take").onclick = () => { salvo = false; armed.clear(); render(); };
+$("mode-salvo").onclick = () => { salvo = true; render(); };
+$("clear").onclick = () => { armed.clear(); render(); };
+$("fire").onclick = () => take([...armed].map(([receiver, sender]) => ({ receiver, sender })));
+$("refresh").onclick = () => read();
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && salvo) { armed.clear(); render(); }
+});
+renderSalvo();
+read();
+setInterval(() => { if (!document.hidden) read(); }, 3000);
+</script>
+</body>
+</html>
