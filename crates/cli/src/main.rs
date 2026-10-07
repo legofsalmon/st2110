@@ -205,6 +205,14 @@ enum Command {
             value_parser = offset()
         )]
         tai_utc: i32,
+        /// The most streams to receive at once for live previews; 0 turns them off. Each
+        /// takes its full bandwidth on this machine's network link.
+        #[arg(long, value_name = "COUNT", default_value_t = 8)]
+        previews: usize,
+        /// The address of the network interface to receive previews on; the one the
+        /// system picks when omitted.
+        #[arg(long, value_name = "ADDRESS")]
+        interface: Option<std::net::Ipv4Addr>,
     },
     /// Decode PTP messages and check them against the ST 2059-2 profile.
     ///
@@ -441,8 +449,9 @@ fn main() -> ExitCode {
             };
             connect::run(&args, format)
         }
-        Command::Router { target, demo, listen, open, timeout, lead, wait, tai_utc } => {
-            router::run(&router::Args { target, demo, listen, open, timeout, lead, wait, tai_utc })
+        Command::Router { target, demo, listen, open, timeout, lead, wait, tai_utc, previews, interface } => {
+            let args = router::Args { target, demo, listen, open, timeout, lead, wait, tai_utc, previews, interface };
+            router::run(&args)
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),
         Command::Pcap { files, sdp, timescale, tai_utc, format, quiet, deny_warnings } => {

@@ -13,10 +13,12 @@
 
 mod demo;
 mod http;
+mod preview;
+mod signal;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +32,7 @@ use st2110_nmos::{Manifest, Snapshot, routing};
 
 use self::demo::Facility;
 use self::http::{Request, Response};
+use self::preview::Previews;
 use crate::seconds;
 
 /// The page.
@@ -37,6 +40,9 @@ const PAGE: &str = include_str!("page.html");
 
 /// The most connections one request may make.
 const MOST: usize = 512;
+
+/// The fewest streams previewed at once with `--demo`: every one of its Senders.
+const DEMO_PREVIEWS: usize = 16;
 
 /// The command's arguments, as given.
 pub(crate) struct Args {
@@ -48,6 +54,8 @@ pub(crate) struct Args {
     pub lead: f64,
     pub wait: f64,
     pub tai_utc: i32,
+    pub previews: usize,
+    pub interface: Option<Ipv4Addr>,
 }
 
 /// A Sender's SDP file, and the Sender's `version` and `manifest_href` when it was fetched.
@@ -71,6 +79,8 @@ struct Router {
     sdp: Mutex<HashMap<String, Fetched>>,
     /// Held while connections are made, so that two salvos do not cross.
     taking: Mutex<()>,
+    /// The streams received for the page's previews.
+    previews: Arc<Previews>,
 }
 
 pub(crate) fn run(args: &Args) -> io::Result<ExitCode> {
@@ -144,7 +154,21 @@ fn serve(args: &Args) -> Result<(), Failure> {
         last: Mutex::new(None),
         sdp: Mutex::default(),
         taking: Mutex::new(()),
+        // The demo's streams come over the loopback interface.
+        previews: Previews::new(
+            if args.demo { Some(Ipv4Addr::LOCALHOST) } else { args.interface },
+            args.tai_utc,
+            // The demo's streams are small, and all of them fit.
+            if args.demo && args.previews > 0 { args.previews.max(DEMO_PREVIEWS) } else { args.previews },
+        ),
     });
+    // Without previews nothing would show the demo's streams, so they are not sent.
+    if let Some(demo) = router.demo.as_ref().filter(|_| args.previews > 0) {
+        let streams = demo.lock().map(|f| f.streams()).unwrap_or_default();
+        if let Err(e) = signal::start(&streams, args.tai_utc) {
+            eprintln!("st2110: the demo's streams cannot be sent, so there are no previews: {e}");
+        }
+    }
     {
         let mut out = io::stdout().lock();
         writeln!(out, "Router: {page}")?;
@@ -248,7 +272,7 @@ fn answer(router: &Router, request: &Request) -> Response {
                 (
                     "Content-Security-Policy",
                     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; \
-                     img-src data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+                     img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
                         .into(),
                 ),
                 ("X-Frame-Options", "DENY".into()),
@@ -262,7 +286,17 @@ fn answer(router: &Router, request: &Request) -> Response {
             Ok(()) => take(router, request),
             Err(message) => Response::error(403, message),
         },
-        (_, "/" | "/api/state" | "/api/why" | "/api/take") => Response::error(405, "not with that method"),
+        ("POST", "/api/watch") => match same_origin(request) {
+            Ok(()) => watch(router, request),
+            Err(message) => Response::error(403, message),
+        },
+        ("GET", "/api/live") => live(router),
+        ("GET", "/api/preview") => picture(router, request),
+        ("GET", "/api/stream") => stream(router, request),
+        (
+            _,
+            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/watch" | "/api/live" | "/api/preview" | "/api/stream",
+        ) => Response::error(405, "not with that method"),
         _ => Response::error(404, "nothing here"),
     }
 }
@@ -372,6 +406,7 @@ fn state(router: &Router) -> Response {
             json!({
                 "id": s.id, "label": s.label, "device": device, "node": node,
                 "format": format_name(flow.and_then(|f| f.get("format")).and_then(Value::as_str)),
+                "summary": text(raw, "id").and_then(|id| summary(&snapshot, &id)),
             })
         })
         .collect();
@@ -394,13 +429,26 @@ fn state(router: &Router) -> Response {
     let read_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let body = json!({
         "registry": router.registry, "demo": router.demo.is_some(), "read_at": read_at as u64,
-        "lead": router.settings.lead.as_secs_f64(),
+        "lead": router.settings.lead.as_secs_f64(), "previews": router.previews.most(),
         "senders": senders, "receivers": receivers,
     });
     if let Ok(mut last) = router.last.lock() {
         *last = Some(snapshot);
     }
     Response::json(200, &body)
+}
+
+/// What a Sender's SDP file declares, in a few words: its first stream's format, and
+/// whether a second leg carries a copy.
+fn summary(snapshot: &Snapshot, id: &str) -> Option<String> {
+    let sdp = snapshot.manifests.get(id)?.sdp.as_deref()?;
+    let report = st2110_sdp::lint(sdp);
+    let first = report.streams.first()?.summary.clone();
+    Some(match report.streams.len() {
+        1 => first,
+        2 => format!("{first}, ST 2022-7 pair"),
+        n => format!("{first}, {n} streams"),
+    })
 }
 
 /// Why a Receiver cannot take a Sender's stream, judged on the registry as last read.
@@ -485,6 +533,118 @@ fn take(router: &Router, request: &Request) -> Response {
         }
         Err(message) => Response::error(400, message),
     }
+}
+
+/// The Senders whose streams the page is showing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchRequest {
+    senders: Vec<String>,
+}
+
+/// Receives the streams of the Senders the page is showing, for another ten seconds:
+/// the page asks again every few seconds while it shows them.
+fn watch(router: &Router, request: &Request) -> Response {
+    let wanted: WatchRequest = match serde_json::from_slice(&request.body) {
+        Ok(wanted) => wanted,
+        Err(e) => return Response::error(400, format!("not a list of senders: {e}")),
+    };
+    let mut refused = serde_json::Map::new();
+    for id in wanted.senders.iter().take(MOST) {
+        let sdp = router.sdp.lock().ok().and_then(|cache| cache.get(id).and_then(|f| f.manifest.sdp.clone()));
+        let result = match sdp {
+            Some(sdp) => router.previews.watch(id, &sdp),
+            None => Err("its SDP file has not been read".into()),
+        };
+        if let Err(message) = result {
+            refused.insert(id.clone(), json!(message));
+        }
+    }
+    let mut body = live_json(router);
+    body["refused"] = Value::Object(refused);
+    Response::json(200, &body)
+}
+
+fn live_json(router: &Router) -> Value {
+    let senders: serde_json::Map<String, Value> =
+        router.previews.each(|_, status| serde_json::to_value(status).unwrap_or(Value::Null)).into_iter().collect();
+    json!({"most": router.previews.most(), "senders": senders})
+}
+
+/// What has arrived of each stream being previewed.
+fn live(router: &Router) -> Response {
+    Response::json(200, &live_json(router))
+}
+
+/// The latest picture of a stream being previewed, as a PNG file.
+fn picture(router: &Router, request: &Request) -> Response {
+    let Some(id) = request.param("sender") else {
+        return Response::error(400, "name a sender");
+    };
+    let Some(picture) = router.previews.picture(&id) else {
+        return Response::error(404, "no picture of that sender yet");
+    };
+    let mut png = Vec::new();
+    if let Err(e) = st2110_media::files::write_png(&mut png, picture.width, picture.height, &picture.rgb) {
+        return Response::error(500, e.to_string());
+    }
+    Response { status: 200, content_type: "image/png", headers: Vec::new(), body: png }
+}
+
+/// Everything known of a Sender's stream: its IS-04 resources, its SDP file and what the
+/// file declares, the checks the file fails, and the Receivers taking it.
+fn stream(router: &Router, request: &Request) -> Response {
+    let Some(id) = request.param("sender") else {
+        return Response::error(400, "name a sender");
+    };
+    let Ok(last) = router.last.lock() else {
+        return Response::error(500, "the router failed");
+    };
+    let Some(snapshot) = last.as_ref() else {
+        return Response::error(409, "the registry has not been read yet");
+    };
+    let by_id = |list: &[Value], id: Option<&str>| -> Value {
+        id.and_then(|id| list.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(id)).cloned())
+            .unwrap_or(Value::Null)
+    };
+    let sender = by_id(&snapshot.senders, Some(&id));
+    if sender.is_null() {
+        return Response::error(404, "no such sender");
+    }
+    let flow = by_id(&snapshot.flows, sender.get("flow_id").and_then(Value::as_str));
+    let source = by_id(&snapshot.sources, flow.get("source_id").and_then(Value::as_str));
+    let (device, node) = device_and_node(snapshot, &sender);
+    let manifest = snapshot.manifests.get(&id);
+    let sdp = manifest.and_then(|m| m.sdp.clone());
+    let report = sdp.as_deref().map(st2110_sdp::lint);
+    let findings: Vec<Value> = report
+        .iter()
+        .flat_map(|r| &r.diagnostics)
+        .map(|d| json!({"severity": d.severity, "rule": d.rule, "line": d.line, "message": d.message}))
+        .collect();
+    let receivers: Vec<Value> = snapshot
+        .receivers
+        .iter()
+        .filter(|r| {
+            let subscription = r.get("subscription");
+            subscription.and_then(|s| s.get("sender_id")).and_then(Value::as_str) == Some(id.as_str())
+                && subscription.and_then(|s| s.get("active")).and_then(Value::as_bool) == Some(true)
+        })
+        .map(|r| json!(text(r, "label").unwrap_or_default()))
+        .collect();
+    Response::json(
+        200,
+        &json!({
+            "id": id, "device": device, "node": node,
+            "sender": sender, "flow": flow, "source": source,
+            "sdp_url": manifest.map(|m| m.url.clone()),
+            "sdp_error": manifest.and_then(|m| m.error.clone().or_else(|| m.status.filter(|s| !(200..300).contains(s)).map(|s| format!("HTTP {s}")))),
+            "sdp": sdp,
+            "streams": report.as_ref().map(|r| serde_json::to_value(&r.streams).unwrap_or(Value::Null)),
+            "findings": findings,
+            "receivers": receivers,
+        }),
+    )
 }
 
 #[cfg(test)]

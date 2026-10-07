@@ -3,14 +3,23 @@
 //! tried with no equipment. Its Receivers stage, schedule and activate as IS-05 v1.2
 //! describes, and the registry hears of each activation, as a Node tells its registry.
 //!
-//! Four cameras send 1080p50 video on an ST 2022-7 pair and stereo audio; a graphics
-//! machine sends 720p50 video on one leg. Three monitors take 1080p video on two legs
-//! and audio, and a fourth takes only 720p video, so some crosspoints cannot be made.
+//! Four cameras send video on an ST 2022-7 pair and stereo tone; a graphics machine
+//! sends a smaller picture on one leg. Three monitors take the cameras' video on two legs
+//! and audio, and a fourth takes only the graphics machine's size, so some crosspoints
+//! cannot be made.
+//!
+//! The streams are real: [`Facility::start_streams`] sends each Sender's from this
+//! machine, on the loopback interface, so the router can show them. They are small
+//! pictures at 25 frames a second, so that a laptop carries them all with ease.
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde_json::{Value, json};
+use st2110_media::describe::{Clock, Description, Leg, Media};
+use st2110_media::format::{AudioFormat, VideoFormat};
 use st2110_ptp::PtpTime;
+use st2110_sdp::Rational;
 
 use super::http::{Request, Response};
 use crate::timing::now;
@@ -84,21 +93,57 @@ pub(crate) struct Facility {
     registry: BTreeMap<&'static str, Vec<Value>>,
     receivers: BTreeMap<String, Receiver>,
     sdp: BTreeMap<String, String>,
+    /// Each Sender's stream, keyed by Sender `id`: its label and description.
+    streams: BTreeMap<String, (String, Description)>,
 }
 
 /// A Sender to build: its label, Flow facts and SDP file.
 struct Sending {
     label: String,
-    video: Option<(u32, u32)>,
-    sdp: String,
+    description: Description,
+}
+
+/// Where the demo's streams go from: this machine's loopback interface.
+const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// The cameras' picture, and the graphics machine's.
+const CAMERA: (u32, u32) = (480, 270);
+const GRAPHICS: (u32, u32) = (320, 180);
+
+/// A stream from this machine to `groups`, each `(group, port)`.
+fn description(name: &str, media: Media, groups: &[(&str, u16)]) -> Description {
+    let payload_type = if matches!(media, Media::Video(_)) { 96 } else { 97 };
+    Description {
+        name: name.to_string(),
+        media,
+        payload_type,
+        legs: groups
+            .iter()
+            .map(|(group, port)| Leg {
+                destination: SocketAddrV4::new(group.parse().expect("a demo group"), *port),
+                source: Some(LOOPBACK),
+            })
+            .collect(),
+        clock: Clock::parse(&format!("{GMID}:127")).ok(),
+        ttl: 1,
+    }
+}
+
+fn video(width: u32, height: u32) -> Media {
+    Media::Video(VideoFormat::new(width, height, Rational::new(25, 1).expect("25")))
 }
 
 impl Facility {
     /// The facility, with URLs on `base`, such as `http://127.0.0.1:8110`, and two
     /// monitors already taking cameras.
     pub(crate) fn new(base: &str, tai_utc: i32) -> Self {
-        let mut facility =
-            Self { tai_utc, registry: BTreeMap::new(), receivers: BTreeMap::new(), sdp: BTreeMap::new() };
+        let mut facility = Self {
+            tai_utc,
+            registry: BTreeMap::new(),
+            receivers: BTreeMap::new(),
+            sdp: BTreeMap::new(),
+            streams: BTreeMap::new(),
+        };
         for kind in ["nodes", "devices", "sources", "flows", "senders", "receivers"] {
             facility.registry.insert(kind, Vec::new());
         }
@@ -107,28 +152,27 @@ impl Facility {
             node += 1;
             let red = format!("192.168.10.2{camera}");
             let blue = format!("192.168.20.2{camera}");
+            let label = format!("CAM {camera} video");
+            let groups = [format!("239.10.{camera}.1"), format!("239.20.{camera}.1")];
             let video = Sending {
-                label: format!("CAM {camera} video"),
-                video: Some((1920, 1080)),
-                sdp: video_sdp(
-                    &format!("CAM {camera} video"),
-                    1920,
-                    1080,
-                    &[(&red, &format!("239.10.{camera}.1")), (&blue, &format!("239.20.{camera}.1"))],
-                ),
+                description: description(&label, video(CAMERA.0, CAMERA.1), &[(&groups[0], 5004), (&groups[1], 5004)]),
+                label,
             };
+            let label = format!("CAM {camera} audio");
             let audio = Sending {
-                label: format!("CAM {camera} audio"),
-                video: None,
-                sdp: audio_sdp(&format!("CAM {camera} audio"), &red, &format!("239.10.{camera}.2")),
+                description: description(
+                    &label,
+                    Media::Audio(AudioFormat::new(2)),
+                    &[(&format!("239.10.{camera}.2"), 5006)],
+                ),
+                label,
             };
             facility.add_sender_node(base, node, &format!("Camera {camera}"), &[&red, &blue], &[video, audio]);
         }
         node += 1;
         let graphics = Sending {
             label: "GFX 1 video".into(),
-            video: Some((1280, 720)),
-            sdp: video_sdp("GFX 1 video", 1280, 720, &[("192.168.10.41", "239.10.41.1")]),
+            description: description("GFX 1 video", video(GRAPHICS.0, GRAPHICS.1), &[("239.10.41.1", 5004)]),
         };
         facility.add_sender_node(base, node, "Graphics 1", &["192.168.10.41"], &[graphics]);
         for monitor in 1..=4u32 {
@@ -148,7 +192,7 @@ impl Facility {
                 let body = json!({
                     "sender_id": sender, "master_enable": true,
                     "transport_file": {"data": sdp, "type": "application/sdp"},
-                    "transport_params": facility.legs(&receiver, &sdp),
+                    "transport_params": facility.legs(&receiver, &sender),
                 });
                 facility.stage(&receiver, &body);
                 facility.activate(&receiver, now);
@@ -159,19 +203,17 @@ impl Facility {
     }
 
     /// What a Receiver's legs take from an SDP file, for setting up the demo.
-    fn legs(&self, receiver: &str, sdp: &str) -> Value {
-        let groups: Vec<(String, String)> = sdp
-            .lines()
-            .filter_map(|line| line.strip_prefix("a=source-filter: incl IN IP4 "))
-            .filter_map(|rest| rest.split_once(' '))
-            .map(|(group, source)| (group.to_string(), source.to_string()))
-            .collect();
+    fn legs(&self, receiver: &str, sender: &str) -> Value {
+        let legs = &self.streams[sender].1.legs;
         let count = self.receivers[receiver].constraints.as_array().map_or(0, Vec::len);
         (0..count)
-            .map(|leg| match groups.get(leg) {
-                Some((group, source)) => {
-                    json!({"multicast_ip": group, "source_ip": source, "destination_port": 5004, "rtp_enabled": true})
-                }
+            .map(|i| match legs.get(i) {
+                Some(leg) => json!({
+                    "multicast_ip": leg.destination.ip().to_string(),
+                    "source_ip": leg.source.map(|s| s.to_string()),
+                    "destination_port": leg.destination.port(),
+                    "rtp_enabled": true,
+                }),
                 None => json!({"rtp_enabled": false}),
             })
             .collect()
@@ -213,21 +255,25 @@ impl Facility {
         for s in sending {
             let k = u32::try_from(self.registry["senders"].len()).expect("a few senders") + 1;
             let (source_id, flow_id, sender_id) = (id("50c0", k), id("f10e", k), id("5e0d", k));
-            let (source, flow) = match s.video {
-                Some((width, height)) => (
-                    json!({"format": VIDEO, "grain_rate": {"numerator": 50}}),
-                    json!({
-                        "format": VIDEO, "grain_rate": {"numerator": 50}, "frame_width": width, "frame_height": height,
-                        "interlace_mode": "progressive", "colorspace": "BT709", "transfer_characteristic": "SDR",
-                        "media_type": "video/raw",
-                        "components": [
-                            {"name": "Y", "width": width, "height": height, "bit_depth": 10},
-                            {"name": "Cb", "width": width / 2, "height": height, "bit_depth": 10},
-                            {"name": "Cr", "width": width / 2, "height": height, "bit_depth": 10},
-                        ],
-                    }),
-                ),
-                None => (
+            let (source, flow) = match &s.description.media {
+                Media::Video(format) => {
+                    let (width, height) = (format.width, format.height);
+                    let rate = json!({"numerator": 25});
+                    (
+                        json!({"format": VIDEO, "grain_rate": rate}),
+                        json!({
+                            "format": VIDEO, "grain_rate": rate, "frame_width": width, "frame_height": height,
+                            "interlace_mode": "progressive", "colorspace": "BT709", "transfer_characteristic": "SDR",
+                            "media_type": "video/raw",
+                            "components": [
+                                {"name": "Y", "width": width, "height": height, "bit_depth": 10},
+                                {"name": "Cb", "width": width / 2, "height": height, "bit_depth": 10},
+                                {"name": "Cr", "width": width / 2, "height": height, "bit_depth": 10},
+                            ],
+                        }),
+                    )
+                }
+                Media::Audio(_) => (
                     json!({"format": AUDIO, "channels": [{"label": "Left", "symbol": "L"}, {"label": "Right", "symbol": "R"}]}),
                     json!({"format": AUDIO, "sample_rate": {"numerator": 48000}, "media_type": "audio/L24", "bit_depth": 24}),
                 ),
@@ -241,7 +287,7 @@ impl Facility {
                 .get_mut("flows")
                 .expect("flows")
                 .push(merge(merge(merge(core(&flow_id, &s.label), json!({"source_id": source_id})), common), flow));
-            let legs = s.sdp.matches("m=").count();
+            let legs = s.description.legs.len();
             let bindings: Vec<String> = (0..legs).map(|i| format!("eth{i}")).collect();
             let mut sender = merge(
                 core(&sender_id, &s.label),
@@ -251,18 +297,19 @@ impl Facility {
                     "interface_bindings": bindings, "subscription": {"receiver_id": null, "active": true},
                 }),
             );
-            if s.video.is_some() {
+            if matches!(s.description.media, Media::Video(_)) {
                 sender["st2110_21_sender_type"] = json!("2110TPN");
             }
             self.registry.get_mut("senders").expect("senders").push(sender);
-            self.sdp.insert(sender_id, s.sdp.clone());
+            self.sdp.insert(sender_id.clone(), s.description.sdp(u64::from(k)));
+            self.streams.insert(sender_id, (s.label.clone(), s.description.clone()));
         }
     }
 
     fn add_monitor(&mut self, base: &str, n: u32, monitor: u32, video: &[String], audio: &str) {
         let interfaces: Vec<&str> = video.iter().map(String::as_str).collect();
         let device_id = self.node(base, n, &format!("Monitor {monitor}"), &interfaces);
-        let (width, height, label) = if monitor == 4 { (1280, 720, "720p") } else { (1920, 1080, "1080p") };
+        let ((width, height), label) = if monitor == 4 { (GRAPHICS, "180p") } else { (CAMERA, "270p") };
         let video_caps = json!({
             "media_types": ["video/raw"],
             "constraint_sets": [{
@@ -270,7 +317,7 @@ impl Facility {
                 "urn:x-nmos:cap:format:frame_width": {"enum": [width]},
                 "urn:x-nmos:cap:format:frame_height": {"enum": [height]},
                 "urn:x-nmos:cap:format:interlace_mode": {"enum": ["progressive"]},
-                "urn:x-nmos:cap:format:grain_rate": {"enum": [{"numerator": 50}, {"numerator": 60000, "denominator": 1001}]},
+                "urn:x-nmos:cap:format:grain_rate": {"enum": [{"numerator": 25}, {"numerator": 50}]},
                 "urn:x-nmos:cap:format:color_sampling": {"enum": ["YCbCr-4:2:2"]},
                 "urn:x-nmos:cap:format:component_depth": {"enum": [10]},
             }],
@@ -311,6 +358,11 @@ impl Facility {
                 },
             );
         }
+    }
+
+    /// Each Sender's label and the stream it sends, for [`super::signal::start`].
+    pub(crate) fn streams(&self) -> Vec<(String, Description)> {
+        self.streams.values().cloned().collect()
     }
 
     /// Whether a request is for the facility, rather than the router.
@@ -540,38 +592,6 @@ impl Facility {
             registered["version"] = json!(tai(at));
         }
     }
-}
-
-/// An ST 2110-20 SDP file, with one media section per leg: `(source, group)`.
-fn video_sdp(name: &str, width: u32, height: u32, legs: &[(&str, &str)]) -> String {
-    let mut sdp = format!("v=0\r\no=- 1790510437 1790510437 IN IP4 {}\r\ns={name}\r\nt=0 0\r\n", legs[0].0);
-    let mids = ["primary", "secondary"];
-    if legs.len() == 2 {
-        sdp.push_str("a=group:DUP primary secondary\r\n");
-    }
-    for (i, (source, group)) in legs.iter().enumerate() {
-        sdp.push_str(&format!(
-            "m=video 5004 RTP/AVP 96\r\nc=IN IP4 {group}/32\r\na=source-filter: incl IN IP4 {group} {source}\r\n\
-             a=rtpmap:96 raw/90000\r\n\
-             a=fmtp:96 sampling=YCbCr-4:2:2; width={width}; height={height}; exactframerate=50; depth=10; TCS=SDR; \
-             colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN; TSMODE=SAMP\r\n\
-             a=ts-refclk:ptp=IEEE1588-2008:{GMID}:127\r\na=mediaclk:direct=0\r\n"
-        ));
-        if legs.len() == 2 {
-            sdp.push_str(&format!("a=mid:{}\r\n", mids[i]));
-        }
-    }
-    sdp
-}
-
-/// An ST 2110-30 SDP file of stereo, 24-bit, 1 ms packets.
-fn audio_sdp(name: &str, source: &str, group: &str) -> String {
-    format!(
-        "v=0\r\no=- 1790510437 1790510437 IN IP4 {source}\r\ns={name}\r\nt=0 0\r\n\
-         m=audio 5006 RTP/AVP 97\r\nc=IN IP4 {group}/32\r\na=source-filter: incl IN IP4 {group} {source}\r\n\
-         a=rtpmap:97 L24/48000/2\r\na=fmtp:97 channel-order=SMPTE2110.(ST); TSMODE=SAMP\r\na=ptime:1\r\n\
-         a=ts-refclk:ptp=IEEE1588-2008:{GMID}:127\r\na=mediaclk:direct=0\r\n"
-    )
 }
 
 #[cfg(test)]
