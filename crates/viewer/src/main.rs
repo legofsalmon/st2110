@@ -7,9 +7,13 @@
 
 mod app;
 mod health;
+mod look;
 mod network;
 mod picture;
 mod receiving;
+// Vendored from the design system by its scripts/sync.mjs; generated, so not formatted here.
+#[rustfmt::skip]
+mod tokens;
 
 use std::cell::Cell;
 use std::path::PathBuf;

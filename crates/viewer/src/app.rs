@@ -12,6 +12,7 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::health::{self, Doing, Seen, Tone};
+use crate::look;
 use crate::network::{self, Network};
 use crate::picture::Picture;
 use crate::receiving::{Origin, Port, Run, Source, Stream, file_name, ports};
@@ -24,11 +25,6 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 
 /// The extensions of capture files; anything else dropped is taken for an SDP file.
 const CAPTURES: [&str; 3] = ["pcap", "pcapng", "cap"];
-
-/// Text on the black around the picture, which stays black in both themes.
-const ON_BLACK: Color32 = Color32::from_gray(210);
-const ON_BLACK_WEAK: Color32 = Color32::from_gray(140);
-const AMBER: Color32 = Color32::from_rgb(255, 176, 32);
 
 /// What the app remembers between launches.
 #[derive(Serialize, Deserialize)]
@@ -108,6 +104,7 @@ pub(crate) struct Viewer {
 
 impl Viewer {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, start: Start) -> Self {
+        look::apply(&cc.egui_ctx);
         // A test starts from nothing remembered.
         let settings = match (&start.check, cc.storage) {
             (None, Some(storage)) => eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default(),
@@ -532,7 +529,7 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let space = ui.max_rect();
         let painter = ui.painter().clone();
-        painter.rect_filled(space, 0.0, Color32::BLACK);
+        painter.rect_filled(space, 0.0, look::CANVAS);
         let middle = space.center();
         let big = FontId::proportional(20.0);
         let small = FontId::proportional(14.0);
@@ -546,8 +543,8 @@ impl Viewer {
                 } else {
                     ("Open an SDP file", "or drop one here. A capture plays with its stream's SDP file: drop both.")
                 };
-                painter.text(middle - vec2(0.0, 40.0), Align2::CENTER_CENTER, title, big, ON_BLACK);
-                painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, hint, small, ON_BLACK_WEAK);
+                painter.text(middle - vec2(0.0, 40.0), Align2::CENTER_CENTER, title, big, look::ON_CANVAS);
+                painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, hint, small, look::ON_CANVAS_WEAK);
                 let button = egui::Rect::from_center_size(middle + vec2(0.0, 24.0), vec2(140.0, 28.0));
                 if ui.put(button, egui::Button::new("Open SDP file…")).clicked() {
                     self.pick_sdp(&ctx);
@@ -555,9 +552,9 @@ impl Viewer {
             }
             (Some(stream), _) if stream.video.is_none() => {
                 let text = format!("Audio: {}", stream.format());
-                painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, text, big, ON_BLACK);
+                painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, text, big, look::ON_CANVAS);
                 let hint = "No picture to show. What arrives is counted beside it, with each channel's loudest sample.";
-                painter.text(middle + vec2(0.0, 16.0), Align2::CENTER_CENTER, hint, small, ON_BLACK_WEAK);
+                painter.text(middle + vec2(0.0, 16.0), Align2::CENTER_CENTER, hint, small, look::ON_CANVAS_WEAK);
             }
             (Some(_), None) => {}
             (Some(_), Some(picture)) => {
@@ -565,14 +562,14 @@ impl Viewer {
                 let running = self.run.as_mut().is_some_and(Run::running);
                 if !picture.shown() {
                     let text = if running { "Waiting for the first frame" } else { "No frame arrived" };
-                    painter.text(middle, Align2::CENTER_CENTER, text, big, ON_BLACK);
+                    painter.text(middle, Align2::CENTER_CENTER, text, big, look::ON_CANVAS);
                 } else if running && let Some(quiet) = self.seen.quiet.filter(|q| *q >= Duration::from_secs(1)) {
                     let text = format!("Nothing for {} s", quiet.as_secs());
                     let corner = pos2(at.min.x.max(space.min.x) + 12.0, at.min.y.max(space.min.y) + 12.0);
-                    let galley = painter.layout_no_wrap(text, big, AMBER);
+                    let galley = painter.layout_no_wrap(text, big, look::ON_CANVAS_WARN);
                     let badge = egui::Rect::from_min_size(corner, galley.size()).expand(6.0);
                     painter.rect_filled(badge, 4.0, Color32::from_black_alpha(190));
-                    painter.galley(corner, galley, AMBER);
+                    painter.galley(corner, galley, look::ON_CANVAS_WARN);
                 }
                 // Double-click for the picture alone, filling the screen.
                 let response = ui.interact(space, Id::new("picture"), Sense::click());
@@ -582,9 +579,9 @@ impl Viewer {
             }
         }
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            painter.rect_filled(space, 0.0, Color32::from_black_alpha(160));
+            painter.rect_filled(space, 0.0, look::VEIL);
             let text = "Drop an SDP file to open it, or a capture to play it";
-            painter.text(middle, Align2::CENTER_CENTER, text, FontId::proportional(20.0), ON_BLACK);
+            painter.text(middle, Align2::CENTER_CENTER, text, FontId::proportional(20.0), look::ON_CANVAS);
         }
     }
 
