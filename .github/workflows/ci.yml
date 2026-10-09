@@ -18,6 +18,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      - name: The design system's copies are as they were vendored
+        run: python3 scripts/design-system.py --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # `st2110 view` and its window are a default feature, and the rest builds without.
       - run: cargo clippy -p st2110-cli --all-targets --no-default-features --locked -- -D warnings
