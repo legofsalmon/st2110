@@ -8,14 +8,16 @@ checked out beside this repository as `../design-system`. Before changing
 anything a person sees or touches, read its `docs/designing.md` and answer its
 questions, then the pages it points to: `principles.md` (who uses these tools
 and where, the colour grammar, type, space and the behaviour rules),
-`behavioural.md` (how crew behave while getting a job done), `navigation.md`,
-`states.md`, `components.md` and `motion.md`.
+`behavioural.md` (how crew behave while getting a job done), `nngroup.md`
+(the usability research and the ten heuristics every change is checked
+against), `navigation.md`, `states.md`, `components.md` and `motion.md`.
 
 - **Write the reasoning down.** A PR that changes what a person sees or
   touches has a short **Design** section: the one job of the view, the
   behaviour it designs for with the effect named (Default Effect, Loss
-  Aversion, Time Scarcity…), and any departure from the system and why. A
-  bug fix that changes no design says so.
+  Aversion, Time Scarcity…), any departure from the system and why, and
+  any problem the heuristic check rated 3 that it leaves open. A bug fix
+  that changes no design says so.
 - **Use the system's parts first.** Its roles rather than literal colours,
   and a shared component's states, keys and wording before drawing a new one.
 - **Send back what you learn.** A gap in the system, a departure that was
