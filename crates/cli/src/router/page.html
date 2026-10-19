@@ -2906,9 +2906,9 @@ td.cell { padding: var(--ds-space-half); }
    press, and a pulse once the take has run timing.wait. Taking now is green
    with a dot. Each colour has a shape with it, so none is told by colour
    alone. */
-.cell button { width: var(--ds-size-control); height: var(--ds-size-control); padding: 0; border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--line); background: var(--fit); color: var(--text); display: block; font: var(--ds-text-caption); cursor: pointer; }
+.cell button { width: var(--ds-size-control); height: var(--ds-size-control); padding: 0; border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--line); background: var(--fit); color: var(--text); display: block; font: var(--ds-text-caption); cursor: pointer; transition: background-color var(--ds-duration-fast) var(--ds-ease-standard), border-color var(--ds-duration-fast) var(--ds-ease-standard); }
 @media (hover: hover) { .cell button:hover { background: var(--fit-hover); border-color: var(--line-strong); } }
-.cell button:active { background: var(--pressed); }
+.cell button:active { background: var(--pressed); transition-duration: var(--ds-duration-instant); }
 .cell button.live { background: var(--live); border-color: var(--live); color: var(--live-ink); }
 .cell button.live::after { content: "●"; }
 .cell button[data-armed="true"], .cell button[aria-busy="true"] { background: var(--armed); border-color: var(--armed); color: var(--armed-ink); }
@@ -2938,7 +2938,7 @@ section.sources { margin: 0 var(--ds-space-4) var(--ds-space-3); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--ds-space-2); }
 /* A source's card opens its details below the cards (aria-expanded), and is
    drawn selected while they are open. */
-.card { display: block; width: 100%; text-align: left; padding: 0; overflow: hidden; background: var(--panel); color: var(--text); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); font: var(--ds-text-body); cursor: pointer; }
+.card { display: block; width: 100%; text-align: left; padding: 0; overflow: hidden; background: var(--panel); color: var(--text); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); font: var(--ds-text-body); cursor: pointer; transition: border-color var(--ds-duration-fast) var(--ds-ease-standard), box-shadow var(--ds-duration-fast) var(--ds-ease-standard); }
 @media (hover: hover) { .card:hover { border-color: var(--line-strong); } }
 .card[aria-expanded="true"] { border-color: var(--accent); box-shadow: 0 0 0 var(--ds-space-hairline) var(--accent); }
 .screen { position: relative; aspect-ratio: 16 / 9; background: var(--canvas); display: flex; align-items: center; justify-content: center; color: var(--dim); font: var(--ds-text-caption); text-align: center; padding: 0; }
@@ -2969,6 +2969,20 @@ section.details ul { margin: var(--ds-space-half) 0 var(--ds-space-half) var(--d
 li.problem { color: var(--bad-ink); } li.warning { color: var(--warn-ink); }
 section.details .ds-disclosure { margin-top: var(--ds-space-2); }
 pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-control); padding: var(--ds-space-2); overflow: auto; max-height: 260px; }
+/* Motion (the design system's motion.md): a notice, the open source's details
+   and a new line in the log are small things arriving near where they were
+   asked for, so they fade in and drop the small offset, at base with the
+   entering curve; they leave at once. Under reduced motion the tokens take the
+   offset to 0 and the fade to 120ms. A crosspoint and a card change colour in
+   place, at fast. What never moves: the pictures, the meters and the counts,
+   which change the moment they arrive, and the crosshair, which follows the
+   pointer. */
+.notice:not([hidden]), section.details:not([hidden]), .entry {
+  transition: opacity var(--ds-duration-base) var(--ds-ease-enter), translate var(--ds-duration-base) var(--ds-ease-enter);
+}
+@starting-style {
+  .notice:not([hidden]), section.details:not([hidden]), .entry { opacity: 0; translate: 0 calc(-1 * var(--ds-motion-offset-small)); }
+}
 @media (max-width: 600px) { .status { margin-left: 0; width: 100%; } .grid-wrap { max-height: none; } thead th.corner { min-width: 120px; } th.dst { white-space: normal; } }
 </style>
 </head>
