@@ -350,6 +350,8 @@ ST 2110 Viewer is an app for the Mac that finds the ST 2110 streams on the netwo
 - **Watch it.** The picture fills the window at the stream's shape. Double-click it for full screen, and Escape to leave. When frames stop coming, the picture keeps the last one and says how long it has been.
 - **Read what arrived.** Beside the picture: frames and the incomplete ones, the frame rate, packets and what was lost or came too late, each leg of an ST 2022-7 pair, how far apart the legs arrived and the tightest receiver class that allows it, the latency from RTP timestamps, and for audio the loudest sample on each channel. Problems and notes are the ones `st2110 receive` reports, as they come. The line along the bottom says what receiving is doing.
 
+It follows the Mac's light or dark appearance, and its Reduce motion setting (Accessibility, Display): with it on, menus open with a shorter fade and lists jump rather than glide. `ST2110_MOTION=reduced` or `full` overrides the setting, for a show machine short of GPU or a screen recording.
+
 The first time it looks for streams or receives one, macOS 15 asks whether ST 2110 Viewer may find and connect to devices on the local network. Allow it, or nothing is found and nothing arrives; System Settings, Privacy & Security, Local Network changes the answer later.
 
 ### Get it

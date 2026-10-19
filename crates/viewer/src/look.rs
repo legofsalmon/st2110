@@ -1,10 +1,16 @@
 //! How the window looks: egui's visuals built from the shared design system's roles
-//! (legofsalmon/design-system, vendored as `tokens.rs`), in both themes. The app
-//! follows the system's theme, as it did on egui's own visuals.
+//! (legofsalmon/design-system, vendored as `tokens.rs`), in both themes, spaced at
+//! its regular density. The app follows the system's theme, as it did on egui's own
+//! visuals.
+//!
+//! The type stays egui's own faces, sized by the design system's text styles: IBM
+//! Plex is the system's face, and egui reads font files, not the system's fonts, so
+//! taking it means bundling the files, which waits for the design system to ship
+//! them.
 
-use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke, Theme};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Shadow, Stroke, TextStyle, Theme, vec2};
 
-use crate::tokens::{color, elevation, radius};
+use crate::tokens::{color, elevation, motion, radius, size, space, text, timing};
 
 /// A colour from the design system, as egui takes it.
 const fn rgba(c: crate::tokens::Rgba) -> Color32 {
@@ -22,11 +28,115 @@ pub(crate) const ON_CANVAS_WARN: Color32 = rgba(color::dark::warn::INK);
 
 /// Behind what is laid over the picture: a file being dropped on it.
 pub(crate) const VEIL: Color32 = rgba(color::dark::VEIL);
+/// Behind words laid on the picture itself, which can be any colour: the canvas,
+/// three quarters opaque, so the warning ink keeps its contrast over white. The
+/// design system has no role for this yet; the veil is too light for it.
+pub(crate) const SCRIM: Color32 = {
+    let c = color::dark::surface::CANVAS;
+    Color32::from_rgba_unmultiplied_const(c.r, c.g, c.b, 190)
+};
 
-/// Sets the visuals for both themes.
+/// Text over the picture: a line that says what to do, and its hint.
+pub(crate) const ON_CANVAS_TITLE: f32 = text::regular::HEADING.size;
+pub(crate) const ON_CANVAS_HINT: f32 = text::regular::PROSE.size;
+
+/// Sets the visuals for both themes, the sizes, and the motion.
 pub(crate) fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, dark());
     ctx.set_visuals_of(Theme::Light, light());
+    let motion = Motion::asked();
+    ctx.all_styles_mut(|style| {
+        regular(style);
+        motion.apply(style);
+    });
+}
+
+/// How much the window moves: the design system's full motion, or reduced, which
+/// removes movement and keeps the fades, shorter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Motion {
+    Full,
+    Reduced,
+}
+
+impl Motion {
+    /// The motion this machine asked for, read once. `ST2110_MOTION=reduced` (or
+    /// `full`) decides, for a show machine short of GPU or a screen recording;
+    /// otherwise the Mac's Reduce motion setting does; otherwise full.
+    pub(crate) fn asked() -> Self {
+        static ASKED: std::sync::OnceLock<Motion> = std::sync::OnceLock::new();
+        *ASKED.get_or_init(|| Self::from(std::env::var("ST2110_MOTION").ok().as_deref(), os_reduces_motion))
+    }
+
+    fn from(setting: Option<&str>, os_reduces: impl FnOnce() -> bool) -> Self {
+        match setting {
+            Some("reduced") => Self::Reduced,
+            Some("full") => Self::Full,
+            _ if os_reduces() => Self::Reduced,
+            _ => Self::Full,
+        }
+    }
+
+    /// Seconds for a small thing arriving near where it was asked for: a menu, the
+    /// port list, a fold.
+    fn base(self) -> f32 {
+        let ms = match self {
+            Self::Full => motion::full::duration::BASE,
+            Self::Reduced => motion::reduced::duration::BASE,
+        };
+        ms as f32 / 1000.0
+    }
+
+    fn apply(self, style: &mut egui::Style) {
+        // egui's menus, popups and folds open over animation_time.
+        style.animation_time = self.base();
+        // A list scrolled by a wheel or a key glides there; under reduced motion it
+        // jumps, as nothing travels.
+        if self == Self::Reduced {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        }
+        // Not animation: how long the pointer rests before a hover says what a
+        // control does. It never changes with motion.
+        style.interaction.tooltip_delay = timing::TOOLTIP as f32 / 1000.0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn os_reduces_motion() -> bool {
+    std::process::Command::new("defaults")
+        .args(["read", "com.apple.universalaccess", "reduceMotion"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_reduces_motion() -> bool {
+    false
+}
+
+/// The regular density: 32px controls and rows, 12px either side of a button's
+/// label, the 4px grid between things, and the text styles' sizes.
+fn regular(style: &mut egui::Style) {
+    let s = &mut style.spacing;
+    // A button, a menu and a choice are the control height; so is a row of the grid.
+    s.interact_size = vec2(space::STEP_10, size::regular::CONTROL);
+    s.button_padding = vec2(size::regular::CONTROL_PADDING, space::STEP_1);
+    s.item_spacing = vec2(space::STEP_2, space::STEP_1);
+    s.window_margin = Margin::same(space::STEP_2 as i8);
+    s.menu_margin = Margin::same(space::STEP_2 as i8);
+    let t = &mut style.text_styles;
+    t.insert(TextStyle::Small, FontId::proportional(text::regular::CAPTION.size));
+    t.insert(TextStyle::Body, FontId::proportional(text::regular::BODY.size));
+    t.insert(TextStyle::Button, FontId::proportional(text::regular::CONTROL.size));
+    t.insert(TextStyle::Heading, FontId::proportional(text::regular::TITLE.size));
+    t.insert(TextStyle::Monospace, FontId::monospace(text::regular::CODE.size));
+}
+
+/// A button in a line of text or a panel's head: the small control's height, which
+/// is also the smallest anything is to hit (egui's own small button is the text's
+/// height).
+pub(crate) fn small_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(label).small().min_size(vec2(0.0, size::regular::CONTROL_SM)))
 }
 
 /// One theme's roles, as the visuals need them.
@@ -180,4 +290,28 @@ fn visuals(mut v: egui::Visuals, r: &Roles) -> egui::Visuals {
     w.open.corner_radius = control;
 
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Motion;
+
+    #[test]
+    fn motion_follows_the_setting_then_the_os() {
+        assert_eq!(Motion::from(Some("reduced"), || false), Motion::Reduced);
+        assert_eq!(Motion::from(Some("full"), || true), Motion::Full);
+        assert_eq!(Motion::from(None, || true), Motion::Reduced);
+        assert_eq!(Motion::from(Some("anything else"), || false), Motion::Full);
+    }
+
+    #[test]
+    fn reduced_motion_is_shorter_and_does_not_glide() {
+        assert_eq!(Motion::Full.base(), 0.16);
+        assert_eq!(Motion::Reduced.base(), 0.12);
+        let mut style = eframe::egui::Style::default();
+        Motion::Reduced.apply(&mut style);
+        assert_eq!(style.animation_time, 0.12);
+        assert_eq!(style.scroll_animation, eframe::egui::style::ScrollAnimation::none());
+        assert_eq!(style.interaction.tooltip_delay, 0.5);
+    }
 }
