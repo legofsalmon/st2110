@@ -10,7 +10,7 @@
 
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Shadow, Stroke, TextStyle, Theme, vec2};
 
-use crate::tokens::{color, elevation, radius, size, space, text};
+use crate::tokens::{color, elevation, motion, radius, size, space, text, timing};
 
 /// A colour from the design system, as egui takes it.
 const fn rgba(c: crate::tokens::Rgba) -> Color32 {
@@ -40,11 +40,78 @@ pub(crate) const SCRIM: Color32 = {
 pub(crate) const ON_CANVAS_TITLE: f32 = text::regular::HEADING.size;
 pub(crate) const ON_CANVAS_HINT: f32 = text::regular::PROSE.size;
 
-/// Sets the visuals for both themes, and the sizes.
+/// Sets the visuals for both themes, the sizes, and the motion.
 pub(crate) fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, dark());
     ctx.set_visuals_of(Theme::Light, light());
-    ctx.all_styles_mut(regular);
+    let motion = Motion::asked();
+    ctx.all_styles_mut(|style| {
+        regular(style);
+        motion.apply(style);
+    });
+}
+
+/// How much the window moves: the design system's full motion, or reduced, which
+/// removes movement and keeps the fades, shorter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Motion {
+    Full,
+    Reduced,
+}
+
+impl Motion {
+    /// The motion this machine asked for, read once. `ST2110_MOTION=reduced` (or
+    /// `full`) decides, for a show machine short of GPU or a screen recording;
+    /// otherwise the Mac's Reduce motion setting does; otherwise full.
+    pub(crate) fn asked() -> Self {
+        static ASKED: std::sync::OnceLock<Motion> = std::sync::OnceLock::new();
+        *ASKED.get_or_init(|| Self::from(std::env::var("ST2110_MOTION").ok().as_deref(), os_reduces_motion))
+    }
+
+    fn from(setting: Option<&str>, os_reduces: impl FnOnce() -> bool) -> Self {
+        match setting {
+            Some("reduced") => Self::Reduced,
+            Some("full") => Self::Full,
+            _ if os_reduces() => Self::Reduced,
+            _ => Self::Full,
+        }
+    }
+
+    /// Seconds for a small thing arriving near where it was asked for: a menu, the
+    /// port list, a fold.
+    fn base(self) -> f32 {
+        let ms = match self {
+            Self::Full => motion::full::duration::BASE,
+            Self::Reduced => motion::reduced::duration::BASE,
+        };
+        ms as f32 / 1000.0
+    }
+
+    fn apply(self, style: &mut egui::Style) {
+        // egui's menus, popups and folds open over animation_time.
+        style.animation_time = self.base();
+        // A list scrolled by a wheel or a key glides there; under reduced motion it
+        // jumps, as nothing travels.
+        if self == Self::Reduced {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        }
+        // Not animation: how long the pointer rests before a hover says what a
+        // control does. It never changes with motion.
+        style.interaction.tooltip_delay = timing::TOOLTIP as f32 / 1000.0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn os_reduces_motion() -> bool {
+    std::process::Command::new("defaults")
+        .args(["read", "com.apple.universalaccess", "reduceMotion"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_reduces_motion() -> bool {
+    false
 }
 
 /// The regular density: 32px controls and rows, 12px either side of a button's
@@ -223,4 +290,28 @@ fn visuals(mut v: egui::Visuals, r: &Roles) -> egui::Visuals {
     w.open.corner_radius = control;
 
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Motion;
+
+    #[test]
+    fn motion_follows_the_setting_then_the_os() {
+        assert_eq!(Motion::from(Some("reduced"), || false), Motion::Reduced);
+        assert_eq!(Motion::from(Some("full"), || true), Motion::Full);
+        assert_eq!(Motion::from(None, || true), Motion::Reduced);
+        assert_eq!(Motion::from(Some("anything else"), || false), Motion::Full);
+    }
+
+    #[test]
+    fn reduced_motion_is_shorter_and_does_not_glide() {
+        assert_eq!(Motion::Full.base(), 0.16);
+        assert_eq!(Motion::Reduced.base(), 0.12);
+        let mut style = eframe::egui::Style::default();
+        Motion::Reduced.apply(&mut style);
+        assert_eq!(style.animation_time, 0.12);
+        assert_eq!(style.scroll_animation, eframe::egui::style::ScrollAnimation::none());
+        assert_eq!(style.interaction.tooltip_delay, 0.5);
+    }
 }
