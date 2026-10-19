@@ -3142,8 +3142,14 @@ function render() {
     }
     const fits = new Set(r.fits);
     const where = r.device && r.device !== r.label ? r.device : "";
-    const thumb = live && r.format === "video" && r.active && r.sender_id
-      ? el("img", { class: "thumb", alt: "", "data-thumb": r.sender_id }) : null;
+    // The grid is drawn afresh on every read, so each receiver keeps its thumbnail's
+    // element: a new one would show nothing until its picture had loaded again.
+    let thumb = null;
+    if (live && r.format === "video" && r.active && r.sender_id) {
+      thumb = thumbs.get(r.id);
+      if (!thumb) { thumb = el("img", { class: "thumb", alt: "" }); thumbs.set(r.id, thumb); }
+      thumb.setAttribute("data-thumb", r.sender_id);
+    } else thumbs.delete(r.id);
     const tr = el("tr", {}, el("th", { class: "dst", title: r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
     columns.forEach((s, c) => {
       // The hover says what a click does in this mode, and the state it is in.
@@ -3313,6 +3319,7 @@ let refused = {};         // sender id -> why its stream is not being received
 let watched = [];         // sender ids asked for
 let opened = null;        // the sender whose details are open
 const cards = new Map();  // sender id -> its card
+const thumbs = new Map(); // receiver id -> its thumbnail in the grid
 
 function remembered() {
   try { const v = localStorage.getItem("st2110-router-live"); return v === null ? null : v === "1"; } catch (_) { return null; }
