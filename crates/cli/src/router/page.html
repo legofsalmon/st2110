@@ -3077,7 +3077,7 @@ async function read() {
     // Where, what, and what next; the grid keeps what was last read.
     $("banner").replaceChildren(el("div", { class: "ds-notice__body" },
       el("div", { class: "ds-notice__title", text: e.unreachable ? "The router is not answering" : "The registry cannot be read" }),
-      el("div", { text: `${e.message}. Trying again every 3 seconds, or Refresh now; the grid shows what was last read.` })));
+      el("div", { text: `${/[.?!]$/.test(e.message) ? e.message : e.message + "."} Trying again every 3 seconds, or Refresh now; the grid shows what was last read.` })));
     $("banner").hidden = false;
   } finally {
     reading = false;
