@@ -11,6 +11,7 @@ use serde_json::Value;
 use st2110_connect::Activation;
 use st2110_connect::client::{self, ConnectionClient};
 use st2110_connect::controller::{self, Connection, Outcome, Route, Settings, State, Take};
+use st2110_nmos::auth::Token;
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::routing::{self, Matrix};
 use st2110_nmos::{Kind, Snapshot};
@@ -37,6 +38,7 @@ pub(crate) struct Args {
     pub timeout: f64,
     pub wait: f64,
     pub tai_utc: i32,
+    pub auth: crate::auth::Auth,
 }
 
 pub(crate) fn run(args: &Args, format: Format) -> io::Result<ExitCode> {
@@ -97,10 +99,15 @@ impl From<serde_json::Error> for Failure {
 /// Reads the registry, with each Sender's SDP file when `fetch_sdp` is set, or a
 /// snapshot saved with `st2110 nmos --save`. A snapshot has no registry to check
 /// connections in afterwards.
-fn load(target: &str, timeout: Duration, fetch_sdp: bool) -> Result<(Snapshot, Option<QueryClient>), String> {
+fn load(
+    target: &str,
+    timeout: Duration,
+    fetch_sdp: bool,
+    token: Option<&Token>,
+) -> Result<(Snapshot, Option<QueryClient>), String> {
     let lower = target.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        let options = Options { timeout, fetch_sdp, ..Options::default() };
+        let options = Options { timeout, fetch_sdp, token: token.cloned(), ..Options::default() };
         let registry = QueryClient::connect(target, &options).map_err(|e| e.to_string())?;
         let snapshot = registry.snapshot().map_err(|e| e.to_string())?;
         return Ok((snapshot, Some(registry)));
@@ -114,7 +121,7 @@ fn load(target: &str, timeout: Duration, fetch_sdp: bool) -> Result<(Snapshot, O
 /// are read too, for the capabilities that are judged on them.
 fn list(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     let timeout = seconds("--timeout", args.timeout)?;
-    let (snapshot, _) = load(&args.target, timeout, true)?;
+    let (snapshot, _) = load(&args.target, timeout, true, args.auth.token(timeout, true)?.as_ref())?;
     let mut matrix = routing::matrix(&snapshot);
     if let Some(name) = &args.receiver {
         let receiver = routing::find(&snapshot, Kind::Receiver, name)?;
@@ -151,8 +158,9 @@ fn write_matrix(out: &mut impl Write, matrix: &Matrix, style: Style) -> io::Resu
 /// Cancels the activation scheduled on a Receiver.
 fn cancel(args: &Args, receiver: &str, format: Format) -> Result<ExitCode, Failure> {
     let timeout = seconds("--timeout", args.timeout)?;
-    let (snapshot, _) = load(&args.target, timeout, false)?;
-    let client = ConnectionClient::new(&client::Options { timeout, ..client::Options::default() });
+    let token = args.auth.token(timeout, true)?;
+    let (snapshot, _) = load(&args.target, timeout, false, token.as_ref())?;
+    let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
     let cancelled = controller::cancel(&snapshot, receiver, &client)?;
     let mut out = io::stdout().lock();
     match format {
@@ -270,8 +278,9 @@ fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     if timeout.is_zero() {
         return Err(Failure::Usage("--timeout 0 is not a number of seconds above 0".into()));
     }
-    let (snapshot, registry) = load(&args.target, timeout, false)?;
-    let client = ConnectionClient::new(&client::Options { timeout, ..client::Options::default() });
+    let token = args.auth.token(timeout, true)?;
+    let (snapshot, registry) = load(&args.target, timeout, false, token.as_ref())?;
+    let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
     let outcome = controller::connect(&snapshot, &routes, &client, registry.as_ref(), &settings)?;
     let mut out = io::stdout().lock();
     match format {

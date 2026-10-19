@@ -22,6 +22,7 @@ use serde_json::Value;
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
+use crate::auth;
 use crate::check::is_http;
 use crate::routing::transport_file_urls;
 use crate::{Kind, Manifest, Snapshot};
@@ -50,11 +51,21 @@ pub struct Options {
     /// Whether to use the proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names
     /// (except for hosts in `NO_PROXY`).
     pub env_proxy: bool,
+    /// The IS-10 access token to send, where the registry and the Nodes ask for one. It
+    /// is sent only over HTTPS, or to this machine ([`auth::may_send_to`]).
+    pub token: Option<auth::Token>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(5), page_size: 100, fetch_sdp: true, parallel: 16, env_proxy: true }
+        Self {
+            timeout: Duration::from_secs(5),
+            page_size: 100,
+            fetch_sdp: true,
+            parallel: 16,
+            env_proxy: true,
+            token: None,
+        }
     }
 }
 
@@ -77,6 +88,15 @@ impl std::error::Error for Error {}
 
 fn error(url: &str, message: impl Into<String>) -> Error {
     Error { url: url.to_string(), message: message.into() }
+}
+
+/// A Query API subscription: where to connect to hear its changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subscription {
+    /// The subscription's `id`.
+    pub id: String,
+    /// The WebSocket URL its changes come from.
+    pub ws_href: String,
 }
 
 /// A response: status, the paging headers and the body.
@@ -155,15 +175,35 @@ impl Http {
     }
 
     fn get(&self, url: &str, accept: &str, limit: u64) -> Result<Response, Error> {
-        // Transport files change when a Sender is reconfigured, so none may come from a
-        // cache (IS-05 v1.2 Behaviour: Transport Files & Caching).
-        let mut response = self
-            .agent
-            .get(url)
-            .header("Accept", accept)
-            .header("Cache-Control", "no-cache")
-            .call()
-            .map_err(|e| error(url, e.to_string()))?;
+        let token = self.options.token.as_ref().filter(|_| auth::may_send_to(url));
+        let mut retried = false;
+        let mut response = loop {
+            // Transport files change when a Sender is reconfigured, so none may come
+            // from a cache (IS-05 v1.2 Behaviour: Transport Files & Caching).
+            let mut request = self.agent.get(url).header("Accept", accept).header("Cache-Control", "no-cache");
+            let bearer = token.map(auth::Token::bearer).transpose().map_err(|e| error(url, e.message))?;
+            if let Some(bearer) = &bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            let response = request.call().map_err(|e| error(url, e.to_string()))?;
+            // A refused token may have expired or been revoked: get another, once.
+            if response.status() == 401
+                && !retried
+                && let (Some(token), Some(bearer)) = (token, &bearer)
+                && token.renewable()
+            {
+                token.refused(bearer);
+                retried = true;
+                continue;
+            }
+            if response.status() == 401 && self.options.token.is_some() && token.is_none() {
+                return Err(error(
+                    url,
+                    "HTTP 401: it asks for a token, and tokens are sent over https:// only, or to this machine",
+                ));
+            }
+            break response;
+        };
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let paged = header("X-Paging-Limit").is_some();
         let since = header("X-Paging-Since");
@@ -176,6 +216,38 @@ impl Http {
             .read_to_string()
             .map_err(|e| error(url, format!("reading the response: {e}")))?;
         Ok(Response { status, paged, since, until, body })
+    }
+
+    /// Sends a JSON request body, with the token as [`Http::get`] sends it.
+    fn post(&self, url: &str, body: &Value) -> Result<Response, Error> {
+        let token = self.options.token.as_ref().filter(|_| auth::may_send_to(url));
+        let mut retried = false;
+        loop {
+            let mut request =
+                self.agent.post(url).header("Accept", "application/json").header("Content-Type", "application/json");
+            let bearer = token.map(auth::Token::bearer).transpose().map_err(|e| error(url, e.message))?;
+            if let Some(bearer) = &bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            let mut response = request.send(body.to_string()).map_err(|e| error(url, e.to_string()))?;
+            let status = response.status().as_u16();
+            if status == 401
+                && !retried
+                && let (Some(token), Some(bearer)) = (token, &bearer)
+                && token.renewable()
+            {
+                token.refused(bearer);
+                retried = true;
+                continue;
+            }
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(BODY_LIMIT)
+                .read_to_string()
+                .map_err(|e| error(url, format!("reading the response: {e}")))?;
+            return Ok(Response { status, paged: false, since: None, until: None, body });
+        }
     }
 
     /// Reads a JSON response that must be there: HTTP 200.
@@ -399,6 +471,58 @@ impl QueryClient {
         self.http.manifest(href)
     }
 
+    /// Asks the registry to push changes to the resources under `resource_path`, such as
+    /// `/senders`, over a WebSocket (IS-04 Query API: Subscriptions). The subscription
+    /// is not persistent: the registry removes it once no client is connected to it.
+    pub fn subscribe(&self, resource_path: &str, max_update_rate_ms: u32) -> Result<Subscription, Error> {
+        let url = format!("{}subscriptions", self.base);
+        let mut body = serde_json::json!({
+            "max_update_rate_ms": max_update_rate_ms,
+            "resource_path": resource_path,
+            "params": {},
+            "persist": false,
+            "secure": self.base.to_ascii_lowercase().starts_with("https://"),
+        });
+        // IS-04 v1.3 asks whether the WebSocket wants a token, as IS-10 has it.
+        if self.version == "v1.3" {
+            body["authorization"] = Value::Bool(self.http.options.token.is_some());
+        }
+        let response = self.http.post(&url, &body)?;
+        if !matches!(response.status, 200 | 201) {
+            return Err(error(&url, format!("HTTP {}", response.status)));
+        }
+        let reply: Value =
+            serde_json::from_str(&response.body).map_err(|e| error(&url, format!("expected a subscription: {e}")))?;
+        let text = |name: &str| reply.get(name).and_then(Value::as_str).map(str::to_string);
+        match (text("id"), text("ws_href")) {
+            (Some(id), Some(ws_href)) => Ok(Subscription { id, ws_href }),
+            _ => Err(error(&url, "the subscription has no id or ws_href")),
+        }
+    }
+
+    /// The headers to connect to a subscription's `ws_href` with: the IS-10 token, where
+    /// one is configured and may be sent there.
+    pub fn websocket_headers(&self, ws_href: &str) -> Result<Vec<(String, String)>, Error> {
+        match self.http.options.token.as_ref().filter(|_| auth::may_send_to(ws_href)) {
+            Some(token) => {
+                let bearer = token.bearer().map_err(|e| error(ws_href, e.message))?;
+                Ok(vec![("Authorization".into(), format!("Bearer {bearer}"))])
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Tells the token it was refused on `ws_href`, so the next connection gets another.
+    pub fn token_refused(&self, headers: &[(String, String)]) {
+        if let Some(token) = &self.http.options.token {
+            for (_, value) in headers.iter().filter(|(name, _)| name == "Authorization") {
+                if let Some(bearer) = auth::bearer_token(value) {
+                    token.refused(bearer);
+                }
+            }
+        }
+    }
+
     /// Fetches transport files, several at once, in the order of `hrefs`.
     pub fn manifests(&self, hrefs: &[&str]) -> Vec<Manifest> {
         self.http.fetch(hrefs)
@@ -465,6 +589,58 @@ impl NodeClient {
     /// Fetches a transport file. Failures are recorded in the result, not returned.
     pub fn manifest(&self, href: &str) -> Manifest {
         self.http.manifest(href)
+    }
+
+    /// Asks the registry to push changes to the resources under `resource_path`, such as
+    /// `/senders`, over a WebSocket (IS-04 Query API: Subscriptions). The subscription
+    /// is not persistent: the registry removes it once no client is connected to it.
+    pub fn subscribe(&self, resource_path: &str, max_update_rate_ms: u32) -> Result<Subscription, Error> {
+        let url = format!("{}subscriptions", self.base);
+        let mut body = serde_json::json!({
+            "max_update_rate_ms": max_update_rate_ms,
+            "resource_path": resource_path,
+            "params": {},
+            "persist": false,
+            "secure": self.base.to_ascii_lowercase().starts_with("https://"),
+        });
+        // IS-04 v1.3 asks whether the WebSocket wants a token, as IS-10 has it.
+        if self.version == "v1.3" {
+            body["authorization"] = Value::Bool(self.http.options.token.is_some());
+        }
+        let response = self.http.post(&url, &body)?;
+        if !matches!(response.status, 200 | 201) {
+            return Err(error(&url, format!("HTTP {}", response.status)));
+        }
+        let reply: Value =
+            serde_json::from_str(&response.body).map_err(|e| error(&url, format!("expected a subscription: {e}")))?;
+        let text = |name: &str| reply.get(name).and_then(Value::as_str).map(str::to_string);
+        match (text("id"), text("ws_href")) {
+            (Some(id), Some(ws_href)) => Ok(Subscription { id, ws_href }),
+            _ => Err(error(&url, "the subscription has no id or ws_href")),
+        }
+    }
+
+    /// The headers to connect to a subscription's `ws_href` with: the IS-10 token, where
+    /// one is configured and may be sent there.
+    pub fn websocket_headers(&self, ws_href: &str) -> Result<Vec<(String, String)>, Error> {
+        match self.http.options.token.as_ref().filter(|_| auth::may_send_to(ws_href)) {
+            Some(token) => {
+                let bearer = token.bearer().map_err(|e| error(ws_href, e.message))?;
+                Ok(vec![("Authorization".into(), format!("Bearer {bearer}"))])
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Tells the token it was refused on `ws_href`, so the next connection gets another.
+    pub fn token_refused(&self, headers: &[(String, String)]) {
+        if let Some(token) = &self.http.options.token {
+            for (_, value) in headers.iter().filter(|(name, _)| name == "Authorization") {
+                if let Some(bearer) = auth::bearer_token(value) {
+                    token.refused(bearer);
+                }
+            }
+        }
     }
 
     /// Fetches transport files, several at once, in the order of `hrefs`.

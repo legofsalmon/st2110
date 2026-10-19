@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use st2110_nmos::Kind;
+use st2110_nmos::auth::{self, Token};
 use ureq::tls::{RootCerts, TlsConfig};
 use ureq::typestate::WithBody;
 use ureq::{Agent, RequestBuilder};
@@ -40,11 +41,14 @@ pub struct Options {
     /// Whether to use the proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names
     /// (except for hosts in `NO_PROXY`).
     pub env_proxy: bool,
+    /// The IS-10 access token to send, where the Connection APIs ask for one. It is sent
+    /// only over HTTPS, or to this machine.
+    pub token: Option<Token>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(5), env_proxy: true }
+        Self { timeout: Duration::from_secs(5), env_proxy: true, token: None }
     }
 }
 
@@ -114,6 +118,7 @@ impl Reply {
 pub struct ConnectionClient {
     agent: Agent,
     timeout: Duration,
+    token: Option<Token>,
 }
 
 impl ConnectionClient {
@@ -128,14 +133,19 @@ impl ConnectionClient {
             .user_agent(concat!("st2110-connect/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, timeout: options.timeout }
+        Self { agent, timeout: options.timeout, token: options.token.clone() }
     }
 
     /// Reads a resource, such as a Receiver's `/constraints` or `/active`, following
     /// redirects.
     pub fn get(&self, url: &str) -> Result<Reply, Error> {
-        let response = self.agent.get(url).header("Accept", "application/json").call();
-        read(url, response)
+        self.authorized(url, |bearer| {
+            let request = self.agent.get(url).header("Accept", "application/json");
+            match bearer {
+                Some(bearer) => request.header("Authorization", bearer).call(),
+                None => request.call(),
+            }
+        })
     }
 
     /// Changes a resource, such as a Receiver's `/staged`. A redirect is returned, not
@@ -148,7 +158,7 @@ impl ConnectionClient {
     /// Changes a resource as [`ConnectionClient::patch`] does, giving up after `limit`
     /// when that is sooner than the client's timeout.
     pub fn patch_within(&self, url: &str, body: &Value, limit: Duration) -> Result<Reply, Error> {
-        self.send(self.agent.patch(url), url, body, limit)
+        self.send(|| self.agent.patch(url), url, body, limit)
     }
 
     /// Sends a request, such as a `/bulk/receivers` one. A redirect is returned, not
@@ -160,35 +170,79 @@ impl ConnectionClient {
     /// Sends a request as [`ConnectionClient::post`] does, giving up after `limit` when
     /// that is sooner than the client's timeout.
     pub fn post_within(&self, url: &str, body: &Value, limit: Duration) -> Result<Reply, Error> {
-        self.send(self.agent.post(url), url, body, limit)
+        self.send(|| self.agent.post(url), url, body, limit)
     }
 
     fn send(
         &self,
-        request: RequestBuilder<WithBody>,
+        request: impl Fn() -> RequestBuilder<WithBody>,
         url: &str,
         body: &Value,
         limit: Duration,
     ) -> Result<Reply, Error> {
-        let request = request.config().max_redirects(0).timeout_global(Some(limit.min(self.timeout))).build();
-        let response = request
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .send(body.to_string());
-        read(url, response)
+        self.authorized(url, |bearer| {
+            let request = request()
+                .config()
+                .max_redirects(0)
+                .timeout_global(Some(limit.min(self.timeout)))
+                .build()
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json");
+            match bearer {
+                Some(bearer) => request.header("Authorization", bearer).send(body.to_string()),
+                None => request.send(body.to_string()),
+            }
+        })
     }
 
     /// Fetches a transport file: a Sender's `manifest_href`, or its `/transportfile`,
     /// which may redirect (IS-05 v1.2 Behaviour: Transport Files & Caching). None may
     /// come from a cache, since the file changes when the Sender is reconfigured.
     pub fn transport_file(&self, url: &str) -> Result<Reply, Error> {
-        let response = self
-            .agent
-            .get(url)
-            .header("Accept", "application/sdp, text/plain;q=0.9, */*;q=0.8")
-            .header("Cache-Control", "no-cache")
-            .call();
-        read(url, response)
+        self.authorized(url, |bearer| {
+            let request = self
+                .agent
+                .get(url)
+                .header("Accept", "application/sdp, text/plain;q=0.9, */*;q=0.8")
+                .header("Cache-Control", "no-cache");
+            match bearer {
+                Some(bearer) => request.header("Authorization", bearer).call(),
+                None => request.call(),
+            }
+        })
+    }
+
+    /// Makes a request with `send`, giving it the `Authorization` header to send, if
+    /// any. A refused token (HTTP 401) is swapped for another and the request made once
+    /// more: a 401 means nothing was done (IS-10 v1.0 Behaviour: Resource Servers).
+    fn authorized(
+        &self,
+        url: &str,
+        send: impl Fn(Option<String>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Reply, Error> {
+        let token = self.token.as_ref().filter(|_| auth::may_send_to(url));
+        let mut retried = false;
+        loop {
+            let bearer = token.map(Token::bearer).transpose().map_err(|e| error(url, e.message))?;
+            let response = send(bearer.as_ref().map(|b| format!("Bearer {b}")));
+            if let Ok(r) = &response
+                && r.status() == 401
+                && !retried
+                && let (Some(token), Some(bearer)) = (token, &bearer)
+                && token.renewable()
+            {
+                token.refused(bearer);
+                retried = true;
+                continue;
+            }
+            let mut reply = read(url, response)?;
+            if reply.status == 401 && self.token.is_some() && token.is_none() {
+                reply.body = Value::String(
+                    "it asks for a token, and tokens are sent over https:// only, or to this machine".into(),
+                );
+            }
+            return Ok(reply);
+        }
     }
 }
 
