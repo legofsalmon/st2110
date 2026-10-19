@@ -16,6 +16,7 @@ use crate::look;
 use crate::network::{self, Network};
 use crate::picture::Picture;
 use crate::receiving::{Origin, Port, Run, Source, Stream, file_name, ports};
+use crate::tokens;
 use st2110_discover::Found;
 
 /// How many SDP files the app remembers opening.
@@ -487,16 +488,20 @@ impl Viewer {
             }
             if let Origin::Network { by, .. } = &stream.origin {
                 ui.weak(format!("Found by {by}"));
-                save = ui.small_button("Save SDP file…").clicked();
+                save = look::small_button(ui, "Save SDP file…").clicked();
             }
             ui.separator();
-            egui::Grid::new("arrived").num_columns(2).striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
-                for row in health::rows(&self.seen) {
-                    ui.label(row.label);
-                    ui.label(RichText::new(row.value).color(tone_color(ui, row.tone)));
-                    ui.end_row();
-                }
-            });
+            egui::Grid::new("arrived")
+                .num_columns(2)
+                .striped(true)
+                .spacing([tokens::space::STEP_3, tokens::space::STEP_1])
+                .show(ui, |ui| {
+                    for row in health::rows(&self.seen) {
+                        ui.label(row.label);
+                        ui.label(RichText::new(row.value).color(tone_color(ui, row.tone)));
+                        ui.end_row();
+                    }
+                });
             let report = self.seen.report.as_ref();
             let problems = report.map_or(&[][..], |r| &r.problems[..]);
             if !problems.is_empty() {
@@ -531,8 +536,8 @@ impl Viewer {
         let painter = ui.painter().clone();
         painter.rect_filled(space, 0.0, look::CANVAS);
         let middle = space.center();
-        let big = FontId::proportional(20.0);
-        let small = FontId::proportional(14.0);
+        let big = FontId::proportional(look::ON_CANVAS_TITLE);
+        let small = FontId::proportional(look::ON_CANVAS_HINT);
         match (&self.stream, &self.picture) {
             (None, _) => {
                 let (title, hint) = if self.network.is_some() {
@@ -545,7 +550,8 @@ impl Viewer {
                 };
                 painter.text(middle - vec2(0.0, 40.0), Align2::CENTER_CENTER, title, big, look::ON_CANVAS);
                 painter.text(middle - vec2(0.0, 12.0), Align2::CENTER_CENTER, hint, small, look::ON_CANVAS_WEAK);
-                let button = egui::Rect::from_center_size(middle + vec2(0.0, 24.0), vec2(140.0, 28.0));
+                let button =
+                    egui::Rect::from_center_size(middle + vec2(0.0, 24.0), vec2(140.0, tokens::size::regular::CONTROL));
                 if ui.put(button, egui::Button::new("Open SDP file…")).clicked() {
                     self.pick_sdp(&ctx);
                 }
@@ -565,10 +571,11 @@ impl Viewer {
                     painter.text(middle, Align2::CENTER_CENTER, text, big, look::ON_CANVAS);
                 } else if running && let Some(quiet) = self.seen.quiet.filter(|q| *q >= Duration::from_secs(1)) {
                     let text = format!("Nothing for {} s", quiet.as_secs());
-                    let corner = pos2(at.min.x.max(space.min.x) + 12.0, at.min.y.max(space.min.y) + 12.0);
+                    let inset = tokens::space::STEP_3;
+                    let corner = pos2(at.min.x.max(space.min.x) + inset, at.min.y.max(space.min.y) + inset);
                     let galley = painter.layout_no_wrap(text, big, look::ON_CANVAS_WARN);
-                    let badge = egui::Rect::from_min_size(corner, galley.size()).expand(6.0);
-                    painter.rect_filled(badge, 4.0, Color32::from_black_alpha(190));
+                    let badge = egui::Rect::from_min_size(corner, galley.size()).expand(tokens::space::STEP_2);
+                    painter.rect_filled(badge, tokens::radius::regular::CONTROL, look::SCRIM);
                     painter.galley(corner, galley, look::ON_CANVAS_WARN);
                 }
                 // Double-click for the picture alone, filling the screen.
@@ -581,7 +588,8 @@ impl Viewer {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             painter.rect_filled(space, 0.0, look::VEIL);
             let text = "Drop an SDP file to open it, or a capture to play it";
-            painter.text(middle, Align2::CENTER_CENTER, text, FontId::proportional(20.0), look::ON_CANVAS);
+            let big = FontId::proportional(look::ON_CANVAS_TITLE);
+            painter.text(middle, Align2::CENTER_CENTER, text, big, look::ON_CANVAS);
         }
     }
 

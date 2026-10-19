@@ -1,10 +1,16 @@
 //! How the window looks: egui's visuals built from the shared design system's roles
-//! (legofsalmon/design-system, vendored as `tokens.rs`), in both themes. The app
-//! follows the system's theme, as it did on egui's own visuals.
+//! (legofsalmon/design-system, vendored as `tokens.rs`), in both themes, spaced at
+//! its regular density. The app follows the system's theme, as it did on egui's own
+//! visuals.
+//!
+//! The type stays egui's own faces, sized by the design system's text styles: IBM
+//! Plex is the system's face, and egui reads font files, not the system's fonts, so
+//! taking it means bundling the files, which waits for the design system to ship
+//! them.
 
-use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke, Theme};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Shadow, Stroke, TextStyle, Theme, vec2};
 
-use crate::tokens::{color, elevation, radius};
+use crate::tokens::{color, elevation, radius, size, space, text};
 
 /// A colour from the design system, as egui takes it.
 const fn rgba(c: crate::tokens::Rgba) -> Color32 {
@@ -22,11 +28,48 @@ pub(crate) const ON_CANVAS_WARN: Color32 = rgba(color::dark::warn::INK);
 
 /// Behind what is laid over the picture: a file being dropped on it.
 pub(crate) const VEIL: Color32 = rgba(color::dark::VEIL);
+/// Behind words laid on the picture itself, which can be any colour: the canvas,
+/// three quarters opaque, so the warning ink keeps its contrast over white. The
+/// design system has no role for this yet; the veil is too light for it.
+pub(crate) const SCRIM: Color32 = {
+    let c = color::dark::surface::CANVAS;
+    Color32::from_rgba_unmultiplied_const(c.r, c.g, c.b, 190)
+};
 
-/// Sets the visuals for both themes.
+/// Text over the picture: a line that says what to do, and its hint.
+pub(crate) const ON_CANVAS_TITLE: f32 = text::regular::HEADING.size;
+pub(crate) const ON_CANVAS_HINT: f32 = text::regular::PROSE.size;
+
+/// Sets the visuals for both themes, and the sizes.
 pub(crate) fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, dark());
     ctx.set_visuals_of(Theme::Light, light());
+    ctx.all_styles_mut(regular);
+}
+
+/// The regular density: 32px controls and rows, 12px either side of a button's
+/// label, the 4px grid between things, and the text styles' sizes.
+fn regular(style: &mut egui::Style) {
+    let s = &mut style.spacing;
+    // A button, a menu and a choice are the control height; so is a row of the grid.
+    s.interact_size = vec2(space::STEP_10, size::regular::CONTROL);
+    s.button_padding = vec2(size::regular::CONTROL_PADDING, space::STEP_1);
+    s.item_spacing = vec2(space::STEP_2, space::STEP_1);
+    s.window_margin = Margin::same(space::STEP_2 as i8);
+    s.menu_margin = Margin::same(space::STEP_2 as i8);
+    let t = &mut style.text_styles;
+    t.insert(TextStyle::Small, FontId::proportional(text::regular::CAPTION.size));
+    t.insert(TextStyle::Body, FontId::proportional(text::regular::BODY.size));
+    t.insert(TextStyle::Button, FontId::proportional(text::regular::CONTROL.size));
+    t.insert(TextStyle::Heading, FontId::proportional(text::regular::TITLE.size));
+    t.insert(TextStyle::Monospace, FontId::monospace(text::regular::CODE.size));
+}
+
+/// A button in a line of text or a panel's head: the small control's height, which
+/// is also the smallest anything is to hit (egui's own small button is the text's
+/// height).
+pub(crate) fn small_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(label).small().min_size(vec2(0.0, size::regular::CONTROL_SM)))
 }
 
 /// One theme's roles, as the visuals need them.
