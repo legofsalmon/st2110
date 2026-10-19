@@ -43,6 +43,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "client")]
+pub mod auth;
 mod caps;
 mod check;
 #[cfg(feature = "client")]
@@ -52,6 +54,8 @@ mod report;
 pub mod routing;
 pub mod rules;
 mod snapshot;
+#[cfg(feature = "client")]
+pub mod ws;
 
 pub use check::check;
 pub use model::Kind;

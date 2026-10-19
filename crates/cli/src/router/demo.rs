@@ -8,18 +8,28 @@
 //! and audio, and a fourth takes only the graphics machine's size, so some crosspoints
 //! cannot be made.
 //!
-//! The streams are real: [`Facility::start_streams`] sends each Sender's from this
+//! The streams are real: [`super::signal::start`] sends each Sender's from this
 //! machine, on the loopback interface, so the router can show them. They are small
 //! pictures at 25 frames a second, so that a laptop carries them all with ease.
+//!
+//! Its Query API takes subscriptions, and pushes each change to them over a WebSocket,
+//! as a registry does. With `--demo-auth` it asks for IS-10 tokens too, and serves the
+//! Authorization Server to get them from: one client, [`CLIENT_ID`] with
+//! [`CLIENT_SECRET`], whose tokens last a minute. Its tokens are opaque strings it keeps
+//! a list of, where a real Authorization Server issues signed JWTs for each Resource
+//! Server to check for itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::format::{AudioFormat, VideoFormat};
 use st2110_ptp::PtpTime;
 use st2110_sdp::Rational;
+
+use st2110_nmos::auth;
 
 use super::http::{Request, Response};
 use crate::timing::now;
@@ -86,8 +96,34 @@ fn error(code: u16, message: &str, debug: &str) -> (u16, Value) {
     (code, json!({"code": code, "error": message, "debug": debug}))
 }
 
+/// The demo Authorization Server's one client.
+pub(crate) const CLIENT_ID: &str = "st2110-demo";
+
+/// Its secret: this is a demo, on this machine.
+pub(crate) const CLIENT_SECRET: &str = "demo-secret";
+
+/// How long a demo token lasts, short enough to see one renewed.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Where the demo Authorization Server hands out tokens.
+const TOKEN_PATH: &str = "/x-nmos/auth/v1.0/token";
+
+/// Where its metadata is (RFC 8414).
+const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// Where the Query API's subscriptions are heard.
+pub(crate) const WS_PATH: &str = "/x-nmos/query/v1.3/ws/";
+
+/// A token the demo Authorization Server issued.
+struct Issued {
+    scopes: Vec<String>,
+    expires: Instant,
+}
+
 /// The registry, and every Node's Connection API.
 pub(crate) struct Facility {
+    /// Where it is served, such as `http://127.0.0.1:8110`.
+    base: String,
     tai_utc: i32,
     /// The registry's resources, by type: `nodes`, `devices` and so on.
     registry: BTreeMap<&'static str, Vec<Value>>,
@@ -95,6 +131,15 @@ pub(crate) struct Facility {
     sdp: BTreeMap<String, String>,
     /// Each Sender's stream, keyed by Sender `id`: its label and description.
     streams: BTreeMap<String, (String, Description)>,
+    /// The Query API's subscriptions, by `id`.
+    subscriptions: BTreeMap<String, Value>,
+    /// Changes to the registry not yet pushed to subscriptions: the resource type, and
+    /// the resource before and after.
+    changes: Vec<(&'static str, Value, Value)>,
+    /// The tokens issued, with `--demo-auth`.
+    tokens: Option<HashMap<String, Issued>>,
+    /// Whether a Receiver changed since the facility was last kept.
+    dirty: bool,
 }
 
 /// A Sender to build: its label, Flow facts and SDP file.
@@ -138,11 +183,16 @@ impl Facility {
     /// monitors already taking cameras.
     pub(crate) fn new(base: &str, tai_utc: i32) -> Self {
         let mut facility = Self {
+            base: base.to_string(),
             tai_utc,
             registry: BTreeMap::new(),
             receivers: BTreeMap::new(),
             sdp: BTreeMap::new(),
             streams: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
+            changes: Vec::new(),
+            tokens: None,
+            dirty: false,
         };
         for kind in ["nodes", "devices", "sources", "flows", "senders", "receivers"] {
             facility.registry.insert(kind, Vec::new());
@@ -199,7 +249,20 @@ impl Facility {
                 debug_assert_eq!(facility.receivers[&receiver].active["sender_id"], json!(sender), "{kind}");
             }
         }
+        facility.changes.clear();
+        facility.dirty = false;
         facility
+    }
+
+    /// Asks for IS-10 tokens on the Query and Connection APIs, and hands them out.
+    pub(crate) fn with_auth(mut self) -> Self {
+        self.tokens = Some(HashMap::new());
+        self
+    }
+
+    /// The Authorization Server's issuer URL, with `--demo-auth`.
+    pub(crate) fn auth_server(&self) -> Option<String> {
+        self.tokens.as_ref().map(|_| format!("{}/", self.base))
     }
 
     /// What a Receiver's legs take from an SDP file, for setting up the demo.
@@ -367,12 +430,18 @@ impl Facility {
 
     /// Whether a request is for the facility, rather than the router.
     pub(crate) fn serves(path: &str) -> bool {
-        path.starts_with("/x-nmos/") || path.starts_with("/node/")
+        path.starts_with("/x-nmos/") || path.starts_with("/node/") || path.starts_with(METADATA_PATH)
     }
 
-    /// Answers a request for the registry or a Connection API.
+    /// Answers a request for the registry, a Connection API or the Authorization Server.
     pub(crate) fn answer(&mut self, request: &Request) -> Response {
         self.settle();
+        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH {
+            return self.authorization_server(request);
+        }
+        if let Err(refused) = self.authorized(request) {
+            return refused;
+        }
         let body: Value = if request.body.is_empty() {
             Value::Null
         } else {
@@ -393,8 +462,11 @@ impl Facility {
     fn route(&mut self, method: &str, path: &str, body: &Value) -> (u16, Value) {
         let path = path.trim_end_matches('/');
         if let Some(rest) = path.strip_prefix("/x-nmos/query") {
+            if method == "POST" && rest == "/v1.3/subscriptions" {
+                return self.subscribe(body);
+            }
             if method != "GET" {
-                return error(405, "Method Not Allowed", "the Query API only reads");
+                return error(405, "Method Not Allowed", "the Query API only reads, and takes subscriptions");
             }
             return self.query(rest);
         }
@@ -420,6 +492,7 @@ impl Facility {
             let Some(items) = body.as_array() else {
                 return error(400, "Bad Request", "a bulk request is an array");
             };
+            self.dirty = true;
             let results = items
                 .iter()
                 .map(|item| {
@@ -449,7 +522,10 @@ impl Facility {
             ("GET", "constraints") => (200, receiver.constraints.clone()),
             ("GET", "staged") => (200, receiver.staged.clone()),
             ("GET", "active") => (200, receiver.active.clone()),
-            ("PATCH", "staged") => self.stage(id, body),
+            ("PATCH", "staged") => {
+                self.dirty = true;
+                self.stage(id, body)
+            }
             _ => error(405, "Method Not Allowed", ""),
         }
     }
@@ -460,7 +536,14 @@ impl Facility {
         let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
         match parts.as_slice() {
             [] => (200, json!(["v1.3/"])),
-            ["v1.3"] => (200, json!(["nodes/", "devices/", "sources/", "flows/", "senders/", "receivers/"])),
+            ["v1.3"] => {
+                (200, json!(["nodes/", "devices/", "sources/", "flows/", "senders/", "receivers/", "subscriptions/"]))
+            }
+            ["v1.3", "subscriptions"] => (200, Value::Array(self.subscriptions.values().cloned().collect())),
+            ["v1.3", "subscriptions", id] => match self.subscriptions.get(*id) {
+                Some(subscription) => (200, subscription.clone()),
+                None => error(404, "Not Found", "no such subscription"),
+            },
             ["v1.3", kind] => match self.registry.get(kind) {
                 Some(list) => (200, Value::Array(list.clone())),
                 None => error(404, "Not Found", "no such resource type"),
@@ -478,7 +561,7 @@ impl Facility {
     }
 
     /// Carries out the scheduled activations that are due.
-    fn settle(&mut self) {
+    pub(crate) fn settle(&mut self) {
         let now = self.now();
         let due: Vec<(String, PtpTime)> = self
             .receivers
@@ -585,13 +668,247 @@ impl Facility {
         receiver.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
         let subscription =
             json!({"sender_id": receiver.active["sender_id"], "active": receiver.active["master_enable"]});
+        self.register(id, subscription, at);
+        self.dirty = true;
+    }
+
+    /// Tells the registry what a Receiver takes now, as its Node would.
+    fn register(&mut self, id: &str, subscription: Value, at: PtpTime) {
         if let Some(registered) =
             self.registry.get_mut("receivers").and_then(|list| list.iter_mut().find(|r| r["id"] == id))
         {
+            let pre = registered.clone();
             registered["subscription"] = subscription;
             registered["version"] = json!(tai(at));
+            self.changes.push(("receivers", pre, registered.clone()));
         }
     }
+
+    /// Each Receiver's staged and active parameters, to keep for the next run.
+    pub(crate) fn export(&self) -> Value {
+        let receivers: serde_json::Map<String, Value> = self
+            .receivers
+            .iter()
+            .map(|(id, r)| (id.clone(), json!({"staged": r.staged, "active": r.active})))
+            .collect();
+        json!({"receivers": receivers})
+    }
+
+    /// Puts back what [`Facility::export`] kept: each Receiver takes what it took. What
+    /// was scheduled and not yet due is not scheduled again.
+    pub(crate) fn restore(&mut self, kept: &Value) {
+        let now = self.now();
+        let ids: Vec<String> = self.receivers.keys().cloned().collect();
+        for id in ids {
+            let Some(saved) = kept["receivers"].get(&id) else { continue };
+            let legs = self.receivers[&id].constraints.as_array().map_or(0, Vec::len);
+            let fits = |v: &Value| v["transport_params"].as_array().is_some_and(|p| p.len() == legs);
+            if !fits(&saved["staged"]) || !fits(&saved["active"]) {
+                continue;
+            }
+            let receiver = self.receivers.get_mut(&id).expect("a known Receiver");
+            receiver.staged = saved["staged"].clone();
+            receiver.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
+            receiver.active = saved["active"].clone();
+            receiver.pending = None;
+            let subscription =
+                json!({"sender_id": receiver.active["sender_id"], "active": receiver.active["master_enable"]});
+            self.register(&id, subscription, now);
+        }
+        self.changes.clear();
+        self.dirty = false;
+    }
+
+    /// Whether a Receiver changed since this was last asked.
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// `POST /subscriptions`: a subscription to changes under one resource path.
+    fn subscribe(&mut self, body: &Value) -> (u16, Value) {
+        let path = body["resource_path"].as_str().unwrap_or_default().trim_end_matches('/');
+        let kind = path.trim_start_matches('/');
+        if path.is_empty() || !self.registry.contains_key(kind) {
+            return error(
+                400,
+                "Bad Request",
+                "resource_path is one of /nodes, /devices, /sources, /flows, /senders and /receivers",
+            );
+        }
+        if body["persist"] == true {
+            return error(400, "Bad Request", "the demo registry keeps no persistent subscriptions");
+        }
+        let authorization = self.tokens.is_some();
+        // The same request has the same subscription (IS-04 Query API: Subscriptions).
+        if let Some(existing) = self.subscriptions.values().find(|s| s["resource_path"] == path) {
+            return (200, existing.clone());
+        }
+        let n = u32::try_from(self.subscriptions.len()).unwrap_or(u32::MAX) + 1;
+        let id = id("5ab5", n);
+        let ws_base = self.base.replacen("http://", "ws://", 1);
+        let subscription = json!({
+            "id": id, "ws_href": format!("{ws_base}{WS_PATH}?uid={id}"),
+            "max_update_rate_ms": body["max_update_rate_ms"].as_u64().unwrap_or(100),
+            "persist": false, "secure": false, "resource_path": path, "params": {},
+            "authorization": authorization,
+        });
+        self.subscriptions.insert(id, subscription.clone());
+        (201, subscription)
+    }
+
+    /// The subscription a WebSocket to `uid` hears.
+    pub(crate) fn subscription(&self, uid: &str) -> Option<&Value> {
+        self.subscriptions.get(uid)
+    }
+
+    /// The first message on a subscription's WebSocket: everything under its path.
+    pub(crate) fn sync(&self, uid: &str) -> Option<String> {
+        let subscription = self.subscriptions.get(uid)?;
+        let kind = subscription["resource_path"].as_str()?.trim_start_matches('/');
+        let data: Vec<Value> =
+            self.registry.get(kind)?.iter().map(|r| json!({"path": r["id"], "pre": r, "post": r})).collect();
+        Some(self.grain(uid, kind, data))
+    }
+
+    /// The changes since this was last asked, as messages for each subscription: its
+    /// `id`, and the message.
+    pub(crate) fn take_changes(&mut self) -> Vec<(String, String)> {
+        let changes = std::mem::take(&mut self.changes);
+        let mut out = Vec::new();
+        for (uid, subscription) in &self.subscriptions {
+            let kind = subscription["resource_path"].as_str().unwrap_or_default().trim_start_matches('/');
+            let data: Vec<Value> = changes
+                .iter()
+                .filter(|(k, ..)| *k == kind)
+                .map(|(_, pre, post)| json!({"path": post["id"], "pre": pre, "post": post}))
+                .collect();
+            if !data.is_empty() {
+                out.push((uid.clone(), self.grain(uid, kind, data)));
+            }
+        }
+        out
+    }
+
+    /// A Query API WebSocket message (IS-04 v1.3 APIs: Query API, WebSocket messages).
+    fn grain(&self, uid: &str, kind: &str, data: Vec<Value>) -> String {
+        let now = tai(self.now());
+        json!({
+            "grain_type": "event", "source_id": id("9e57", 1), "flow_id": uid,
+            "origin_timestamp": now, "sync_timestamp": now, "creation_timestamp": now,
+            "rate": {"numerator": 0, "denominator": 1}, "duration": {"numerator": 0, "denominator": 1},
+            "grain": {"type": "urn:x-nmos:format:data.event", "topic": format!("/{kind}/"), "data": data},
+        })
+        .to_string()
+    }
+
+    /// Whether a request carries a token for what it asks, with `--demo-auth`: `Err`
+    /// with the refusal when it does not (IS-10 v1.0 Behaviour: Resource Servers). A
+    /// WebSocket may carry it as `access_token` in the query, as IS-10 allows.
+    pub(crate) fn authorized(&mut self, request: &Request) -> Result<(), Response> {
+        let Some(tokens) = &mut self.tokens else {
+            return Ok(());
+        };
+        let scope = if request.path.starts_with("/x-nmos/query") {
+            "query"
+        } else if request.path.starts_with("/node/") {
+            "connection"
+        } else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        tokens.retain(|_, issued| issued.expires > now);
+        let from_query = request.path.starts_with(WS_PATH).then(|| request.param("access_token")).flatten();
+        let token = request.header("Authorization").and_then(auth::bearer_token).map(str::to_string).or(from_query);
+        let refuse = |status: u16, error: &str, why: &str| {
+            let mut response = Response::error(status, why);
+            response.headers.push((
+                "WWW-Authenticate",
+                format!("Bearer realm=\"st2110 demo\", error=\"{error}\", scope=\"{scope}\""),
+            ));
+            Err(response)
+        };
+        match token.as_deref().map(|t| tokens.get(t)) {
+            None => {
+                refuse(401, "invalid_request", "this demo asks for an IS-10 token: run the router with --demo-auth")
+            }
+            Some(None) => refuse(401, "invalid_token", "the token has expired, or was never issued here"),
+            Some(Some(issued)) if !issued.scopes.iter().any(|s| s == scope) => {
+                refuse(403, "insufficient_scope", &format!("the token's scopes do not include {scope}"))
+            }
+            Some(Some(_)) => Ok(()),
+        }
+    }
+
+    /// The demo Authorization Server: its metadata, and its token endpoint.
+    fn authorization_server(&mut self, request: &Request) -> Response {
+        let base = self.base.clone();
+        let Some(tokens) = &mut self.tokens else {
+            return Response::error(404, "this demo asks for no tokens: run the router with --demo-auth for them");
+        };
+        if request.path.starts_with(METADATA_PATH) {
+            return Response::json(
+                200,
+                &json!({
+                    "issuer": format!("{base}/"),
+                    "token_endpoint": format!("{base}{TOKEN_PATH}"),
+                    "grant_types_supported": ["client_credentials"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "response_types_supported": ["none"],
+                    "scopes_supported": ["query", "connection"],
+                }),
+            );
+        }
+        let oauth_error = |status: u16, error: &str, description: &str| {
+            let mut response = Response::json(status, &json!({"error": error, "error_description": description}));
+            if status == 401 {
+                response.headers.push(("WWW-Authenticate", "Basic realm=\"st2110 demo\"".into()));
+            }
+            response
+        };
+        if request.method != "POST" {
+            return oauth_error(405, "invalid_request", "ask for a token with POST");
+        }
+        let credentials = request.header("Authorization").and_then(auth::basic_credentials);
+        if credentials.as_ref().is_none_or(|(id, secret)| id != CLIENT_ID || secret != CLIENT_SECRET) {
+            return oauth_error(401, "invalid_client", "the client id or secret is not this demo's");
+        }
+        let form: HashMap<String, String> = String::from_utf8_lossy(&request.body)
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, value)| (auth::form_decode(name), auth::form_decode(value)))
+            .collect();
+        if form.get("grant_type").map(String::as_str) != Some("client_credentials") {
+            return oauth_error(400, "unsupported_grant_type", "this demo issues tokens by client_credentials only");
+        }
+        let asked = form.get("scope").map_or("query connection", String::as_str);
+        let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
+        if scopes.is_empty() || scopes.iter().any(|s| s != "query" && s != "connection") {
+            return oauth_error(400, "invalid_scope", "this demo's scopes are query and connection");
+        }
+        let token = random_token();
+        let now = Instant::now();
+        tokens.retain(|_, issued| issued.expires > now);
+        tokens.insert(token.clone(), Issued { scopes: scopes.clone(), expires: now + TOKEN_LIFETIME });
+        Response::json(
+            200,
+            &json!({
+                "access_token": token, "token_type": "Bearer",
+                "expires_in": TOKEN_LIFETIME.as_secs(), "scope": scopes.join(" "),
+            }),
+        )
+    }
+}
+
+/// A token no one can guess ahead, for the demo: the standard library's random hash keys.
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    (0..4)
+        .map(|n| {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(n);
+            format!("{:016x}", hasher.finish())
+        })
+        .collect()
 }
 
 #[cfg(test)]

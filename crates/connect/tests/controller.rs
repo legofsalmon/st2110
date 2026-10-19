@@ -386,7 +386,8 @@ impl Mock {
     }
 
     fn connect(&self, routes: &[Route], settings: &Settings) -> Outcome {
-        let client = ConnectionClient::new(&Options { timeout: Duration::from_millis(800), env_proxy: false });
+        let client =
+            ConnectionClient::new(&Options { timeout: Duration::from_millis(800), env_proxy: false, token: None });
         connect(&self.snapshot(), routes, &client, Some(&self.registry()), settings).expect("the names are good")
     }
 

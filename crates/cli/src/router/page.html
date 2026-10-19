@@ -2991,7 +2991,8 @@ pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-spa
   <h1>ST 2110 Router</h1>
   <span id="demo" class="ds-chip ds-chip--warn" title="A demo facility on this machine: nothing here reaches real equipment" hidden>Demo</span>
   <span id="registry" class="registry"></span>
-  <span class="status"><span id="dot" class="ds-dot ds-dot--off"></span><span id="read">Reading the registry…</span></span>
+  <span id="auth" class="ds-chip" title="Requests to the registry and the Nodes carry an IS-10 access token" hidden>IS-10</span>
+  <span id="status" class="status"><span id="dot" class="ds-dot ds-dot--off"></span><span id="read">Reading the registry…</span></span>
 </header>
 <div class="toolbar">
   <div class="ds-seg" role="group" aria-label="Level" id="levels"></div>
@@ -3057,28 +3058,100 @@ async function call(url, options) {
   }
   let body = null;
   try { body = await response.json(); } catch (_) { /* not JSON */ }
-  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error((body && body.error) || `HTTP ${response.status}`), { body });
   return body;
+}
+
+// Live updates: the router pushes each change over a WebSocket, as the registry tells
+// it of them. While the socket is down the page reads every 3 seconds, as it did
+// before, and connects again.
+let socket = null;
+let socketOpen = false;
+let subscribed = false;    // whether the registry tells the router of each change
+let readAt = null;         // when the router last read the registry
+let retryIn = 1000;
+
+function listen() {
+  if (socket) return;
+  try {
+    socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/events`);
+  } catch (_) { socket = null; return; }
+  socket.onopen = () => { socketOpen = true; retryIn = 1000; showStatus(); };
+  socket.onmessage = (event) => {
+    let m;
+    try { m = JSON.parse(event.data); } catch (_) { return; }
+    if ("subscribed" in m) subscribed = m.subscribed;
+    if (m.type === "hello") showLog(m.log || []);
+    else if (m.type === "state") applyState(m);
+    else if (m.type === "read") { readAt = m.read_at; showStatus(); }
+    else if (m.type === "error") showFailure(m.message, false);
+    else if (m.type === "log") logEntry(m.entry);
+    else if (m.type === "live" && live) { liveStatus = m.senders || {}; showLive(); }
+  };
+  socket.onclose = () => {
+    const was = socketOpen;
+    socket = null;
+    socketOpen = false;
+    showStatus();
+    if (was) read();
+    setTimeout(listen, retryIn);
+    retryIn = Math.min(retryIn * 2, 5000);
+  };
+}
+
+function applyState(next) {
+  state = next;
+  readAt = next.read_at;
+  if ("subscribed" in next) subscribed = next.subscribed;
+  if (live === null) setLive(remembered() ?? (state.demo && state.previews > 0));
+  restoreArmed();
+  $("banner").hidden = true;
+  showStatus();
+  render();
+}
+
+// How the page hears of changes shows in the status: live as they happen, read every
+// 3 seconds by the router, or read every 3 seconds by the page itself.
+function showStatus() {
+  if (!$("banner").hidden && $("dot").className.includes("bad")) return;
+  if (readAt == null) return;
+  const time = new Date(readAt).toLocaleTimeString();
+  $("dot").className = "ds-dot ds-dot--ok";
+  if (socketOpen && subscribed) {
+    $("read").textContent = `Live · read ${time}`;
+    $("status").title = "The registry tells the router of each change, and this page shows it as it happens";
+  } else if (socketOpen) {
+    $("read").textContent = `Read ${time} · every 3 s`;
+    $("status").title = "The registry offers the router no subscriptions, so the router reads it every 3 seconds and this page shows each change";
+  } else {
+    $("read").textContent = `Read at ${time}`;
+    $("status").title = "This page cannot hear the router's updates, so it reads the registry every 3 seconds";
+  }
+}
+
+function showFailure(message, unreachable) {
+  $("dot").className = "ds-dot ds-dot--bad";
+  $("read").textContent = unreachable ? "Router unreachable" : "Registry unreachable";
+  $("status").title = "";
+  // Where, what, and what next; the grid keeps what was last read.
+  const next = unreachable || !socketOpen
+    ? "Trying again every 3 seconds, or Refresh now"
+    : "This page updates as soon as it answers, or Refresh now";
+  $("banner").replaceChildren(el("div", { class: "ds-notice__body" },
+    el("div", { class: "ds-notice__title", text: unreachable ? "The router is not answering" : "The registry cannot be read" }),
+    el("div", { text: `${/[.?!]$/.test(message) ? message : message + "."} ${next}; the grid shows what was last read.` })));
+  $("banner").hidden = false;
 }
 
 async function read() {
   if (reading || taking) return;
   reading = true;
   try {
-    state = await call("/api/state");
-    if (live === null) setLive(remembered() ?? (state.demo && state.previews > 0));
-    $("dot").className = "ds-dot ds-dot--ok";
-    $("read").textContent = `Read at ${new Date(state.read_at).toLocaleTimeString()}`;
+    const next = await call("/api/state");
     $("banner").hidden = true;
-    render();
+    applyState(next);
   } catch (e) {
-    $("dot").className = "ds-dot ds-dot--bad";
-    $("read").textContent = e.unreachable ? "Router unreachable" : "Registry unreachable";
-    // Where, what, and what next; the grid keeps what was last read.
-    $("banner").replaceChildren(el("div", { class: "ds-notice__body" },
-      el("div", { class: "ds-notice__title", text: e.unreachable ? "The router is not answering" : "The registry cannot be read" }),
-      el("div", { text: `${/[.?!]$/.test(e.message) ? e.message : e.message + "."} Trying again every 3 seconds, or Refresh now; the grid shows what was last read.` })));
-    $("banner").hidden = false;
+    showFailure(e.message, e.unreachable);
   } finally {
     reading = false;
   }
@@ -3112,6 +3185,8 @@ function name(resource) {
 function render() {
   if (!state) return;
   $("registry").textContent = state.registry;
+  $("registry").title = state.auth ? `IS-10: ${state.auth}` : "";
+  $("auth").hidden = !state.auth;
   $("demo").hidden = !state.demo;
   renderLevels();
   const shown = (format) => level === "all" || format === level;
@@ -3247,16 +3322,18 @@ async function take(routes) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ routes, dry_run: $("dry").checked }),
     });
-    log(outcome);
+    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections });
     if (outcome.succeeded && !$("dry").checked) for (const route of routes) armed.delete(route.receiver);
   } catch (e) {
     // Nothing is switched when the router answers with a refusal; when it cannot
     // be reached, the grid says what is switched once it answers again.
-    logError(e.unreachable ? `${e.message} What is switched shows in the grid once it answers.` : `Nothing was switched: ${e.message}`);
+    if (e.body && e.body.log_id) logEntry({ id: e.body.log_id, at: Date.now(), dry_run: $("dry").checked, error: e.message, connections: [] });
+    else logError(e.unreachable ? `${e.message} What is switched shows in the grid once it answers.` : `Nothing was switched: ${e.message}`);
   } finally {
     for (const route of routes) { busy.delete(route.receiver); pendingTake.delete(route.receiver); }
     taking = false;
-    await read();
+    // The router pushes what changed; without its updates, read it now.
+    if (!socketOpen) await read();
     render();
   }
 }
@@ -3264,6 +3341,7 @@ async function take(routes) {
 // A mode shows itself twice: the segment that is pressed, and these words
 // saying what a click does in it. Check only changes what Take says too.
 function renderSalvo() {
+  saveArmed();
   const dry = $("dry").checked;
   $("mode-take").setAttribute("aria-pressed", String(!salvo));
   $("mode-salvo").setAttribute("aria-pressed", String(salvo));
@@ -3283,8 +3361,38 @@ function renderSalvo() {
     : (dry ? "Each click checks: nothing connects" : "Each click connects at once");
 }
 
-function stamp() {
-  return el("time", { text: new Date().toLocaleTimeString() });
+// What is armed for a salvo is kept in this browser, per registry, so that a reload
+// or a router restart does not lose it; it comes back in Salvo mode, still to be taken.
+let armedRestored = false;
+
+function armedKey() { return state ? `st2110-router-armed ${state.registry}` : null; }
+
+function saveArmed() {
+  if (!armedRestored || !armedKey()) return;
+  try {
+    if (salvo && armed.size) localStorage.setItem(armedKey(), JSON.stringify([...armed]));
+    else localStorage.removeItem(armedKey());
+  } catch (_) { /* not kept */ }
+}
+
+function restoreArmed() {
+  if (armedRestored || !state) return;
+  armedRestored = true;
+  let kept = null;
+  try { kept = JSON.parse(localStorage.getItem(armedKey()) || "null"); } catch (_) { return; }
+  if (!Array.isArray(kept)) return;
+  const receivers = new Set(state.receivers.map((r) => r.id));
+  const senders = new Set(state.senders.map((s) => s.id));
+  for (const pair of kept) {
+    if (Array.isArray(pair) && receivers.has(pair[0]) && (pair[1] === null || senders.has(pair[1]))) armed.set(pair[0], pair[1]);
+  }
+  if (armed.size) { salvo = true; renderSalvo(); }
+}
+
+function stamp(at) {
+  const when = new Date(at ?? Date.now());
+  const today = when.toDateString() === new Date().toDateString();
+  return el("time", { datetime: when.toISOString(), text: today ? when.toLocaleTimeString() : when.toLocaleString() });
 }
 
 function clearEmpty() {
@@ -3292,14 +3400,28 @@ function clearEmpty() {
   if (empty) empty.remove();
 }
 
-function log(outcome) {
+// The log is the router's: every page sees each take from any page, and it is
+// kept across restarts. Each entry shows once, by its id.
+const logged = new Set();
+
+function showLog(entries) {
+  for (const entry of entries) logEntry(entry);
+}
+
+function logEntry(e) {
+  if (!e || (e.id && logged.has(e.id))) return;
+  if (e.id) logged.add(e.id);
   clearEmpty();
-  const dry = $("dry").checked;
-  for (const c of [...outcome.connections].reverse()) {
+  const dry = e.dry_run;
+  if (e.error) {
+    $("log").prepend(el("div", { class: "entry bad" }, stamp(e.at), (dry ? "Check only: " : "") + `Nothing was switched: ${e.error}`));
+    return;
+  }
+  for (const c of [...(e.connections || [])].reverse()) {
     const good = ["done", "scheduled", "planned"].includes(c.state);
     const soft = ["held", "rolled-back"].includes(c.state);
-    const entry = el("div", { class: "entry " + (good ? "ok" : soft ? "warn" : "bad") }, stamp(), (dry ? "Check only: " : "") + c.describe);
-    const details = [...c.problems.map((t) => "problem: " + t), ...c.warnings.map((t) => "warning: " + t), ...c.notes.map((t) => "note: " + t)];
+    const entry = el("div", { class: "entry " + (good ? "ok" : soft ? "warn" : "bad") }, stamp(e.at), (dry ? "Check only: " : "") + c.describe);
+    const details = [...(c.problems || []).map((t) => "problem: " + t), ...(c.warnings || []).map((t) => "warning: " + t), ...(c.notes || []).map((t) => "note: " + t)];
     if (details.length) entry.append(el("ul", {}, ...details.map((t) => el("li", { text: t }))));
     $("log").prepend(entry);
   }
@@ -3461,7 +3583,7 @@ async function watch() {
 }
 
 async function poll() {
-  if (!live || document.hidden) return;
+  if (!live || document.hidden || socketOpen) return;
   try {
     const answer = await call("/api/live");
     if (live) { liveStatus = answer.senders || {}; showLive(); }
@@ -3576,7 +3698,8 @@ document.addEventListener("keydown", (e) => {
 });
 renderSalvo();
 read();
-setInterval(() => { if (!document.hidden) read(); }, 3000);
+listen();
+setInterval(() => { if (!socketOpen && !document.hidden) read(); }, 3000);
 </script>
 </body>
 </html>

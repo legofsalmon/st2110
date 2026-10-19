@@ -6,20 +6,29 @@
 //! included. The browser talks only to it, so devices need not allow a page from
 //! another site to send them requests, and no video passes through the browser.
 //!
+//! The page hears of each change over a WebSocket ([`events`]), as the router hears of
+//! them from the registry's subscriptions. Requests to the registry and the Nodes carry
+//! an IS-10 token where they ask for one. The log of connections made, and the demo
+//! facility's connections, are kept in a file between runs ([`keep`]).
+//!
 //! Anyone who can reach the page can make connections. It listens on this machine's
 //! loopback address unless told otherwise, and answers only requests addressed to an
-//! IP address or `localhost`, and connection requests sent from the page itself, so
-//! another web site cannot make them through a visitor's browser.
+//! IP address or `localhost`, and connection requests and WebSockets from the page
+//! itself, so another web site cannot make them through a visitor's browser.
 
 mod demo;
+mod events;
 mod http;
+mod keep;
 mod preview;
 mod signal;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,13 +36,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use st2110_connect::client::{self, ConnectionClient};
 use st2110_connect::controller::{self, Route, Settings, Take};
+use st2110_nmos::auth::{ClientCredentials, Token};
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::{Manifest, Snapshot, routing};
 
 use self::demo::Facility;
+use self::events::{Hub, Sent, Signal, Subscriptions};
 use self::http::{Request, Response};
+use self::keep::Keeper;
 use self::preview::Previews;
 use crate::seconds;
+
+pub(crate) use self::keep::default_path as default_state;
 
 /// The page.
 const PAGE: &str = include_str!("page.html");
@@ -56,6 +70,10 @@ pub(crate) struct Args {
     pub tai_utc: i32,
     pub previews: usize,
     pub interface: Option<Ipv4Addr>,
+    pub auth: crate::auth::Auth,
+    pub demo_auth: bool,
+    /// The state file, or `None` to keep nothing.
+    pub state: Option<PathBuf>,
 }
 
 /// A Sender's SDP file, and the Sender's `version` and `manifest_href` when it was fetched.
@@ -81,6 +99,24 @@ struct Router {
     taking: Mutex<()>,
     /// The streams received for the page's previews.
     previews: Arc<Previews>,
+    /// The IS-10 token sent to the registry and the Nodes, if they ask for one.
+    token: Option<Token>,
+    /// The pages connected to `/api/events`.
+    pages: Hub,
+    /// Raised when the registry may have changed, to read it again.
+    changes: Signal,
+    /// What the pages were last sent of the registry.
+    sent: Mutex<Sent>,
+    /// The registry's subscriptions, and which are connected.
+    subscriptions: Subscriptions,
+    /// The connections made from the page, oldest first, as kept.
+    log: Mutex<Vec<Value>>,
+    /// Numbers the log's entries.
+    entries: AtomicU64,
+    /// Where the log and the demo facility are kept between runs.
+    keeper: Keeper,
+    /// The demo registry's subscriptions' WebSockets, each with its subscription's id.
+    demo_sockets: Hub,
 }
 
 pub(crate) fn run(args: &Args) -> io::Result<ExitCode> {
@@ -142,10 +178,34 @@ fn serve(args: &Args) -> Result<(), Failure> {
         }
         (None, true) => {
             let base = format!("http://{local}");
-            (format!("{base}/x-nmos/query/v1.3/"), Some(Mutex::new(Facility::new(&base, args.tai_utc))))
+            let facility = Facility::new(&base, args.tai_utc);
+            let facility = if args.demo_auth { facility.with_auth() } else { facility };
+            (format!("{base}/x-nmos/query/v1.3/"), Some(facility))
         }
         _ => return Err(Failure::Usage("give a registry's Query API URL, or --demo".into())),
     };
+    let token = match demo.as_ref().and_then(Facility::auth_server) {
+        Some(server) => Some(Token::client_credentials(
+            ClientCredentials {
+                server,
+                client_id: demo::CLIENT_ID.into(),
+                client_secret: demo::CLIENT_SECRET.into(),
+                scope: st2110_nmos::auth::SCOPES.into(),
+            },
+            timeout,
+            false,
+        )),
+        None => args.auth.token(timeout, demo.is_none())?,
+    };
+    let keeper = Keeper::new(args.state.clone(), if demo.is_some() { "demo" } else { registry.as_str() });
+    let kept = keeper.load();
+    let demo = demo.map(|mut facility| {
+        if let Some(saved) = &kept.demo {
+            facility.restore(saved);
+        }
+        Mutex::new(facility)
+    });
+    let entries = kept.log.len() as u64;
     let router = Arc::new(Router {
         registry,
         demo,
@@ -154,6 +214,15 @@ fn serve(args: &Args) -> Result<(), Failure> {
         last: Mutex::new(None),
         sdp: Mutex::default(),
         taking: Mutex::new(()),
+        token,
+        pages: Hub::default(),
+        changes: Signal::default(),
+        sent: Mutex::default(),
+        subscriptions: Subscriptions::default(),
+        log: Mutex::new(kept.log),
+        entries: AtomicU64::new(entries),
+        keeper,
+        demo_sockets: Hub::default(),
         // The demo's streams come over the loopback interface.
         previews: Previews::new(
             if args.demo { Some(Ipv4Addr::LOCALHOST) } else { args.interface },
@@ -176,6 +245,20 @@ fn serve(args: &Args) -> Result<(), Failure> {
             Some(_) => writeln!(out, "Registry: the demo facility, at {}", router.registry)?,
             None => writeln!(out, "Registry: {}", router.registry)?,
         }
+        if let Some(server) = router.demo.as_ref().and_then(|d| d.lock().ok()?.auth_server()) {
+            writeln!(
+                out,
+                "IS-10: the demo asks for tokens, from {server} (client {}, secret {})",
+                demo::CLIENT_ID,
+                demo::CLIENT_SECRET
+            )?;
+        } else if let Some(token) = &router.token {
+            writeln!(out, "IS-10: {}", token.describe())?;
+        }
+        match router.keeper.path() {
+            Some(path) => writeln!(out, "Kept in: {}", path.display())?,
+            None => writeln!(out, "Kept in: nothing (--no-state)")?,
+        }
         if !address.ip().is_loopback() {
             writeln!(out, "Anyone who can reach {address} can make connections. Ctrl-C stops the router.")?;
         } else {
@@ -185,6 +268,11 @@ fn serve(args: &Args) -> Result<(), Failure> {
     }
     if args.open {
         open(&page);
+    }
+    events::start(&router);
+    if router.demo.is_some() {
+        let r = router.clone();
+        std::thread::spawn(move || run_demo(&r));
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -208,12 +296,95 @@ fn open(page: &str) {
     }
 }
 
-fn handle(router: &Router, stream: &TcpStream) {
+fn handle(router: &Arc<Router>, stream: &TcpStream) {
     let Ok(Some(request)) = http::read(stream) else {
         return;
     };
+    if events::is_upgrade(&request) {
+        return upgrade(router, stream, &request);
+    }
     let response = answer(router, &request);
     let _ = http::write(stream, &response);
+    if let Some(demo) = &router.demo
+        && Facility::serves(&request.path)
+    {
+        push_demo_changes(router, demo);
+    }
+}
+
+/// A request to become a WebSocket: the page's `/api/events`, or a subscription to the
+/// demo registry.
+fn upgrade(router: &Arc<Router>, stream: &TcpStream, request: &Request) {
+    let refuse = |status, message: &str| {
+        let _ = http::write(stream, &Response::error(status, message));
+    };
+    if !host_allowed(request.header("Host")) {
+        return refuse(403, "address the router by its IP address or localhost");
+    }
+    match request.path.as_str() {
+        "/api/events" => {
+            // A browser sends Origin with every WebSocket, and a page from another site
+            // may open one here: only this server's own page may.
+            let host = request.header("Host").unwrap_or_default();
+            if request.header("Origin").is_some_and(|o| !o.eq_ignore_ascii_case(&format!("http://{host}"))) {
+                return refuse(403, "only the router's own page may listen here");
+            }
+            events::page(router, stream, request);
+        }
+        demo::WS_PATH if router.demo.is_some() => {
+            let Some(demo) = &router.demo else { return };
+            let uid = request.param("uid").unwrap_or_default();
+            let sync = {
+                let Ok(mut facility) = demo.lock() else { return };
+                if let Err(refused) = facility.authorized(request) {
+                    let _ = http::write(stream, &refused);
+                    return;
+                }
+                if facility.subscription(&uid).is_none() {
+                    return refuse(404, "no such subscription");
+                }
+                facility.sync(&uid)
+            };
+            if let Err((status, message)) = events::accept(stream, request) {
+                return refuse(status, &message);
+            }
+            let Some(client) = router.demo_sockets.add(&uid, stream, 64) else { return };
+            if let Some(sync) = sync {
+                let _ = client.send(&st2110_nmos::ws::Frame::Text(sync));
+            }
+            router.demo_sockets.hold(&client, stream);
+        }
+        _ => refuse(404, "nothing here"),
+    }
+}
+
+/// Keeps the demo facility going: its scheduled activations happen when they are due,
+/// whether or not anything asks.
+fn run_demo(router: &Router) {
+    let Some(demo) = &router.demo else { return };
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        if let Ok(mut facility) = demo.lock() {
+            facility.settle();
+        }
+        push_demo_changes(router, demo);
+    }
+}
+
+/// Pushes the demo registry's changes to its subscriptions, and keeps its Receivers.
+fn push_demo_changes(router: &Router, demo: &Mutex<Facility>) {
+    let (messages, kept) = {
+        let Ok(mut facility) = demo.lock() else { return };
+        let messages = facility.take_changes();
+        let kept = facility.take_dirty().then(|| facility.export());
+        (messages, kept)
+    };
+    for (uid, message) in messages {
+        router.demo_sockets.send(|topic| topic == uid, &message);
+    }
+    if let Some(kept) = kept {
+        router.keeper.update(|section| section.demo = Some(kept));
+    }
 }
 
 /// Whether a `Host` header names this server by an IP address or `localhost`. A page
@@ -223,11 +394,19 @@ fn host_allowed(host: Option<&str>) -> bool {
     let Some(host) = host else {
         return false;
     };
-    let name = match host.strip_prefix('[') {
-        Some(rest) => rest.split_once(']').map(|(ip, _)| ip),
-        None => Some(host.rsplit_once(':').map_or(host, |(name, port)| if port.is_empty() { "" } else { name })),
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((ip, after)) => (ip, after.strip_prefix(':').or(if after.is_empty() { None } else { Some("") })),
+            None => return false,
+        },
+        None => match host.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (host, None),
+        },
     };
-    name.is_some_and(|name| name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok())
+    // The page echoes the host into what it may connect to, so nothing but a port follows.
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok())
 }
 
 /// Whether a request that changes something came from the page itself: JSON, which a
@@ -271,9 +450,13 @@ fn answer(router: &Router, request: &Request) -> Response {
             headers: vec![
                 (
                     "Content-Security-Policy",
-                    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; \
-                     img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-                        .into(),
+                    // `'self'` covers the page's own WebSocket in some browsers only.
+                    format!(
+                        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                         connect-src 'self' ws://{}; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; \
+                         form-action 'none'",
+                        request.header("Host").unwrap_or_default()
+                    ),
                 ),
                 ("X-Frame-Options", "DENY".into()),
                 ("Referrer-Policy", "no-referrer".into()),
@@ -291,11 +474,16 @@ fn answer(router: &Router, request: &Request) -> Response {
             Err(message) => Response::error(403, message),
         },
         ("GET", "/api/live") => live(router),
+        ("GET", "/api/log") => {
+            let log = router.log.lock().map(|l| l.clone()).unwrap_or_default();
+            Response::json(200, &json!({"log": log}))
+        }
         ("GET", "/api/preview") => picture(router, request),
         ("GET", "/api/stream") => stream(router, request),
         (
             _,
-            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/watch" | "/api/live" | "/api/preview" | "/api/stream",
+            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/watch" | "/api/live" | "/api/log" | "/api/preview"
+            | "/api/stream" | "/api/events",
         ) => Response::error(405, "not with that method"),
         _ => Response::error(404, "nothing here"),
     }
@@ -303,8 +491,13 @@ fn answer(router: &Router, request: &Request) -> Response {
 
 impl Router {
     fn query_client(&self, fetch_sdp: bool) -> Result<QueryClient, String> {
-        let options =
-            Options { timeout: self.timeout, fetch_sdp, env_proxy: self.demo.is_none(), ..Options::default() };
+        let options = Options {
+            timeout: self.timeout,
+            fetch_sdp,
+            env_proxy: self.demo.is_none(),
+            token: self.token.clone(),
+            ..Options::default()
+        };
         QueryClient::connect(&self.registry, &options).map_err(|e| e.to_string())
     }
 
@@ -355,7 +548,43 @@ impl Router {
     }
 
     fn connection_client(&self) -> ConnectionClient {
-        ConnectionClient::new(&client::Options { timeout: self.timeout, env_proxy: self.demo.is_none() })
+        ConnectionClient::new(&client::Options {
+            timeout: self.timeout,
+            env_proxy: self.demo.is_none(),
+            token: self.token.clone(),
+        })
+    }
+
+    /// Whether every subscription to the registry is connected, so that the router hears
+    /// of each change as it happens.
+    fn subscribed(&self) -> bool {
+        self.subscriptions.all()
+    }
+
+    fn note_subscription(&self, path: &str, problem: Option<String>) {
+        self.subscriptions.note(path, problem);
+    }
+
+    /// Where the IS-10 token comes from, for the page.
+    fn auth_note(&self) -> Option<String> {
+        self.token.as_ref().map(Token::describe)
+    }
+
+    /// Adds a take to the log, keeps it, and tells every page.
+    fn record(&self, mut entry: Value) -> String {
+        let n = self.entries.fetch_add(1, Ordering::Relaxed) + 1;
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()) as u64;
+        let id = format!("{at}-{n}");
+        entry["id"] = json!(id);
+        entry["at"] = json!(at);
+        if let Ok(mut log) = self.log.lock() {
+            log.push(entry.clone());
+            let extra = log.len().saturating_sub(keep::LOG_LIMIT);
+            log.drain(..extra);
+        }
+        self.keeper.update(|section| section.log.push(entry.clone()));
+        self.pages.send(|_| true, &json!({"type": "log", "entry": entry}).to_string());
+        id
     }
 }
 
@@ -379,18 +608,23 @@ fn device_and_node(snapshot: &Snapshot, resource: &Value) -> (Option<String>, Op
     (device.and_then(|d| text(&d, "label")), node.and_then(|n| text(&n, "label")))
 }
 
+/// The registry, as the page shows it.
+fn state(router: &Router) -> Response {
+    match state_json(router) {
+        Ok(body) => Response::json(200, &body),
+        Err(message) => Response::error(502, message),
+    }
+}
+
 /// The registry, as the page shows it: every Sender, and every Receiver with the
 /// Senders it can take and the one it takes now.
-fn state(router: &Router) -> Response {
+fn state_json(router: &Router) -> Result<Value, String> {
     let read = router.query_client(false).and_then(|registry| {
         let mut snapshot = registry.snapshot().map_err(|e| e.to_string())?;
         router.add_sdp(&registry, &mut snapshot);
         Ok(snapshot)
     });
-    let snapshot = match read {
-        Ok(snapshot) => snapshot,
-        Err(message) => return Response::error(502, format!("reading the registry: {message}")),
-    };
+    let snapshot = read.map_err(|message| format!("reading the registry: {message}"))?;
     let matrix = routing::matrix(&snapshot);
     let flows = &snapshot.flows;
     let senders: Vec<Value> = matrix
@@ -430,12 +664,13 @@ fn state(router: &Router) -> Response {
     let body = json!({
         "registry": router.registry, "demo": router.demo.is_some(), "read_at": read_at as u64,
         "lead": router.settings.lead.as_secs_f64(), "previews": router.previews.most(),
+        "auth": router.auth_note(), "subscribed": router.subscribed(),
         "senders": senders, "receivers": receivers,
     });
     if let Ok(mut last) = router.last.lock() {
         *last = Some(snapshot);
     }
-    Response::json(200, &body)
+    Ok(body)
 }
 
 /// What a Sender's SDP file declares, in a few words: its first stream's format, and
@@ -485,8 +720,38 @@ struct TakeRequest {
     dry_run: bool,
 }
 
-/// Makes the connections the page asks for, together, as `st2110 connect --salvo` does.
+/// Makes the connections the page asks for, together, as `st2110 connect --salvo` does,
+/// and logs what happened for every page, and the next run, to see.
 fn take(router: &Router, request: &Request) -> Response {
+    let mut response = make(router, request);
+    if response.status == 409 {
+        // Refused for another take in progress: nothing to log.
+        return response;
+    }
+    let mut body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+    let asked: Option<TakeRequest> = serde_json::from_slice(&request.body).ok();
+    let entry = match body.get("error").and_then(Value::as_str) {
+        Some(error) => json!({
+            "dry_run": asked.as_ref().is_some_and(|a| a.dry_run), "succeeded": false,
+            "error": error, "connections": [],
+        }),
+        None => json!({
+            "dry_run": body["dry_run"], "succeeded": body["succeeded"],
+            "connections": body["connections"].as_array().into_iter().flatten().map(|c| json!({
+                "state": c["state"], "describe": c["describe"],
+                "problems": c["problems"], "warnings": c["warnings"], "notes": c["notes"],
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    if asked.is_some() {
+        body["log_id"] = json!(router.record(entry));
+        response.body = body.to_string().into_bytes();
+    }
+    router.changes.raise();
+    response
+}
+
+fn make(router: &Router, request: &Request) -> Response {
     let wanted: TakeRequest = match serde_json::from_slice(&request.body) {
         Ok(wanted) => wanted,
         Err(e) => return Response::error(400, format!("not a list of routes: {e}")),
@@ -656,7 +921,16 @@ mod tests {
         for host in ["127.0.0.1:8110", "localhost:8110", "LOCALHOST", "[::1]:8110", "192.168.1.20", "10.0.0.5:80"] {
             assert!(host_allowed(Some(host)), "{host}");
         }
-        for host in ["evil.example:8110", "evil.example", "127.0.0.1.nip.io:8110", "[::1", ""] {
+        for host in [
+            "evil.example:8110",
+            "evil.example",
+            "127.0.0.1.nip.io:8110",
+            "[::1",
+            "",
+            "127.0.0.1:",
+            "127.0.0.1:80; connect-src *",
+            "[::1]x",
+        ] {
             assert!(!host_allowed(Some(host)), "{host}");
         }
         assert!(!host_allowed(None));

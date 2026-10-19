@@ -97,7 +97,7 @@ registry: 1 error, 3 warnings, 0 notes
 - `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`.
 - It exits with 0 when nothing is an error, 1 when something is, and 2 when the registry or file cannot be read.
 
-It only reads; `st2110 connect` makes connections. Give it a Node's address, or its Node API URL such as `http://camera.example/x-nmos/node/`, to check that Node alone where there is no registry. It reads the registry it is given, and `st2110 discover` finds registries and Nodes by DNS-SD. It does not yet send IS-10 access tokens.
+It only reads; `st2110 connect` makes connections. Give it a Node's address, or its Node API URL such as `http://camera.example/x-nmos/node/`, to check that Node alone where there is no registry. It reads the registry it is given, and `st2110 discover` finds registries and Nodes by DNS-SD. Where the registry asks for IS-10 access tokens, see [IS-10 access tokens](#is-10-access-tokens).
 
 ## Connect Receivers to Senders
 
@@ -140,7 +140,7 @@ receiver "MON 1 video" (7ecf0001) ← sender "CAM 1 audio" (5e0d0002): refused
 - TARGET may also be a snapshot saved with `st2110 nmos --save`, when the registry is out of reach; the registry check is then skipped.
 - It exits with 0 when every connection was made, scheduled or planned, 1 when one was refused, failed or differs, and 2 when the registry or a file cannot be read, or a name finds no Sender or Receiver or more than one.
 
-It connects Receivers only: it does not yet set a unicast Sender's destination or turn Senders on and off. It polls rather than following the Query API's WebSocket subscriptions, and like `st2110 nmos` it does not browse DNS-SD or send IS-10 access tokens.
+It connects Receivers only: it does not yet set a unicast Sender's destination or turn Senders on and off. Like `st2110 nmos` it does not browse DNS-SD, and it takes the same [IS-10 options](#is-10-access-tokens).
 
 ## Route from a browser
 
@@ -159,9 +159,26 @@ Ctrl-C stops the router.
 - Above the grid, a card for each Sender shows its stream live: a picture of video, a meter for each audio channel, and what arrived (bit rate, frame rate, packets lost, the ST 2022-7 class of a pair). It says which Receivers take the Sender. Clicking the card opens the Sender's details: its Flow and Source, every leg of its SDP file with the file's checks, and what this machine receives of it. Each video Receiver's row shows a small picture of what it takes.
 - The previews are received by `st2110 router` itself, from the Senders' SDP files, only while the page is open and shows them, and at most `--previews` at once (8 unless set; `--previews 0` turns them off). Each takes its stream's full bandwidth on this machine's link, whatever the size of its picture, so they start off for a real facility; tick Live previews to turn them on, and `--interface` names the interface to join the multicast groups on. The browser receives only small PNG pictures and numbers.
 - The browser talks only to `st2110 router`, which talks to the registry and the Devices. So Devices need not accept requests from a web page (most refuse them), and no ST 2110 stream reaches the browser.
-- `st2110 router --demo` serves a demo facility instead: an IS-04 registry and each Node's IS-05 Connection API, with four cameras, a graphics machine and four monitors, one of which takes only the graphics machine's smaller picture. The demo sends each Sender's stream from this machine on the loopback interface (small 25 fps pictures, an ST 2022-7 pair for each camera, and a tone at its own level for each camera's sound), so its previews are live on a Mac with no network at all. It is a registry like any other, so `st2110 nmos` and `st2110 connect` work on it too, at `http://127.0.0.1:8110`.
+- The page hears of each change as it happens. The router subscribes to the registry's Query API for every type of resource (IS-04 Query API subscriptions, over WebSockets) and pushes each change to every open page over a WebSocket of its own, with each connection made from any page. The status at the top right says `Live` when the registry tells the router of each change; a registry without subscriptions is read every 3 seconds while a page is open (`every 3 s`), and a page that cannot hold a WebSocket reads every 3 seconds itself (`Read at`).
+- The connections log is the router's, not the page's: every page shows each take from any page, and it is kept, with the demo facility's connections, in a small file (`--state FILE`; by default `~/Library/Application Support/st2110/router.json` on a Mac, `~/.local/state/st2110/router.json` on Linux; `--no-state` keeps nothing), so a restart loses neither. Crosspoints armed for a salvo are kept in the browser, per registry, and come back armed after a reload.
+- `st2110 router --demo` serves a demo facility instead: an IS-04 registry and each Node's IS-05 Connection API, with four cameras, a graphics machine and four monitors, one of which takes only the graphics machine's smaller picture. The demo sends each Sender's stream from this machine on the loopback interface (small 25 fps pictures, an ST 2022-7 pair for each camera, and a tone at its own level for each camera's sound), so its previews are live on a Mac with no network at all. It is a registry like any other, so `st2110 nmos` and `st2110 connect` work on it too, at `http://127.0.0.1:8110`. Its Query API takes subscriptions, and with `--demo-auth` it asks for IS-10 tokens too (below).
 
-Anyone who can reach the page can make connections. It listens on `127.0.0.1:8110` unless `--listen` says otherwise (`0.0.0.0:8110` lets other machines in), answers only requests addressed to an IP address or `localhost`, and takes connections only from its own page, so another web site cannot make them through a visitor's browser. Like `st2110 connect`, it does not yet send IS-10 access tokens, so it cannot control Devices that require them.
+Anyone who can reach the page can make connections. It listens on `127.0.0.1:8110` unless `--listen` says otherwise (`0.0.0.0:8110` lets other machines in), answers only requests addressed to an IP address or `localhost`, and takes connections only from its own page, so another web site cannot make them through a visitor's browser. The page's WebSocket is held to the same rules: addressed by IP address or `localhost`, and opened only by the router's own page.
+
+### IS-10 access tokens
+
+Where a registry or the Devices ask for IS-10 access tokens, `st2110 nmos`, `st2110 connect` and `st2110 router` send one with every request, including the router's subscriptions:
+
+```console
+$ ST2110_CLIENT_SECRET=… st2110 router https://registry.example --auth https://auth.example/ --client-id st2110-router
+```
+
+- `--auth URL --client-id ID` gets tokens from the Authorization Server whose issuer is URL, found from its RFC 8414 metadata, with the OAuth 2.0 Client Credentials grant (`client_secret_basic`) and the scopes `query connection` (`--scope` to change them). The secret comes from `--client-secret-file` or `ST2110_CLIENT_SECRET`, never the command line. A token is renewed half way to expiring, and at once when a server refuses it.
+- `--token-file FILE` sends the token a file holds instead, read again whenever it changes, for a token another program keeps fresh.
+- A token is sent only over `https://` (and `wss://`), or to this machine, as IS-10 expects TLS.
+- `st2110 router --demo --demo-auth` tries it with no equipment: the demo asks for tokens and serves an Authorization Server, for client `st2110-demo` with secret `demo-secret`, whose tokens last a minute. The router gets its own; `st2110 connect http://127.0.0.1:8110 --auth http://127.0.0.1:8110/ --client-id st2110-demo` works too, with the secret in `ST2110_CLIENT_SECRET`. Its tokens are opaque strings where a real server issues signed JWTs.
+
+Not yet: finding the Authorization Server by DNS-SD (`_nmos-auth._tcp`), which IS-10 asks clients to do, dynamic client registration (RFC 7591), and `private_key_jwt` client authentication.
 
 ## Decode PTP messages
 

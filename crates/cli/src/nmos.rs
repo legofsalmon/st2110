@@ -19,6 +19,8 @@ pub(crate) struct Fetch {
     pub timeout: f64,
     /// Whether to fetch the Senders' SDP files.
     pub sdp: bool,
+    /// Where an IS-10 token comes from.
+    pub auth: crate::auth::Auth,
 }
 
 pub(crate) fn run(
@@ -62,7 +64,8 @@ fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
         if timeout.is_zero() {
             return Err(format!("--timeout {} is not a number of seconds above 0", fetch.timeout));
         }
-        let options = Options { timeout, fetch_sdp: fetch.sdp, ..Options::default() };
+        let token = fetch.auth.token(timeout, true)?;
+        let options = Options { timeout, fetch_sdp: fetch.sdp, token, ..Options::default() };
         if lower.contains("/x-nmos/node") {
             let node = NodeClient::connect(target, &options).map_err(|e| e.to_string())?;
             return node.snapshot().map_err(|e| e.to_string());

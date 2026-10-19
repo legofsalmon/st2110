@@ -2,6 +2,7 @@
 //! captures from the command line, connect Receivers to Senders through IS-05, work out
 //! ST 2059-1 timing, find the streams on a network, and send and receive streams.
 
+mod auth;
 mod connect;
 mod discover;
 mod nmos;
@@ -83,6 +84,8 @@ enum Command {
         /// Do not fetch the Senders' SDP files.
         #[arg(long)]
         no_sdp: bool,
+        #[command(flatten)]
+        auth: auth::Auth,
     },
     /// Connect Receivers to Senders through IS-05, or list which Senders each Receiver
     /// can take.
@@ -162,6 +165,8 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        #[command(flatten)]
+        auth: auth::Auth,
     },
     /// Serve a router panel to use in a browser: a crosspoint grid of which Senders
     /// each Receiver can take, where a click connects them through IS-05.
@@ -216,6 +221,21 @@ enum Command {
         /// system picks when omitted.
         #[arg(long, value_name = "ADDRESS")]
         interface: Option<std::net::Ipv4Addr>,
+        #[command(flatten)]
+        auth: auth::Auth,
+        /// With --demo: the demo facility asks for IS-10 tokens, and serves an
+        /// Authorization Server to get them from, for client st2110-demo with secret
+        /// demo-secret. The router gets its tokens there.
+        #[arg(long, requires = "demo", conflicts_with_all = ["token_file", "auth"])]
+        demo_auth: bool,
+        /// The file the router keeps its connection log in, and the demo facility its
+        /// connections, so that they are there again after a restart. A file in this
+        /// user's application data when omitted.
+        #[arg(long, value_name = "FILE", conflicts_with = "no_state")]
+        state: Option<PathBuf>,
+        /// Keep nothing after the router stops.
+        #[arg(long)]
+        no_state: bool,
     },
     /// Decode PTP messages and check them against the ST 2059-2 profile.
     ///
@@ -426,8 +446,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
-        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp } => {
-            let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp };
+        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, auth } => {
+            let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, auth };
             nmos::run(&target, &fetch, format, quiet, deny_warnings)
         }
         Command::Connect {
@@ -447,6 +467,7 @@ fn main() -> ExitCode {
             wait,
             tai_utc,
             format,
+            auth,
         } => {
             let args = connect::Args {
                 target,
@@ -464,11 +485,42 @@ fn main() -> ExitCode {
                 timeout,
                 wait,
                 tai_utc,
+                auth,
             };
             connect::run(&args, format)
         }
-        Command::Router { target, demo, listen, open, timeout, lead, wait, tai_utc, previews, interface } => {
-            let args = router::Args { target, demo, listen, open, timeout, lead, wait, tai_utc, previews, interface };
+        Command::Router {
+            target,
+            demo,
+            listen,
+            open,
+            timeout,
+            lead,
+            wait,
+            tai_utc,
+            previews,
+            interface,
+            auth,
+            demo_auth,
+            state,
+            no_state,
+        } => {
+            let state = if no_state { None } else { state.or_else(router::default_state) };
+            let args = router::Args {
+                target,
+                demo,
+                listen,
+                open,
+                timeout,
+                lead,
+                wait,
+                tai_utc,
+                previews,
+                interface,
+                auth,
+                demo_auth,
+                state,
+            };
             router::run(&args)
         }
         Command::Ptp { files, format, quiet, deny_warnings } => ptp::run(&files, format, quiet, deny_warnings),

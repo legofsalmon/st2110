@@ -3,9 +3,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use st2110_nmos::ws;
 
 /// The router, serving the demo facility on a free port; stopped when dropped.
 struct Router {
@@ -20,7 +23,7 @@ impl Router {
     /// Without previews, so that the demo sends no streams: only one test at a time
     /// should, since every demo sends to the same multicast groups.
     fn start() -> Self {
-        Self::with(&["--previews", "0"])
+        Self::with(&["--previews", "0", "--no-state"])
     }
 
     fn with(more: &[&str]) -> Self {
@@ -201,7 +204,7 @@ fn refuses_what_a_receiver_cannot_take_and_says_why() {
 
 #[test]
 fn previews_the_demo_streams_and_describes_them() {
-    let router = Router::with(&[]);
+    let router = Router::with(&["--no-state"]);
     let camera = router.sender("CAM 2 video");
     let sound = router.sender("CAM 2 audio");
     let (status, watching) = router.post("/api/watch", &json!({"senders": [camera, sound]}));
@@ -273,4 +276,206 @@ fn needs_a_registry_or_the_demo() {
         .expect("runs");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not a registry's http:// or https:// URL"));
+}
+
+impl Router {
+    /// The page's WebSocket, as its page opens it.
+    fn events(&self) -> ws::Socket {
+        let origin = format!("http://{}", self.address);
+        let socket = ws::connect(
+            &format!("ws://{}/api/events", self.address),
+            &[("Origin", origin.as_str())],
+            Duration::from_secs(5),
+        )
+        .expect("connects");
+        socket.set_read_timeout(Some(Duration::from_secs(10))).expect("a timeout");
+        socket
+    }
+}
+
+/// The next message of `kind` on the page's WebSocket.
+fn next(socket: &mut ws::Socket, kind: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no {kind} message");
+        let text = socket.read().expect("a message").expect("still open");
+        let message: Value = serde_json::from_str(&text).expect("JSON");
+        if message["type"] == kind {
+            return message;
+        }
+    }
+}
+
+fn label_of(state: &Value, receiver: &str) -> Option<String> {
+    let r = state["receivers"].as_array()?.iter().find(|r| r["label"] == receiver)?;
+    Some(state["senders"][r["current"].as_u64()? as usize]["label"].as_str()?.to_string())
+}
+
+#[test]
+fn pushes_changes_to_the_page_as_they_happen() {
+    let router = Router::start();
+    let mut socket = router.events();
+    let hello = next(&mut socket, "hello");
+    assert_eq!(hello["log"], json!([]));
+    let state = next(&mut socket, "state");
+    assert_eq!(label_of(&state, "MON 1 video").as_deref(), Some("CAM 1 video"));
+
+    // The router subscribes to the demo registry, and says so once every subscription is up.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !router.get("/api/state")["subscribed"].as_bool().unwrap() {
+        assert!(Instant::now() < deadline, "the router never subscribed to the registry");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A take from anywhere reaches the page: its log entry, then the registry's change,
+    // which the registry pushes to the router.
+    let taken = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
+    let entry = next(&mut socket, "log")["entry"].clone();
+    assert_eq!(entry["id"], taken["log_id"]);
+    assert_eq!(entry["succeeded"], true);
+    assert!(entry["connections"][0]["describe"].as_str().unwrap().contains("MON 3 video"), "{entry}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = next(&mut socket, "state");
+        if label_of(&state, "MON 3 video").as_deref() == Some("CAM 2 video") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the change never reached the page");
+    }
+    assert_eq!(router.get("/api/log")["log"][0]["id"], taken["log_id"]);
+    socket.close();
+
+    // Another site's page cannot listen.
+    let refused = ws::connect(
+        &format!("ws://{}/api/events", router.address),
+        &[("Origin", "http://evil.example")],
+        Duration::from_secs(5),
+    );
+    assert!(refused.is_err());
+}
+
+#[test]
+fn the_demo_registry_pushes_its_changes_to_subscriptions() {
+    let router = Router::start();
+    let (status, subscription) = router.post(
+        "/x-nmos/query/v1.3/subscriptions",
+        &json!({"max_update_rate_ms": 100, "resource_path": "/receivers", "params": {}, "persist": false, "secure": false}),
+    );
+    assert_eq!(status, 201, "{subscription}");
+    let mut socket = ws::connect(subscription["ws_href"].as_str().unwrap(), &[], Duration::from_secs(5)).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let sync: Value = serde_json::from_str(&socket.read().unwrap().unwrap()).unwrap();
+    assert_eq!(sync["grain"]["topic"], "/receivers/");
+    assert_eq!(sync["grain"]["data"].as_array().unwrap().len(), 8);
+    router.take(json!([{"receiver": "MON 3 audio", "sender": "CAM 3 audio"}]));
+    let change: Value = serde_json::from_str(&socket.read().unwrap().unwrap()).unwrap();
+    let data = &change["grain"]["data"][0];
+    assert_eq!(data["pre"]["subscription"]["sender_id"], Value::Null);
+    assert_eq!(data["post"]["subscription"]["active"], true);
+}
+
+#[test]
+fn asks_for_is_10_tokens_with_demo_auth() {
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth"]);
+    // The demo registry and Connection APIs refuse requests without a token…
+    let (status, _) = router.request("GET", "/x-nmos/query/v1.3/senders", &[], "");
+    assert_eq!(status, 401);
+    let (status, head, _) = router.bytes("GET", "/x-nmos/query/v1.3/senders", &[("Authorization", "Bearer guess")], "");
+    assert_eq!(status, 401);
+    assert!(head.contains("WWW-Authenticate: Bearer"), "{head}");
+    // …and its Authorization Server hands them only to its client.
+    let (status, _) = router.request(
+        "POST",
+        "/x-nmos/auth/v1.0/token",
+        &[("Content-Type", "application/x-www-form-urlencoded"), ("Authorization", "Basic d3Jvbmc6d3Jvbmc=")],
+        "grant_type=client_credentials",
+    );
+    assert_eq!(status, 401);
+
+    // The router gets its own, and reads and switches as before.
+    assert_eq!(taking(&router.routes(), "MON 1 video").as_deref(), Some("CAM 1 video"));
+    let one = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
+    assert_eq!(one["succeeded"], true, "{one:#}");
+    assert!(router.get("/api/state")["auth"].as_str().unwrap().contains("st2110-demo"));
+    let mut socket = router.events();
+    next(&mut socket, "state");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !router.get("/api/state")["subscribed"].as_bool().unwrap() {
+        assert!(Instant::now() < deadline, "the router never subscribed with its token");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // So do `st2110 nmos` and `st2110 connect`, given the client's id and secret.
+    let base = format!("http://{}", router.address);
+    let run = |args: &[&str], secret: &str| {
+        Command::new(env!("CARGO_BIN_EXE_st2110"))
+            .args(args)
+            .args(["--auth", &format!("{base}/"), "--client-id", "st2110-demo"])
+            .env("ST2110_CLIENT_SECRET", secret)
+            .env("NO_COLOR", "1")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .output()
+            .expect("runs")
+    };
+    let listed = run(&["connect", &base], "demo-secret");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed.status.code(), Some(0), "{text}{}", String::from_utf8_lossy(&listed.stderr));
+    assert!(text.contains("MON 4 video"), "{text}");
+    let made = run(&["connect", &base, "--receiver", "MON 3 audio", "--sender", "CAM 2 audio"], "demo-secret");
+    assert_eq!(made.status.code(), Some(0), "{}", String::from_utf8_lossy(&made.stdout));
+    let wrong = run(&["nmos", &base, "--quiet"], "not-the-secret");
+    assert_eq!(wrong.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("invalid_client"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+}
+
+/// A state file of its own, removed when dropped.
+struct StateFile(PathBuf);
+
+impl StateFile {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("st2110-router-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir.join("router.json"))
+    }
+}
+
+impl Drop for StateFile {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[test]
+fn keeps_its_log_and_the_demo_connections_across_a_restart() {
+    let file = StateFile::new("restart");
+    let path = file.0.to_str().unwrap();
+    let first = Router::with(&["--previews", "0", "--state", path]);
+    let taken = first.take(json!([{"receiver": "MON 3 video", "sender": "CAM 3 video"}]));
+    assert_eq!(taken["succeeded"], true, "{taken:#}");
+    first.take(json!([{"receiver": "MON 1 video", "sender": null}]));
+    drop(first);
+
+    let second = Router::with(&["--previews", "0", "--state", path]);
+    let routes = second.routes();
+    assert_eq!(taking(&routes, "MON 3 video").as_deref(), Some("CAM 3 video"));
+    assert_eq!(taking(&routes, "MON 1 video"), None);
+    assert_eq!(taking(&routes, "MON 2 video").as_deref(), Some("CAM 2 video"));
+    let log = second.get("/api/log")["log"].clone();
+    assert_eq!(log.as_array().unwrap().len(), 2, "{log:#}");
+    assert_eq!(log[0]["id"], taken["log_id"]);
+    let mut socket = second.events();
+    assert_eq!(next(&mut socket, "hello")["log"], log);
+
+    // Without a state file, nothing is kept.
+    drop(second);
+    let third = Router::start();
+    assert_eq!(taking(&third.routes(), "MON 3 video"), None);
+    assert_eq!(third.get("/api/log")["log"], json!([]));
 }
