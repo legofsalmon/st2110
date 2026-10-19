@@ -593,6 +593,2254 @@
   }
 }
 /* ds:tokens:end */
+/* ds:base:start @letissier/design-system 0.4.0 sha256-8b0a12c79ea6a68c — run scripts/sync.mjs --inline to update */
+/* The page defaults, on top of dist/tokens.css: the ground, the ink, body
+   text, the focus ring, and one class per text style. Optional — an app with
+   its own reset can take tokens.css alone and borrow from here.
+
+   Theme, density and motion are attributes, on <html> or on any element below it:
+     <html data-theme="dark | light | auto" data-density="regular | compact | touch | auto">
+   Motion needs none: it follows prefers-reduced-motion unless data-motion says otherwise.
+   An element that sets one is an island: it re-reads its ink and body text
+   below, and paints its own ground if it wants one. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* the ground goes on body, so the canvas behind an overscroll takes it too */
+body {
+  margin: 0;
+  background: var(--ds-surface-ground);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* a custom property is computed where it is declared and a colour inherits
+   as a colour, so an island has to ask again */
+[data-theme] {
+  color: var(--ds-ink-primary);
+}
+[data-density] {
+  font: var(--ds-text-body);
+}
+
+/* one ring, on everything operable, outside the edge it belongs to */
+:focus-visible {
+  outline: var(--ds-size-focus-ring) solid var(--ds-focus);
+  outline-offset: var(--ds-space-half);
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* A view change is a fade through (docs/motion.md): the old view leaves
+   quickly, the new one arrives. Only runs when an app starts a view
+   transition; with reduced motion the durations shorten and nothing moves. */
+::view-transition-old(root) {
+  animation-duration: var(--ds-duration-fast);
+  animation-timing-function: var(--ds-ease-exit);
+}
+::view-transition-new(root) {
+  animation-duration: var(--ds-duration-base);
+  animation-timing-function: var(--ds-ease-enter);
+}
+
+::selection {
+  background: var(--ds-accent-soft);
+}
+
+/* Text styles. The capitals come from the style, never from typing them. */
+.ds-text-label {
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+.ds-text-caption {
+  font: var(--ds-text-caption);
+}
+.ds-text-body {
+  font: var(--ds-text-body);
+}
+.ds-text-control {
+  font: var(--ds-text-control);
+}
+.ds-text-prose {
+  font: var(--ds-text-prose);
+  max-width: 65ch;
+}
+.ds-text-title {
+  font: var(--ds-text-title);
+}
+.ds-text-heading {
+  font: var(--ds-text-heading);
+  text-wrap: balance;
+}
+.ds-text-display {
+  font: var(--ds-text-display);
+  letter-spacing: var(--ds-text-display-tracking);
+  text-wrap: balance;
+}
+.ds-text-numeric {
+  font: var(--ds-text-numeric);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+.ds-text-readout {
+  font: var(--ds-text-readout);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+.ds-text-code {
+  font: var(--ds-text-code);
+}
+
+/* the three levels of ink, and off */
+.ds-ink-secondary {
+  color: var(--ds-ink-secondary);
+}
+.ds-ink-tertiary {
+  color: var(--ds-ink-tertiary);
+}
+.ds-ink-disabled {
+  color: var(--ds-ink-disabled);
+}
+
+/* read by a screen reader, not drawn */
+.ds-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+/* ds:base:end */
+/* ds:components:start @letissier/design-system 0.4.0 sha256-8bf76d393f8c87e9 — run scripts/sync.mjs --inline to update */
+/* The shared components, drawn from the tokens alone: no literal colour, no
+   size that is not a token. Plain classes on plain elements, so a vanilla
+   page (aoviewer, tipping-point, a router's web panel) can use them as they
+   are and a React app can wrap them. State lives in ARIA attributes —
+   aria-pressed, aria-selected, aria-invalid, aria-disabled, aria-busy — so
+   what is drawn is what a screen reader hears.
+
+   Every component takes its states from one model (docs/states.md): the same
+   washes, the same ring, the same order everywhere. Hover only exists where
+   there is a pointer that hovers, so a tap on a phone never leaves a control
+   lit. Anatomy, keyboard and motion for each are in docs/components.md.
+
+   Every control here is one height (--ds-size-control) whatever is in it, and
+   grows with the density. */
+
+/* ---------- loops ----------
+   The only animations that repeat: they say "working". Each stays in place,
+   so reduced motion keeps them (docs/motion.md). */
+@keyframes ds-spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+/* ---------- button ----------
+   .ds-btn                 secondary: used several times a session
+   .ds-btn--primary        the one main action in a region, in the accent
+   .ds-btn--quiet          tertiary: no fill until hovered
+   .ds-btn--danger         destructive; arms first (data-armed), see below
+   .ds-btn--small · --icon
+   [aria-pressed="true"]   a latched toggle
+   [aria-busy="true"]      working: no second press; after --ds-timing-wait a spinner replaces the label, same size */
+.ds-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-control);
+  padding: 0 var(--ds-size-control-padding);
+  border: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-raised);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-control);
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color var(--ds-duration-fast) var(--ds-ease-standard),
+    border-color var(--ds-duration-fast) var(--ds-ease-standard),
+    color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+@media (hover: hover) {
+  .ds-btn:hover {
+    background: var(--ds-surface-raised-hover);
+    border-color: var(--ds-line-strong);
+  }
+}
+.ds-btn:active {
+  background: var(--ds-surface-inset);
+  transition-duration: var(--ds-duration-instant);
+}
+
+.ds-btn--primary {
+  background: var(--ds-accent);
+  border-color: var(--ds-accent);
+  color: var(--ds-accent-on);
+}
+@media (hover: hover) {
+  .ds-btn--primary:hover {
+    background: var(--ds-accent-hover);
+    border-color: var(--ds-accent-hover);
+  }
+}
+.ds-btn--primary:active {
+  background: var(--ds-accent-hover);
+  border-color: var(--ds-accent-hover);
+}
+
+.ds-btn--quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--ds-ink-secondary);
+}
+@media (hover: hover) {
+  .ds-btn--quiet:hover {
+    background: var(--ds-wash-hover);
+    border-color: transparent;
+    color: var(--ds-ink-primary);
+  }
+}
+.ds-btn--quiet:active {
+  background: var(--ds-wash-pressed);
+}
+
+/* Only what cannot be undone, or what goes straight to a live output, arms
+   first: the first press sets data-armed="true" and relabels the button with
+   what the next press does; --ds-timing-arm later, or on blur, it disarms.
+   A destructive action that can be undone happens at once, with Undo in a
+   toast. */
+.ds-btn--danger {
+  color: var(--ds-bad-ink);
+}
+@media (hover: hover) {
+  .ds-btn--danger:hover {
+    border-color: var(--ds-bad);
+  }
+}
+.ds-btn--danger[data-armed='true'] {
+  background: var(--ds-bad);
+  border-color: var(--ds-bad);
+  color: var(--ds-bad-on);
+}
+
+.ds-btn[aria-pressed='true'] {
+  background: var(--ds-accent-soft);
+  border-color: var(--ds-accent);
+  color: var(--ds-accent-ink);
+}
+
+.ds-btn--small {
+  min-height: var(--ds-size-control-sm);
+  padding: 0 var(--ds-space-2);
+}
+.ds-btn--icon {
+  min-width: var(--ds-size-control);
+  padding: 0;
+}
+.ds-btn--small.ds-btn--icon {
+  min-width: var(--ds-size-control-sm);
+}
+.ds-btn > svg {
+  flex: none;
+  width: var(--ds-size-icon);
+  height: var(--ds-size-icon);
+}
+/* a small control keeps its look and grows its hit area to the target size */
+.ds-btn--small::after {
+  content: '';
+  position: absolute;
+  inset: min(0px, calc((var(--ds-size-control-sm) - var(--ds-size-target)) / 2));
+}
+
+/* Busy: a busy button does not take a second press, at once. The label stays
+   until the work has run --ds-timing-wait, so a quick action never flashes a
+   spinner; then the spinner is drawn over it. The label stays for the screen
+   reader throughout and holds the width. Each delay is a zero-length
+   animation filled both ways: before it, the first keyframe holds; after it,
+   the last. */
+.ds-btn[aria-busy='true'] {
+  cursor: progress;
+  pointer-events: none;
+  animation: ds-busy-ink 0s var(--ds-timing-wait) both;
+}
+.ds-btn[aria-busy='true'] > * {
+  animation: ds-busy-hide 0s var(--ds-timing-wait) both;
+}
+.ds-btn[aria-busy='true']::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: var(--ds-size-icon);
+  height: var(--ds-size-icon);
+  margin: auto;
+  border: var(--ds-space-half) solid var(--ds-ink-secondary);
+  border-inline-end-color: transparent;
+  border-radius: var(--ds-radius-pill);
+  animation:
+    ds-spin var(--ds-motion-cycle-spin) linear infinite,
+    ds-busy-show 0s var(--ds-timing-wait) both;
+}
+@keyframes ds-busy-ink {
+  to {
+    color: transparent;
+  }
+}
+@keyframes ds-busy-hide {
+  to {
+    visibility: hidden;
+  }
+}
+@keyframes ds-busy-show {
+  from {
+    opacity: 0;
+  }
+}
+.ds-btn--primary[aria-busy='true']::before {
+  border-color: var(--ds-accent-on);
+  border-inline-end-color: transparent;
+}
+
+.ds-btn:disabled,
+.ds-btn[aria-disabled='true'] {
+  background: transparent;
+  border-color: var(--ds-line-subtle);
+  color: var(--ds-ink-disabled);
+  cursor: not-allowed;
+}
+
+/* ---------- fields ---------- */
+.ds-field {
+  display: block;
+  width: 100%;
+  min-height: var(--ds-size-control);
+  padding: 0 var(--ds-size-control-padding);
+  border: var(--ds-space-hairline) solid var(--ds-line-control);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  transition: border-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-field::placeholder {
+  color: var(--ds-ink-tertiary);
+  opacity: 1;
+}
+@media (hover: hover) {
+  .ds-field:hover {
+    border-color: var(--ds-ink-tertiary);
+  }
+}
+.ds-field:focus-visible {
+  border-color: var(--ds-focus);
+  outline-offset: 0;
+}
+.ds-field[aria-invalid='true'] {
+  border-color: var(--ds-bad);
+}
+.ds-field:disabled {
+  border-color: var(--ds-line-subtle);
+  color: var(--ds-ink-disabled);
+  cursor: not-allowed;
+}
+.ds-field--numeric {
+  font: var(--ds-text-numeric);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+textarea.ds-field {
+  min-height: calc(var(--ds-size-control) * 3);
+  padding-block: var(--ds-space-2);
+  resize: vertical;
+}
+select.ds-field {
+  appearance: none;
+  padding-inline-end: calc(var(--ds-size-control-padding) + var(--ds-space-4));
+  /* a chevron drawn in the text colour, so it follows the theme */
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    right calc(var(--ds-size-control-padding) + var(--ds-space-1)) center,
+    right var(--ds-size-control-padding) center;
+  background-size: var(--ds-space-1) var(--ds-space-1);
+  background-repeat: no-repeat;
+}
+
+/* label above, field, then a hint or an error under it */
+.ds-form-row {
+  display: grid;
+  gap: var(--ds-space-1);
+}
+.ds-label {
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+.ds-hint {
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-caption);
+}
+.ds-error {
+  color: var(--ds-bad-ink);
+  font: var(--ds-text-caption);
+}
+/* The label line, when it carries a Reset: label first, Reset at the end.
+   <div class="ds-form-row" data-modified="true">
+     <div class="ds-form-row__head"><label class="ds-label" for="fps">Frame rate</label>
+       <button class="ds-btn ds-btn--quiet ds-btn--small ds-reset" aria-label="Reset frame rate to 30">Reset</button></div>
+     <input class="ds-field" id="fps" value="25">
+   </div> */
+.ds-form-row__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-control-sm);
+}
+/* Changed from its default: the label goes to ink.primary with a neutral dot.
+   Not the accent (it is not "you") and not amber (nothing is wrong). A live
+   value never takes it. */
+[data-modified='true'] > .ds-label,
+[data-modified='true'] > .ds-form-row__head > .ds-label,
+.ds-switch[data-modified='true'],
+.ds-check[data-modified='true'],
+.ds-radio[data-modified='true'] {
+  color: var(--ds-ink-primary);
+}
+[data-modified='true'] > .ds-label::before,
+[data-modified='true'] > .ds-form-row__head > .ds-label::before {
+  content: '' / '';
+  display: inline-block;
+  width: var(--ds-space-1);
+  height: var(--ds-space-1);
+  margin-inline-end: var(--ds-space-1);
+  border-radius: var(--ds-radius-pill);
+  background: currentColor;
+  vertical-align: middle;
+}
+/* Reset keeps its place when there is nothing to reset, so nothing moves
+   under the pointer: it is hidden, not removed. */
+.ds-form-row:not([data-modified='true']) .ds-reset {
+  visibility: hidden;
+}
+
+/* Pending: a value sent to a device and not yet read back. The control stays
+   usable (unlike busy); a dashed ring says "sent, not confirmed". If the
+   read-back disagrees past the app's timeout it goes to data-pending="late",
+   in amber, with a hint saying what the device reports. */
+[data-pending='true'],
+[data-pending='late'] {
+  outline: var(--ds-space-hairline) dashed var(--ds-ink-tertiary);
+  outline-offset: var(--ds-space-half);
+}
+[data-pending='late'] {
+  outline-color: var(--ds-warn);
+  outline-style: solid;
+}
+/* focus still wins: its ring replaces the pending one while it has focus */
+[data-pending]:focus-visible {
+  outline: var(--ds-size-focus-ring) solid var(--ds-focus);
+}
+
+/* Locked: protected, not unavailable. The live output, a locked patch. Unlike
+   disabled it can be lifted, by someone, and its value still reads: the
+   content stays in ink, the control loses its fill, and a lock mark says why.
+   Set aria-disabled="true" with data-locked="true", and a tooltip naming who
+   can unlock it.
+   <button class="ds-btn" aria-disabled="true" data-locked="true" aria-describedby="lock-tip"><span class="ds-lock" aria-hidden="true"></span>Blackout</button> */
+.ds-lock {
+  display: inline-block;
+  flex: none;
+  width: var(--ds-size-icon);
+  height: var(--ds-size-icon);
+  background: currentColor;
+  vertical-align: middle;
+  /* a padlock, drawn as a mask so it takes the text colour in either theme */
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 7V5a3.5 3.5 0 0 1 7 0v2h.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1zm1.5 0h4V5a2 2 0 1 0-4 0z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 7V5a3.5 3.5 0 0 1 7 0v2h.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1zm1.5 0h4V5a2 2 0 1 0-4 0z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+.ds-btn[data-locked='true'] {
+  background: transparent;
+  border-color: var(--ds-line-subtle);
+  color: var(--ds-ink-secondary);
+  cursor: not-allowed;
+}
+.ds-field[data-locked='true'] {
+  border-color: var(--ds-line-subtle);
+  background: transparent;
+  color: var(--ds-ink-primary);
+  cursor: not-allowed;
+}
+
+/* ---------- segmented control ----------
+   <div class="ds-seg" role="group" aria-label="View">
+     <button aria-pressed="true">Rig</button> <button aria-pressed="false">Stage</button>
+   </div>
+   The chosen segment is told by the accent's edge, not by a fill alone. */
+.ds-seg {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--ds-space-half);
+  padding: var(--ds-space-half);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+}
+.ds-seg > button {
+  min-height: calc(var(--ds-size-control) - 2 * var(--ds-space-half));
+  padding: 0 var(--ds-size-control-padding);
+  border: 0;
+  border-radius: max(0px, calc(var(--ds-radius-control) - var(--ds-space-half)));
+  background: transparent;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-control);
+  cursor: pointer;
+  transition:
+    background-color var(--ds-duration-fast) var(--ds-ease-standard),
+    color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+@media (hover: hover) {
+  .ds-seg > button:hover {
+    background: var(--ds-wash-hover);
+    color: var(--ds-ink-primary);
+  }
+}
+.ds-seg > button[aria-pressed='true'],
+.ds-seg > button[aria-checked='true'] {
+  background: var(--ds-accent-soft);
+  color: var(--ds-accent-ink);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-accent);
+}
+
+/* ---------- switch ----------
+   <label class="ds-switch"><input type="checkbox" role="switch"> Send when idle</label> */
+.ds-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-target);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  cursor: pointer;
+}
+.ds-switch > input {
+  --track-h: calc(var(--ds-size-control-sm) * 0.75);
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: calc(var(--track-h) * 1.75);
+  height: var(--track-h);
+  margin: 0;
+  border: var(--ds-space-hairline) solid var(--ds-line-control);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-inset);
+  cursor: pointer;
+  transition:
+    background-color var(--ds-duration-fast) var(--ds-ease-standard),
+    border-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-switch > input::before {
+  content: '';
+  position: absolute;
+  top: var(--ds-space-half);
+  left: var(--ds-space-half);
+  width: calc(var(--track-h) - 2 * var(--ds-space-half) - 2 * var(--ds-space-hairline));
+  aspect-ratio: 1;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-ink-secondary);
+  transition: transform var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-switch > input:checked {
+  background: var(--ds-accent);
+  border-color: var(--ds-accent);
+}
+.ds-switch > input:checked::before {
+  background: var(--ds-accent-on);
+  transform: translateX(calc(var(--track-h) * 0.75));
+}
+.ds-switch > input:disabled {
+  border-color: var(--ds-line-subtle);
+  cursor: not-allowed;
+}
+.ds-switch > input:disabled::before {
+  background: var(--ds-ink-disabled);
+}
+.ds-switch:has(> input:disabled) {
+  color: var(--ds-ink-disabled);
+  cursor: not-allowed;
+}
+
+/* ---------- chip and dot ----------
+   A chip names a state in words; the dot beside it is a second channel,
+   never the only one. */
+.ds-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ds-space-1);
+  min-height: var(--ds-size-control-sm);
+  padding: 0 var(--ds-space-2);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+  white-space: nowrap;
+}
+.ds-chip--accent {
+  background: var(--ds-accent-soft);
+  color: var(--ds-accent-ink);
+}
+.ds-chip--ok {
+  background: var(--ds-ok-soft);
+  color: var(--ds-ok-ink);
+}
+.ds-chip--warn {
+  background: var(--ds-warn-soft);
+  color: var(--ds-warn-ink);
+}
+.ds-chip--bad {
+  background: var(--ds-bad-soft);
+  color: var(--ds-bad-ink);
+}
+
+.ds-dot {
+  display: inline-block;
+  flex: none;
+  width: var(--ds-space-2);
+  height: var(--ds-space-2);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-ink-tertiary);
+}
+.ds-dot--ok {
+  background: var(--ds-ok);
+}
+.ds-dot--warn {
+  background: var(--ds-warn);
+}
+.ds-dot--bad {
+  background: var(--ds-bad);
+}
+.ds-dot--accent {
+  background: var(--ds-accent);
+}
+/* hollow: off, not sending */
+.ds-dot--off {
+  background: transparent;
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-ink-disabled);
+}
+
+/* ---------- panel ----------
+   Set off by its surface, not by a border. */
+.ds-panel {
+  min-width: 0;
+  border-radius: var(--ds-radius-panel);
+  background: var(--ds-surface-panel);
+}
+.ds-panel__head {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-bar);
+  padding: 0 var(--ds-space-3);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  font: var(--ds-text-title);
+}
+.ds-panel__body {
+  display: grid;
+  gap: var(--ds-space-3);
+  padding: var(--ds-space-3);
+}
+
+/* ---------- list ---------- */
+.ds-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ds-row {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-row);
+  padding: var(--ds-space-1) var(--ds-space-3);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  color: var(--ds-ink-primary);
+}
+.ds-row:last-child {
+  border-bottom: 0;
+}
+.ds-row[role='option'],
+.ds-row[tabindex] {
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ds-row[role='option']:not([aria-selected='true']):hover,
+  .ds-row[tabindex]:not([aria-selected='true']):hover {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-row[aria-selected='true'] {
+  background: var(--ds-accent-soft);
+  box-shadow: inset var(--ds-space-half) 0 0 var(--ds-accent);
+}
+/* Picked up: lifted off the list with the dragged wash and a float shadow.
+   The app sets data-dragging while the row is held. */
+.ds-row[data-dragging='true'] {
+  position: relative;
+  z-index: var(--ds-layer-sticky);
+  border-radius: var(--ds-radius-control);
+  background:
+    linear-gradient(var(--ds-wash-dragged), var(--ds-wash-dragged)), var(--ds-surface-panel);
+  box-shadow: var(--ds-elevation-menu);
+  cursor: grabbing;
+}
+
+/* A list in chunks: a subheader names each group and stays in view while its
+   rows scroll under it. Put the subheader in its own <li role="presentation">
+   or, for a listbox, give each group role="group" aria-labelledby the head.
+   <li class="ds-list__head" id="g-fohl">FOH left</li> */
+.ds-list__head {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: var(--ds-layer-sticky);
+  display: flex;
+  align-items: flex-end;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-row);
+  padding: var(--ds-space-2) var(--ds-space-3) var(--ds-space-1);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  background: var(--ds-surface-panel);
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+.ds-list__head > .ds-list__count {
+  margin-inline-start: auto;
+  font-variant-numeric: tabular-nums;
+}
+/* Two lines: the name, then what tells it apart (a channel, a time, who).
+   Never three: a third line is a detail view.
+   <li class="ds-row"><span class="ds-row__text"><span class="ds-row__title">Spot 3</span>
+   <span class="ds-row__meta">101/1 · 16ch</span></span><span class="ds-row__end">…</span></li> */
+.ds-row__text {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+.ds-row__title,
+.ds-row__meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-row__meta {
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+}
+.ds-row__end {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ds-space-2);
+  margin-inline-start: auto;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+  font-variant-numeric: tabular-nums;
+}
+/* a row that goes somewhere: a chevron at the end says "opens" */
+.ds-row--link {
+  text-decoration: none;
+  cursor: pointer;
+}
+.ds-row--link::after {
+  content: '›' / '';
+  flex: none;
+  margin-inline-start: var(--ds-space-2);
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-title);
+}
+@media (hover: hover) {
+  .ds-row--link:not([aria-current='page']):hover {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-row--link[aria-current='page'] {
+  background: var(--ds-accent-soft);
+  box-shadow: inset var(--ds-space-half) 0 0 var(--ds-accent);
+}
+
+/* ---------- section ----------
+   A titled chunk inside a panel, a sheet or a page, without a fold or a box:
+   a label, then its content. Space above it, not a line, is what separates
+   one section from the next. A section that is rarely needed is a
+   ds-disclosure instead.
+   <section class="ds-section" aria-labelledby="s-out"><h3 class="ds-section__head" id="s-out">Output</h3>…</section> */
+.ds-section {
+  display: grid;
+  gap: var(--ds-space-2);
+  min-width: 0;
+}
+.ds-section + .ds-section {
+  margin-block-start: var(--ds-space-4);
+}
+.ds-section__head {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  margin: 0;
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+.ds-section__head > :last-child {
+  margin-inline-start: auto;
+}
+
+/* ---------- table ----------
+   Dense data: a patch, a flow list, a call sheet. Numbers sit right in the
+   mono face (.ds-num); a selected row gets the accent's edge, as a list does. */
+.ds-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: var(--ds-text-body);
+}
+.ds-table th {
+  height: var(--ds-size-row);
+  padding: 0 var(--ds-space-2);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-strong);
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+  text-align: start;
+  white-space: nowrap;
+}
+.ds-table td {
+  height: var(--ds-size-row);
+  padding: 0 var(--ds-space-2);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+}
+.ds-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.ds-table .ds-num {
+  text-align: end;
+}
+.ds-table td.ds-num {
+  font: var(--ds-text-numeric);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+.ds-table tbody tr[aria-selected] {
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ds-table tbody tr[aria-selected='false']:hover td {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-table tbody tr[aria-selected='true'] td {
+  background: var(--ds-accent-soft);
+}
+.ds-table tbody tr[aria-selected='true'] td:first-child {
+  box-shadow: inset var(--ds-space-half) 0 0 var(--ds-accent);
+}
+
+/* ---------- tabs ---------- */
+.ds-tabs {
+  display: flex;
+  gap: var(--ds-space-4);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  overflow-x: auto;
+}
+.ds-tab {
+  min-height: var(--ds-size-control);
+  padding: 0;
+  border: 0;
+  border-bottom: var(--ds-space-half) solid transparent;
+  background: transparent;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-control);
+  white-space: nowrap;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ds-tab:hover {
+    color: var(--ds-ink-primary);
+  }
+}
+.ds-tab[aria-selected='true'] {
+  border-bottom-color: var(--ds-accent);
+  color: var(--ds-ink-primary);
+}
+
+/* ---------- notice and toast ----------
+   A notice says what happened and what to do next. A failure stays until it
+   is dismissed; success leaves after --ds-timing-notice.
+   <div class="ds-notice ds-notice--warn" role="status">
+     <div class="ds-notice__body"><div class="ds-notice__title">Held at full white</div>…</div>
+     <button class="ds-btn ds-btn--small ds-btn--quiet">Release</button>
+   </div> */
+.ds-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ds-space-2);
+  padding: var(--ds-space-2) var(--ds-space-3);
+  border-inline-start: var(--ds-space-1) solid var(--ds-line-strong);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+}
+.ds-notice__body {
+  flex: 1;
+  min-width: 0;
+}
+.ds-notice__title {
+  font-weight: var(--ds-weight-semibold);
+}
+.ds-notice--ok {
+  border-color: var(--ds-ok);
+  background: var(--ds-ok-soft);
+}
+.ds-notice--warn {
+  border-color: var(--ds-warn);
+  background: var(--ds-warn-soft);
+}
+.ds-notice--bad {
+  border-color: var(--ds-bad);
+  background: var(--ds-bad-soft);
+}
+.ds-toast {
+  z-index: var(--ds-layer-toast);
+  max-width: min(100%, 26rem);
+  border: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-inline-start-width: var(--ds-space-1);
+  background: var(--ds-surface-overlay);
+  box-shadow: var(--ds-elevation-menu);
+}
+.ds-toast.ds-notice--ok,
+.ds-toast.ds-notice--warn,
+.ds-toast.ds-notice--bad {
+  background: var(--ds-surface-overlay);
+}
+.ds-toast.ds-notice--ok {
+  border-inline-start-color: var(--ds-ok);
+}
+.ds-toast.ds-notice--warn {
+  border-inline-start-color: var(--ds-warn);
+}
+.ds-toast.ds-notice--bad {
+  border-inline-start-color: var(--ds-bad);
+}
+/* A toast's one action (Undo, Retry), then Dismiss. While the pointer or
+   focus is in a toast with an action, its timer pauses (the app's script);
+   it carries on, from where it stopped, when they leave. */
+.ds-notice__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ds-space-1);
+}
+
+/* ---------- menu ---------- */
+.ds-menu {
+  z-index: var(--ds-layer-popover);
+  display: grid;
+  min-width: 12rem;
+  padding: var(--ds-space-1);
+  border: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-radius: var(--ds-radius-overlay);
+  background: var(--ds-surface-overlay);
+  box-shadow: var(--ds-elevation-menu);
+}
+.ds-menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-row);
+  padding: 0 var(--ds-space-2);
+  border: 0;
+  border-radius: var(--ds-radius-control);
+  background: transparent;
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  text-align: start;
+  text-decoration: none;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ds-menu__item:hover {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-menu__item:focus-visible {
+  background: var(--ds-wash-hover);
+}
+.ds-menu__item--danger {
+  color: var(--ds-bad-ink);
+}
+.ds-menu__item kbd {
+  margin-inline-start: auto;
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-caption);
+}
+.ds-menu__rule {
+  height: var(--ds-space-hairline);
+  margin: var(--ds-space-1) 0;
+  border: 0;
+  background: var(--ds-line-subtle);
+}
+
+/* ---------- dialog ----------
+   On a native <dialog>, opened with showModal(): focus moves in, Escape
+   closes it, focus returns. Focus the safe button, not the destructive one. */
+.ds-dialog {
+  width: min(28rem, calc(100% - 2 * var(--ds-space-4)));
+  padding: var(--ds-space-6);
+  border: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-radius: var(--ds-radius-overlay);
+  background: var(--ds-surface-overlay);
+  color: var(--ds-ink-primary);
+  box-shadow: var(--ds-elevation-modal);
+}
+.ds-dialog::backdrop {
+  background: var(--ds-veil);
+}
+.ds-dialog__title {
+  margin: 0 0 var(--ds-space-2);
+  font: var(--ds-text-title);
+}
+.ds-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--ds-space-2);
+  margin-top: var(--ds-space-6);
+}
+
+/* ---------- tooltip ---------- */
+.ds-tooltip {
+  z-index: var(--ds-layer-tooltip);
+  max-width: 18rem;
+  padding: var(--ds-space-1) var(--ds-space-2);
+  border: 0;
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-ink-primary);
+  color: var(--ds-ink-inverse);
+  font: var(--ds-text-caption);
+}
+
+/* ---------- readout ---------- */
+.ds-readout {
+  display: inline-grid;
+  gap: var(--ds-space-half);
+}
+.ds-readout__value {
+  font: var(--ds-text-readout);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+.ds-readout__label {
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+
+/* ---------- progress ---------- */
+.ds-progress {
+  height: var(--ds-space-1);
+  overflow: hidden;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-inset);
+}
+.ds-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ds-accent);
+  transition: width var(--ds-duration-base) var(--ds-ease-standard);
+}
+
+/* ---------- empty state ----------
+   The only onboarding a professional will tolerate: say what goes here, show
+   it, and offer the one action that starts it. */
+.ds-empty {
+  display: grid;
+  justify-items: center;
+  gap: var(--ds-space-3);
+  padding: var(--ds-space-10) var(--ds-space-6);
+  text-align: center;
+}
+.ds-empty__title {
+  margin: 0;
+  font: var(--ds-text-heading);
+  text-wrap: balance;
+}
+.ds-empty__body {
+  max-width: 44ch;
+  margin: 0;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-prose);
+}
+
+/* ---------- checkbox and radio ----------
+   <label class="ds-check"><input type="checkbox"> Follow the cue</label>
+   <label class="ds-radio"><input type="radio" name="out"> Output A</label>
+   The native input, drawn: the keyboard, the form and the mixed state
+   (el.indeterminate = true) come with it. */
+.ds-check,
+.ds-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-target);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  cursor: pointer;
+}
+.ds-check > input,
+.ds-radio > input {
+  --box: calc(var(--ds-size-control-sm) * 0.75);
+  appearance: none;
+  position: relative;
+  display: grid;
+  place-content: center;
+  flex: none;
+  width: var(--box);
+  height: var(--box);
+  margin: 0;
+  border: var(--ds-space-hairline) solid var(--ds-line-control);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  cursor: pointer;
+  transition:
+    background-color var(--ds-duration-fast) var(--ds-ease-standard),
+    border-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-radio > input {
+  border-radius: var(--ds-radius-pill);
+}
+/* the mark: a tick drawn with two borders, a bar for mixed, a dot for a radio */
+.ds-check > input::before,
+.ds-radio > input::before {
+  content: '';
+  opacity: 0;
+  transition: opacity var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-check > input::before {
+  width: calc(var(--box) * 0.3);
+  height: calc(var(--box) * 0.55);
+  margin-top: calc(var(--box) * -0.1);
+  border: solid var(--ds-accent-on);
+  border-width: 0 var(--ds-space-half) var(--ds-space-half) 0;
+  rotate: 45deg;
+}
+.ds-check > input:indeterminate::before {
+  width: calc(var(--box) * 0.5);
+  height: 0;
+  margin: 0;
+  border-width: 0 0 var(--ds-space-half);
+  rotate: none;
+}
+.ds-radio > input::before {
+  width: calc(var(--box) * 0.4);
+  aspect-ratio: 1;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent-on);
+}
+.ds-check > input:is(:checked, :indeterminate),
+.ds-radio > input:checked {
+  border-color: var(--ds-accent);
+  background: var(--ds-accent);
+}
+.ds-check > input:is(:checked, :indeterminate)::before,
+.ds-radio > input:checked::before {
+  opacity: 1;
+}
+@media (hover: hover) {
+  .ds-check:hover > input:not(:checked, :indeterminate, :disabled),
+  .ds-radio:hover > input:not(:checked, :disabled) {
+    border-color: var(--ds-ink-tertiary);
+  }
+}
+.ds-check > input[aria-invalid='true'],
+.ds-radio > input[aria-invalid='true'] {
+  border-color: var(--ds-bad);
+}
+.ds-check > input:disabled,
+.ds-radio > input:disabled {
+  border-color: var(--ds-line-subtle);
+  background: transparent;
+  cursor: not-allowed;
+}
+.ds-check > input:disabled::before {
+  border-color: var(--ds-ink-disabled);
+}
+.ds-radio > input:disabled::before {
+  background: var(--ds-ink-disabled);
+}
+.ds-check:has(> input:disabled),
+.ds-radio:has(> input:disabled) {
+  color: var(--ds-ink-disabled);
+  cursor: not-allowed;
+}
+
+/* a set of choices: the legend is a label, the options stack */
+.ds-choices {
+  display: grid;
+  gap: var(--ds-space-1);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.ds-choices > legend {
+  margin-bottom: var(--ds-space-1);
+  padding: 0;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+
+/* ---------- slider ----------
+   <input class="ds-slider" type="range" min="0" max="255" style="--fill: 50%">
+   .ds-slider--vertical is a fader. The app sets --fill from the value (the
+   track is filled in the accent up to the thumb); Firefox fills on its own.
+   The thumb follows the value at once: a live value never animates. */
+.ds-slider {
+  --fill: 0%;
+  --track: var(--ds-space-1);
+  --thumb: calc(var(--ds-size-control-sm) * 0.75);
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: var(--ds-size-target);
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.ds-slider::-webkit-slider-runnable-track {
+  height: var(--track);
+  border-radius: var(--ds-radius-pill);
+  background: linear-gradient(
+    to right,
+    var(--ds-accent) var(--fill),
+    var(--ds-surface-inset) var(--fill)
+  );
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-line-control);
+}
+.ds-slider::-moz-range-track {
+  height: var(--track);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-inset);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-line-control);
+}
+.ds-slider::-moz-range-progress {
+  height: var(--track);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent);
+}
+.ds-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc((var(--track) - var(--thumb)) / 2);
+  border: var(--ds-space-hairline) solid var(--ds-line-control);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-ink-primary);
+  transition: scale var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-slider::-moz-range-thumb {
+  width: var(--thumb);
+  height: var(--thumb);
+  border: var(--ds-space-hairline) solid var(--ds-line-control);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-ink-primary);
+}
+.ds-slider:active::-webkit-slider-thumb {
+  background: var(--ds-accent);
+}
+.ds-slider:active::-moz-range-thumb {
+  background: var(--ds-accent);
+}
+.ds-slider:focus-visible {
+  outline-offset: 0;
+}
+.ds-slider:disabled {
+  cursor: not-allowed;
+}
+.ds-slider:disabled::-webkit-slider-runnable-track {
+  background: var(--ds-surface-inset);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-line-subtle);
+}
+.ds-slider:disabled::-webkit-slider-thumb {
+  border-color: var(--ds-line-subtle);
+  background: var(--ds-ink-disabled);
+}
+.ds-slider:disabled::-moz-range-progress {
+  background: var(--ds-ink-disabled);
+}
+.ds-slider:disabled::-moz-range-thumb {
+  border-color: var(--ds-line-subtle);
+  background: var(--ds-ink-disabled);
+}
+/* a fader: up is more */
+.ds-slider--vertical {
+  width: var(--ds-size-target);
+  height: auto;
+  min-height: calc(var(--ds-size-control) * 4);
+  writing-mode: vertical-lr;
+  direction: rtl;
+}
+.ds-slider--vertical::-webkit-slider-runnable-track {
+  width: var(--track);
+  height: 100%;
+  background: linear-gradient(
+    to top,
+    var(--ds-accent) var(--fill),
+    var(--ds-surface-inset) var(--fill)
+  );
+}
+.ds-slider--vertical::-webkit-slider-thumb {
+  margin-top: 0;
+  margin-left: calc((var(--track) - var(--thumb)) / 2);
+}
+
+/* ---------- spinner ----------
+   Indeterminate, in place: <span class="ds-spinner" role="status" aria-label="Sending"></span>.
+   The same spin a busy button draws. */
+.ds-spinner {
+  display: inline-block;
+  flex: none;
+  width: var(--ds-size-icon);
+  height: var(--ds-size-icon);
+  border: var(--ds-space-half) solid var(--ds-ink-secondary);
+  border-inline-end-color: transparent;
+  border-radius: var(--ds-radius-pill);
+  animation: ds-spin var(--ds-motion-cycle-spin) linear infinite;
+}
+
+/* ---------- indeterminate progress ----------
+   <div class="ds-progress ds-progress--indeterminate" role="progressbar" aria-label="Loading the rig"><span></span></div>
+   A sweep; with reduced motion, a pulse in place. */
+@keyframes ds-sweep {
+  from {
+    translate: -100% 0;
+  }
+  to {
+    translate: 250% 0;
+  }
+}
+@keyframes ds-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+.ds-progress--indeterminate > span {
+  width: 40%;
+  animation: ds-sweep var(--ds-motion-cycle-sweep) var(--ds-ease-standard) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-progress--indeterminate > span {
+    width: 100%;
+    animation-name: ds-pulse;
+  }
+}
+[data-motion='reduced'] .ds-progress--indeterminate > span {
+  width: 100%;
+  animation-name: ds-pulse;
+}
+
+/* ---------- skeleton ----------
+   The shape of what is coming, while it comes: <span class="ds-skeleton" aria-hidden="true"></span>
+   Only where something is on its way. Offline is not loading: show what is
+   here and say what is waiting, never an endless skeleton. */
+.ds-skeleton {
+  display: block;
+  height: var(--ds-text-body-size);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  animation: ds-pulse var(--ds-motion-cycle-pulse) var(--ds-ease-standard) infinite;
+}
+.ds-skeleton--row {
+  height: var(--ds-size-row);
+}
+.ds-skeleton--block {
+  height: calc(var(--ds-size-row) * 3);
+  border-radius: var(--ds-radius-panel);
+}
+
+/* ---------- badge ----------
+   A count or a mark on something else: unread messages on a tab, faults on
+   an output. Neutral unless it means something in the grammar. The count
+   changes at once; it never animates.
+   <button class="ds-btn ds-btn--icon" aria-label="Messages, 3 unread">… <span class="ds-badge" aria-hidden="true">3</span></button> */
+.ds-badge {
+  display: inline-grid;
+  place-content: center;
+  min-width: var(--ds-size-icon);
+  height: var(--ds-size-icon);
+  padding: 0 var(--ds-space-1);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-ink-primary);
+  color: var(--ds-ink-inverse);
+  font: var(--ds-text-caption);
+  font-weight: var(--ds-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.ds-badge--accent {
+  background: var(--ds-accent);
+  color: var(--ds-accent-on);
+}
+.ds-badge--warn {
+  background: var(--ds-warn);
+  color: var(--ds-warn-on);
+}
+.ds-badge--bad {
+  background: var(--ds-bad);
+  color: var(--ds-bad-on);
+}
+/* on the corner of a button; after the label of a tab */
+.ds-btn > .ds-badge {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  translate: 35% -35%;
+}
+.ds-tab > .ds-badge {
+  margin-inline-start: var(--ds-space-1);
+  vertical-align: text-bottom;
+}
+/* a bare dot: something new, no count */
+.ds-badge:empty {
+  min-width: var(--ds-space-2);
+  width: var(--ds-space-2);
+  height: var(--ds-space-2);
+  padding: 0;
+}
+
+/* ---------- disclosure ----------
+   <details class="ds-disclosure"><summary>Advanced</summary><div class="ds-disclosure__body">…</div></details>
+   A section that folds: an inspector's advanced settings, a fixture's
+   channels. The chevron turns and, where the browser can, the body opens. */
+.ds-disclosure {
+  interpolate-size: allow-keywords;
+}
+.ds-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-row);
+  padding: 0 var(--ds-space-2);
+  border-radius: var(--ds-radius-control);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-control);
+  list-style: none;
+  cursor: pointer;
+  transition: background-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-disclosure__count {
+  margin-inline-start: auto;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+  font-variant-numeric: tabular-nums;
+}
+.ds-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+/* the chevron: two borders, turned */
+.ds-disclosure > summary::before {
+  content: '';
+  flex: none;
+  width: var(--ds-space-1);
+  height: var(--ds-space-1);
+  margin-inline: var(--ds-space-half);
+  border: solid currentColor;
+  border-width: 0 var(--ds-space-half) var(--ds-space-half) 0;
+  rotate: -45deg;
+  transition: rotate var(--ds-duration-base) var(--ds-ease-standard);
+}
+.ds-disclosure[open] > summary::before {
+  rotate: 45deg;
+}
+@media (hover: hover) {
+  .ds-disclosure > summary:hover {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-disclosure__body {
+  display: grid;
+  gap: var(--ds-space-3);
+  padding: var(--ds-space-2) var(--ds-space-2) var(--ds-space-3) var(--ds-space-6);
+}
+.ds-disclosure::details-content {
+  block-size: 0;
+  overflow-y: clip;
+  transition:
+    block-size var(--ds-duration-fast) var(--ds-ease-exit),
+    content-visibility var(--ds-duration-fast) allow-discrete;
+}
+.ds-disclosure[open]::details-content {
+  block-size: auto;
+  transition-duration: var(--ds-duration-base);
+  transition-timing-function: var(--ds-ease-enter);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-disclosure::details-content,
+  .ds-disclosure > summary::before {
+    transition: none;
+  }
+}
+[data-motion='reduced'] .ds-disclosure::details-content,
+[data-motion='reduced'] .ds-disclosure > summary::before {
+  transition: none;
+}
+
+/* ---------- popover ----------
+   <button popovertarget="patch-help">?</button>
+   <div class="ds-popover" id="patch-help" popover>…</div>
+   Anchored, light-dismissed, on the native popover attribute: Escape and a
+   click outside close it, and focus returns. Rich help, a colour picker, a
+   quick edit. Place it with CSS anchor positioning or the anchor's rect. */
+.ds-popover {
+  max-width: min(22rem, calc(100% - 2 * var(--ds-space-4)));
+  margin: 0;
+  padding: var(--ds-space-3);
+  border: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-radius: var(--ds-radius-overlay);
+  background: var(--ds-surface-overlay);
+  color: var(--ds-ink-primary);
+  font: var(--ds-text-body);
+  box-shadow: var(--ds-elevation-menu);
+}
+
+/* ---------- sheet ----------
+   A panel that slides in from an edge, on a native <dialog> opened with
+   showModal(): an inspector on a narrow screen (from the end), a phone's
+   actions (from the bottom). Focus moves in, Escape closes it.
+   <dialog class="ds-sheet" aria-labelledby="t">
+     <header class="ds-sheet__head"><h2 id="t">Partybar 1</h2> <button class="ds-btn ds-btn--quiet ds-btn--icon" aria-label="Close">…</button></header>
+     <div class="ds-sheet__body">…</div>
+     <footer class="ds-sheet__foot">…</footer>
+   </dialog> */
+.ds-sheet {
+  --from: translate(calc(100% * var(--ds-motion-travel)), 0);
+  display: none;
+  flex-direction: column;
+  width: min(24rem, calc(100% - var(--ds-space-8)));
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  margin: 0 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-inline-start: var(--ds-space-hairline) solid var(--ds-line-strong);
+  background: var(--ds-surface-overlay);
+  color: var(--ds-ink-primary);
+  box-shadow: var(--ds-elevation-modal);
+}
+.ds-sheet[open] {
+  display: flex;
+}
+.ds-sheet--bottom {
+  --from: translate(0, calc(100% * var(--ds-motion-travel)));
+  width: 100%;
+  height: fit-content;
+  max-height: 85dvh;
+  margin: auto 0 0;
+  border: 0;
+  border-top: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-radius: var(--ds-radius-overlay) var(--ds-radius-overlay) 0 0;
+}
+/* the grabber says it can be pulled down, and is the drag handle */
+.ds-sheet--bottom::before {
+  content: '';
+  align-self: center;
+  flex: none;
+  width: var(--ds-space-8);
+  height: var(--ds-space-1);
+  margin-top: var(--ds-space-2);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-line-strong);
+}
+.ds-sheet::backdrop {
+  background: var(--ds-veil);
+}
+.ds-sheet__head {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-bar);
+  padding: 0 var(--ds-space-2) 0 var(--ds-space-4);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+}
+.ds-sheet__head > :first-child {
+  flex: 1;
+  margin: 0;
+  font: var(--ds-text-title);
+}
+.ds-sheet__body {
+  display: grid;
+  align-content: start;
+  gap: var(--ds-space-3);
+  flex: 1;
+  padding: var(--ds-space-4);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ds-sheet__foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--ds-space-2);
+  padding: var(--ds-space-3) var(--ds-space-4);
+  border-top: var(--ds-space-hairline) solid var(--ds-line-subtle);
+}
+
+/* ---------- toaster ----------
+   Where toasts stack: one region, present from the start so the live
+   announcement works (principles: live regions exist before content).
+   <section class="ds-toaster" aria-label="Notifications"><div role="status">…toasts…</div></section>
+   Newest at the bottom, nearest the edge it arrives from. To dismiss one,
+   set data-leaving="true", then remove it after --ds-duration-base. */
+.ds-toaster {
+  position: fixed;
+  inset-block-end: var(--ds-space-4);
+  inset-inline-end: var(--ds-space-4);
+  z-index: var(--ds-layer-toast);
+  display: grid;
+  justify-items: end;
+  gap: var(--ds-space-2);
+  width: min(26rem, calc(100% - 2 * var(--ds-space-4)));
+  pointer-events: none;
+}
+.ds-toaster > *,
+.ds-toaster [role='status'] > *,
+.ds-toaster [role='alert'] > * {
+  pointer-events: auto;
+}
+.ds-toaster [role='status'],
+.ds-toaster [role='alert'] {
+  display: grid;
+  justify-items: end;
+  gap: var(--ds-space-2);
+}
+
+/* ---------- keyboard key ----------
+   <kbd class="ds-kbd">⇧</kbd><kbd class="ds-kbd">Space</kbd> */
+.ds-kbd {
+  display: inline-grid;
+  place-content: center;
+  min-width: var(--ds-size-control-sm);
+  height: var(--ds-size-control-sm);
+  padding: 0 var(--ds-space-1);
+  border: var(--ds-space-hairline) solid var(--ds-line-strong);
+  border-bottom-width: var(--ds-space-half);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-raised);
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-code);
+  line-height: 1;
+}
+
+/* ---------- icon ----------
+   <svg class="ds-icon" …>: one of dist/icons.js, drawn in the ink it sits in.
+   Beside its word by default (docs/imagery.md). */
+.ds-icon {
+  display: inline-block;
+  flex: none;
+  inline-size: var(--ds-size-icon);
+  block-size: var(--ds-size-icon);
+  vertical-align: middle;
+  fill: none;
+  stroke: currentColor;
+}
+
+/* ---------- thumbnail and avatar ----------
+   The picture at the start of a row or the top of a page: a photo of the
+   thing, or of the person, when there is one; until then a placeholder that
+   says what kind of thing it is (a kit icon) or who it is (initials). The
+   placeholder is quiet, inset and tertiary, so it never reads as content.
+   <span class="ds-thumb"><svg class="ds-icon" …/></span>
+   <span class="ds-avatar" data-initials="AB"></span>  <span class="ds-avatar" data-initials="AB"><img alt="" src="…"></span> */
+.ds-thumb,
+.ds-avatar {
+  --picture: var(--ds-size-control);
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  inline-size: var(--picture);
+  block-size: var(--picture);
+  overflow: hidden;
+  border: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-surface-inset);
+  color: var(--ds-ink-tertiary);
+}
+.ds-avatar {
+  border-radius: var(--ds-radius-pill);
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-label);
+  font-size: calc(var(--picture) * 0.38);
+  letter-spacing: 0;
+  text-transform: uppercase;
+  user-select: none;
+}
+/* initials from data-initials, so the row's text is still only the name */
+.ds-avatar[data-initials]::before {
+  content: attr(data-initials);
+}
+.ds-avatar:has(> img)::before {
+  display: none;
+}
+.ds-thumb > img,
+.ds-avatar > img {
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+}
+.ds-thumb > .ds-icon,
+.ds-avatar > .ds-icon {
+  inline-size: calc(var(--picture) * 0.5);
+  block-size: calc(var(--picture) * 0.5);
+}
+.ds-thumb--small,
+.ds-avatar--small {
+  --picture: var(--ds-size-control-sm);
+}
+.ds-thumb--large,
+.ds-avatar--large {
+  --picture: calc(var(--ds-size-control) * 2);
+}
+/* a stack of faces on a job: each overlaps the last, edged in the panel so
+   they stay apart */
+.ds-avatars {
+  display: inline-flex;
+}
+.ds-avatars > .ds-avatar {
+  border: var(--ds-space-half) solid var(--ds-surface-panel);
+}
+.ds-avatars > .ds-avatar + .ds-avatar {
+  margin-inline-start: calc(var(--picture) * -0.3);
+}
+
+/* ---------- skip link ----------
+   The first thing in a page with navigation in front of its content. Hidden
+   until it has focus, then it sits over the top corner.
+   <a class="ds-skip" href="#main">Skip to content</a> */
+.ds-skip {
+  position: absolute;
+  inset-block-start: var(--ds-space-2);
+  inset-inline-start: var(--ds-space-2);
+  z-index: var(--ds-layer-tooltip);
+  padding: var(--ds-space-2) var(--ds-space-3);
+  border-radius: var(--ds-radius-control);
+  background: var(--ds-accent);
+  color: var(--ds-accent-on);
+  font: var(--ds-text-control);
+  text-decoration: none;
+  translate: 0 calc(-100% - var(--ds-space-4));
+}
+.ds-skip:focus-visible {
+  translate: 0 0;
+}
+
+/* ---------- app bar ----------
+   The top of a view: Up, where you are, and the view's own actions. Up goes
+   to the parent in the app's hierarchy (All plots), never "back in history";
+   its label names the parent. The title is the one h1 on the view.
+   <header class="ds-appbar">
+     <a class="ds-btn ds-btn--quiet ds-btn--icon ds-appbar__up" href="/m/lighting" aria-label="Up to all plots">‹</a>
+     <div class="ds-appbar__title"><h1>Main rig</h1><span class="ds-appbar__context">Lighting · Plot 3</span></div>
+     <div class="ds-appbar__actions">…</div>
+   </header> */
+.ds-appbar {
+  display: flex;
+  align-items: center;
+  gap: var(--ds-space-2);
+  min-height: var(--ds-size-bar);
+  padding: 0 var(--ds-space-2);
+  border-bottom: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  background: var(--ds-surface-panel);
+}
+.ds-appbar--sticky {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: var(--ds-layer-sticky);
+}
+.ds-appbar__up {
+  flex: none;
+  font: var(--ds-text-title);
+}
+.ds-appbar__title {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  padding-inline-start: var(--ds-space-1);
+}
+.ds-appbar__title > h1,
+.ds-appbar__title > h2 {
+  overflow: hidden;
+  margin: 0;
+  font: var(--ds-text-title);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-appbar__context {
+  overflow: hidden;
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-appbar__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ds-space-1);
+}
+
+/* ---------- breadcrumbs ----------
+   Where this page sits, for a hierarchy three or more levels deep that a
+   person browses: docs, a site, a nested record. Not for a working tool's
+   views (those use Up in the app bar) and not for history.
+   <nav class="ds-crumbs" aria-label="Breadcrumb"><ol>
+     <li><a href="/docs">Docs</a></li>
+     <li class="ds-crumbs__more"><button class="ds-crumbs__more-btn" popovertarget="cr-more" aria-label="2 more levels">…</button></li>
+     <li><a href="/docs/light">LIGHT</a></li>
+     <li><a href="/docs/light/0.3">0.3</a></li>
+     <li><a aria-current="page">Output</a></li>
+   </ol></nav>
+   The middle levels fold into the "…" when the trail is short of room; the
+   app puts the same links in a ds-menu that the button opens. */
+.ds-crumbs {
+  container-type: inline-size;
+  min-width: 0;
+  font: var(--ds-text-body);
+}
+.ds-crumbs > ol {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  white-space: nowrap;
+}
+.ds-crumbs li {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.ds-crumbs li + li::before {
+  content: '/' / '';
+  flex: none;
+  padding: 0 var(--ds-space-1);
+  color: var(--ds-ink-tertiary);
+}
+.ds-crumbs a,
+.ds-crumbs__more-btn {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  max-width: var(--ds-size-crumb);
+  min-height: var(--ds-size-target);
+  padding: 0 var(--ds-space-1);
+  border: 0;
+  border-radius: var(--ds-radius-control);
+  background: transparent;
+  color: var(--ds-ink-secondary);
+  font: inherit;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ds-crumbs a[href]:hover,
+  .ds-crumbs__more-btn:hover {
+    background: var(--ds-wash-hover);
+    color: var(--ds-ink-primary);
+    text-decoration: underline;
+  }
+}
+/* the levels above keep their width (they are what you click); the page you
+   are on is plain text and takes the room that is left */
+.ds-crumbs li:not(:last-child) {
+  flex-shrink: 0;
+}
+.ds-crumbs a[aria-current='page'] {
+  display: block;
+  max-width: none;
+  color: var(--ds-ink-primary);
+  cursor: default;
+}
+.ds-crumbs__more {
+  display: none !important;
+}
+/* short of room: keep the root, the parent and the page; fold the rest */
+@container (max-width: 480px) {
+  .ds-crumbs li:not(:first-child, .ds-crumbs__more, :nth-last-child(-n + 2)) {
+    display: none;
+  }
+  .ds-crumbs__more {
+    display: flex !important;
+  }
+}
+/* very short: only the parent, as an Up link ("‹ LIGHT") */
+@container (max-width: 240px) {
+  .ds-crumbs li:not(:nth-last-child(2)) {
+    display: none !important;
+  }
+  .ds-crumbs li:nth-last-child(2)::before {
+    content: '‹' / '';
+    padding-inline-start: 0;
+  }
+}
+
+/* ---------- navigation rail ----------
+   The app's top-level destinations down the side of a tablet or desk window:
+   3 to 7, each an icon over a short label. Expanded, it shows labels beside
+   the icons and section headings, and it is what a drawer would have been.
+   <nav class="ds-navrail" aria-label="Modules" data-expanded="false">
+     <a class="ds-navrail__item" href="/c/general" aria-current="page">
+       <span class="ds-navrail__icon" aria-hidden="true">…</span><span class="ds-navrail__label">Chat</span></a>
+   </nav> */
+.ds-navrail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ds-space-1);
+  width: var(--ds-size-rail);
+  height: 100%;
+  padding: var(--ds-space-2) var(--ds-space-1);
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-inline-end: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  background: var(--ds-surface-panel);
+  transition: width var(--ds-duration-base) var(--ds-ease-standard);
+}
+.ds-navrail[data-expanded='true'] {
+  width: var(--ds-size-rail-expanded);
+  padding-inline: var(--ds-space-2);
+}
+.ds-navrail__item {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: var(--ds-space-1);
+  padding: var(--ds-space-1) 0;
+  border-radius: var(--ds-radius-control);
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ds-navrail__icon {
+  display: grid;
+  place-content: center;
+  width: calc(var(--ds-size-rail) - var(--ds-space-6));
+  min-height: var(--ds-size-control-sm);
+  border-radius: var(--ds-radius-pill);
+  font-size: var(--ds-size-icon);
+  line-height: 1;
+  transition: background-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+.ds-navrail__label {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (hover: hover) {
+  .ds-navrail__item:not([aria-current='page']):hover .ds-navrail__icon {
+    background: var(--ds-wash-hover);
+  }
+  .ds-navrail__item:not([aria-current='page']):hover {
+    color: var(--ds-ink-primary);
+  }
+}
+.ds-navrail__item:active .ds-navrail__icon {
+  background: var(--ds-wash-pressed);
+}
+.ds-navrail__item[aria-current='page'] {
+  color: var(--ds-ink-primary);
+  font-weight: var(--ds-weight-semibold);
+}
+.ds-navrail__item[aria-current='page'] .ds-navrail__icon {
+  background: var(--ds-accent-soft);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-accent);
+}
+.ds-navrail__item > .ds-badge {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: calc(50% + var(--ds-space-2));
+}
+/* expanded: one row per destination, the indicator behind the whole row */
+.ds-navrail[data-expanded='true'] .ds-navrail__item {
+  grid-template-columns: var(--ds-size-icon) 1fr auto;
+  justify-items: start;
+  align-items: center;
+  gap: var(--ds-space-3);
+  min-height: var(--ds-size-row);
+  padding: 0 var(--ds-space-3);
+  border-radius: var(--ds-radius-pill);
+  font: var(--ds-text-control);
+  text-align: start;
+}
+.ds-navrail[data-expanded='true'] .ds-navrail__icon {
+  width: auto;
+  min-height: 0;
+  background: none;
+  box-shadow: none;
+}
+@media (hover: hover) {
+  .ds-navrail[data-expanded='true'] .ds-navrail__item:not([aria-current='page']):hover {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-navrail[data-expanded='true'] .ds-navrail__item[aria-current='page'] {
+  background: var(--ds-accent-soft);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-accent);
+}
+.ds-navrail[data-expanded='true'] .ds-navrail__item > .ds-badge {
+  position: static;
+}
+.ds-navrail__head {
+  display: none;
+  padding: var(--ds-space-3) var(--ds-space-3) var(--ds-space-1);
+  color: var(--ds-ink-tertiary);
+  font: var(--ds-text-label);
+  letter-spacing: var(--ds-text-label-tracking);
+  text-transform: var(--ds-text-label-case);
+}
+.ds-navrail[data-expanded='true'] .ds-navrail__head {
+  display: block;
+}
+/* the end of the rail: settings, the account; pushed to the bottom */
+.ds-navrail__end {
+  display: grid;
+  gap: var(--ds-space-1);
+  margin-block-start: auto;
+}
+
+/* ---------- navigation bar ----------
+   A phone's top-level destinations along the bottom, in reach of a thumb:
+   3 to 5, each an icon over a label. More than 5 is a rail in a sheet.
+   <nav class="ds-navbar" aria-label="Main">
+     <a class="ds-navbar__item" href="#jobs" aria-current="page"><span class="ds-navbar__icon" aria-hidden="true">…</span>Jobs</a>
+   </nav> */
+.ds-navbar {
+  display: grid;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
+  min-height: var(--ds-size-navbar);
+  padding-block-end: env(safe-area-inset-bottom, 0);
+  border-top: var(--ds-space-hairline) solid var(--ds-line-subtle);
+  background: var(--ds-surface-panel);
+}
+.ds-navbar--fixed {
+  position: fixed;
+  inset-inline: 0;
+  inset-block-end: 0;
+  z-index: var(--ds-layer-sticky);
+}
+.ds-navbar__item {
+  position: relative;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--ds-space-1);
+  min-width: 0;
+  min-height: var(--ds-size-navbar);
+  padding: var(--ds-space-1);
+  color: var(--ds-ink-secondary);
+  font: var(--ds-text-caption);
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ds-navbar__icon {
+  display: grid;
+  place-content: center;
+  width: calc(var(--ds-size-icon) * 3.5);
+  min-height: var(--ds-size-control-sm);
+  border-radius: var(--ds-radius-pill);
+  font-size: var(--ds-size-icon);
+  line-height: 1;
+  transition: background-color var(--ds-duration-fast) var(--ds-ease-standard);
+}
+@media (hover: hover) {
+  .ds-navbar__item:not([aria-current='page']):hover .ds-navbar__icon {
+    background: var(--ds-wash-hover);
+  }
+}
+.ds-navbar__item:active .ds-navbar__icon {
+  background: var(--ds-wash-pressed);
+}
+.ds-navbar__item[aria-current='page'] {
+  color: var(--ds-ink-primary);
+  font-weight: var(--ds-weight-semibold);
+}
+.ds-navbar__item[aria-current='page'] .ds-navbar__icon {
+  background: var(--ds-accent-soft);
+  box-shadow: inset 0 0 0 var(--ds-space-hairline) var(--ds-accent);
+}
+.ds-navbar__item > .ds-badge {
+  position: absolute;
+  inset-block-start: var(--ds-space-1);
+  inset-inline-start: calc(50% + var(--ds-space-2));
+}
+
+/* ---------- arriving and leaving ----------
+   Everything that floats fades in near where it came from and leaves a step
+   quicker (docs/motion.md). @starting-style and allow-discrete let a native
+   dialog, a popover and display:none animate with no script; a browser
+   without them shows and hides at once. Reduced motion is in the tokens:
+   the offsets, the scale and travel go to nothing and the fade stays. */
+
+/* anchored and small: a menu, a popover, a tooltip drop from their anchor */
+.ds-menu[popover],
+.ds-popover,
+.ds-tooltip[popover] {
+  transition:
+    opacity var(--ds-duration-base) var(--ds-ease-enter),
+    translate var(--ds-duration-base) var(--ds-ease-enter),
+    display var(--ds-duration-base) allow-discrete,
+    overlay var(--ds-duration-base) allow-discrete;
+}
+.ds-menu[popover]:not(:popover-open),
+.ds-popover:not(:popover-open),
+.ds-tooltip[popover]:not(:popover-open) {
+  /* the classes set a display, which would beat the browser's own hiding */
+  display: none;
+  opacity: 0;
+  translate: 0 calc(-1 * var(--ds-motion-offset-small));
+  transition-duration: var(--ds-duration-fast);
+  transition-timing-function: var(--ds-ease-exit);
+}
+@starting-style {
+  .ds-menu[popover]:popover-open,
+  .ds-popover:popover-open,
+  .ds-tooltip[popover]:popover-open {
+    opacity: 0;
+    translate: 0 calc(-1 * var(--ds-motion-offset-small));
+  }
+}
+.ds-menu[popover],
+.ds-tooltip[popover] {
+  margin: 0;
+}
+
+/* large: a dialog settles into place, its veil fades */
+.ds-dialog {
+  transition:
+    opacity var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    scale var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    translate var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    display var(--ds-duration-slow) allow-discrete,
+    overlay var(--ds-duration-slow) allow-discrete;
+}
+.ds-dialog:not([open]) {
+  opacity: 0;
+  scale: var(--ds-motion-scale-enter);
+  transition-duration: var(--ds-duration-base);
+  transition-timing-function: var(--ds-ease-emphasized-exit);
+}
+@starting-style {
+  .ds-dialog[open] {
+    opacity: 0;
+    scale: var(--ds-motion-scale-enter);
+    translate: 0 var(--ds-motion-offset-medium);
+  }
+}
+
+/* from an edge: a sheet slides its own size */
+.ds-sheet {
+  transition:
+    transform var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    opacity var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    display var(--ds-duration-slow) allow-discrete,
+    overlay var(--ds-duration-slow) allow-discrete;
+}
+.ds-sheet:not([open]) {
+  opacity: 0;
+  transform: var(--from);
+  transition-duration: var(--ds-duration-base);
+  transition-timing-function: var(--ds-ease-emphasized-exit);
+}
+@starting-style {
+  .ds-sheet[open] {
+    opacity: 0;
+    transform: var(--from);
+  }
+}
+
+/* the veil behind a dialog or a sheet */
+.ds-dialog::backdrop,
+.ds-sheet::backdrop {
+  transition:
+    opacity var(--ds-duration-slow) var(--ds-ease-standard),
+    display var(--ds-duration-slow) allow-discrete,
+    overlay var(--ds-duration-slow) allow-discrete;
+}
+.ds-dialog:not([open])::backdrop,
+.ds-sheet:not([open])::backdrop {
+  opacity: 0;
+}
+@starting-style {
+  .ds-dialog[open]::backdrop,
+  .ds-sheet[open]::backdrop {
+    opacity: 0;
+  }
+}
+
+/* a toast rises from its edge and sinks back */
+.ds-toast {
+  transition:
+    opacity var(--ds-duration-slow) var(--ds-ease-emphasized-enter),
+    translate var(--ds-duration-slow) var(--ds-ease-emphasized-enter);
+}
+@starting-style {
+  .ds-toast {
+    opacity: 0;
+    translate: 0 var(--ds-motion-offset-medium);
+  }
+}
+.ds-toast[data-leaving='true'] {
+  opacity: 0;
+  translate: 0 var(--ds-motion-offset-medium);
+  transition-duration: var(--ds-duration-base);
+  transition-timing-function: var(--ds-ease-exit);
+}
+/* ds:components:end */
 /* The page's own names, each given a role from the design system
    (legofsalmon/design-system, docs/adoption.md). Declared on every element
    that can set a theme, so a [data-theme] island takes its own values. */

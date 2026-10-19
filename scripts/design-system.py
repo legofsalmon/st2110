@@ -6,8 +6,9 @@ scripts/sync.mjs vendored them, and say how to bring them up to date.
     python3 scripts/design-system.py --sync    # refill them from ../design-system
 
 The design system (legofsalmon/design-system, private) gives the router page
-its colours, inlined between /* ds:tokens:start */ and /* ds:tokens:end */,
-and the viewer its tokens.rs. Each copy carries a hash of what it holds, so
+its tokens, page defaults and components, inlined between
+/* ds:tokens:start */ and /* ds:tokens:end */ and the ds:base and
+ds:components blocks after it, and the viewer its tokens.rs. Each copy carries a hash of what it holds, so
 a hand edit is caught here with nothing but the copy: that edit is a fix the
 design-system repository should get, and the next sync would drop it.
 Whether a copy is behind the design system needs a checkout of it beside
