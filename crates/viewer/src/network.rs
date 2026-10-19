@@ -10,13 +10,17 @@ use st2110_discover::{Discovery, Found, List, Options, Origin};
 
 use crate::look;
 use crate::receiving::Stream;
-use crate::tokens::{radius, space};
+use crate::tokens::{radius, space, timing};
 
 /// What to run to send a stream to find, with no other kit.
 const TRY: &str = "st2110 send video 720p50 --to 239.10.1.1:5004 --clock traceable --sap";
 
 /// Inside a stream's row: the 4px grid, wider than it is tall.
 const ROW_MARGIN: egui::Margin = egui::Margin::symmetric(space::STEP_2 as i8, space::STEP_1 as i8);
+
+/// How long reading takes before the list shows it is busy: a spinner that
+/// flashes for less is noise (the design system's timing.wait).
+const WAIT: Duration = Duration::from_millis(timing::WAIT as u64);
 
 /// How long the list says it is looking before it says it has found nothing.
 const LOOKING: Duration = Duration::from_secs(3);
@@ -40,6 +44,8 @@ pub(crate) struct Network {
     /// What each SDP file found would play as, by its text: kept, as the list is read
     /// again every second.
     playable: HashMap<String, Result<String, String>>,
+    /// Since when the NMOS Senders have been being read, while they are.
+    busy_since: Option<Instant>,
 }
 
 impl Network {
@@ -53,6 +59,7 @@ impl Network {
             listed: Vec::new(),
             read: None,
             playable: HashMap::new(),
+            busy_since: None,
         }
     }
 
@@ -102,8 +109,16 @@ impl Network {
                 if refresh.clicked() {
                     self.refresh();
                 }
+                // Busy shows once the reading has taken timing.wait, not at once.
                 if self.list.busy {
-                    ui.spinner().on_hover_text("Reading the NMOS Senders");
+                    let since = *self.busy_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= WAIT {
+                        ui.spinner().on_hover_text("Reading the NMOS Senders");
+                    } else {
+                        ui.ctx().request_repaint_after(WAIT.saturating_sub(since.elapsed()));
+                    }
+                } else {
+                    self.busy_since = None;
                 }
             });
         });
@@ -203,6 +218,11 @@ fn row(ui: &mut egui::Ui, i: usize, listed: &Listed, marked: bool) -> egui::Resp
         Color32::TRANSPARENT
     };
     ui.painter().set(background, egui::Shape::rect_filled(rect, radius::regular::CONTROL, fill));
+    // The selection is the accent's wash with a bar at its start, as a list's row is.
+    if marked {
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(space::HALF, rect.height()));
+        ui.painter().rect_filled(bar, 0.0, ui.visuals().selection.stroke.color);
+    }
     let mut hover = vec![by(found)];
     hover.extend(found.problem.iter().map(|p| format!("No SDP file: {p}")));
     if listed.playable.is_ok() && !marked {
