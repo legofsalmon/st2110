@@ -2870,29 +2870,21 @@ select.ds-field {
    Mono first, falling back to the system's faces: the page is one file the
    command serves, so it carries no font files. The body, the ground and the
    focus ring come from the base stylesheet above. */
+/* The controls are the design system's (ds-btn, ds-seg, ds-switch, ds-notice,
+   ds-chip, ds-dot, ds-disclosure). A [hidden] part stays hidden whatever
+   display its class gives it. */
+[hidden] { display: none !important; }
 .label { font: var(--ds-text-label); letter-spacing: var(--ds-text-label-tracking); text-transform: var(--ds-text-label-case); }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2) var(--ds-space-4); padding: var(--ds-space-3) var(--ds-space-4); border-bottom: var(--ds-space-hairline) solid var(--line); background: var(--panel); }
 h1 { margin: 0; font: var(--ds-text-title); }
 .registry { color: var(--dim); font: var(--ds-text-caption); overflow-wrap: anywhere; }
-.badge { font: var(--ds-text-label); letter-spacing: var(--ds-text-label-tracking); padding: var(--ds-space-half) var(--ds-space-2); border-radius: var(--ds-radius-control); background: var(--armed); color: var(--armed-ink); }
 .status { margin-left: auto; display: flex; align-items: center; gap: var(--ds-space-2); color: var(--dim); font: var(--ds-text-caption); }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
-.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2) var(--ds-space-3); padding: var(--ds-space-3) var(--ds-space-4); }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--ds-radius-control); overflow: hidden; }
-.seg button { border: 0; border-radius: 0; background: transparent; }
-.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
-button { font: var(--ds-text-control); color: var(--text); background: var(--fit); border: 1px solid var(--line); border-radius: var(--ds-radius-control); padding: 5px 10px; cursor: pointer; }
-button:hover { background: var(--fit-hover); }
-button:active { background: var(--pressed); }
-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-button.primary { background: var(--accent); color: var(--accent-on); border-color: transparent; }
-button.primary:hover, button.primary:active { background: var(--accent-hover); }
-button:disabled { color: var(--off); background: transparent; border-color: var(--line); cursor: not-allowed; }
-label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
 .spacer { flex: 1; }
-.banner { margin: 0 var(--ds-space-4) var(--ds-space-3); padding: var(--ds-space-2) var(--ds-space-3); border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--bad); color: var(--text); background: var(--bad-soft); }
-.info { margin: 0 var(--ds-space-4) var(--ds-space-3); padding: var(--ds-space-2) var(--ds-space-3); border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--line); background: var(--panel); }
+/* What a click does in the mode chosen: the mode in words, beside the
+   segment that shows it. */
+.hint { color: var(--dim); font: var(--ds-text-caption); }
+.notice { margin: 0 var(--ds-space-4) var(--ds-space-3); }
 .grid-wrap { margin: 0 var(--ds-space-4); overflow: auto; max-height: calc(100vh - 230px); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); background: var(--panel); }
 table { border-collapse: separate; border-spacing: 0; }
 th, td { padding: 0; }
@@ -2906,21 +2898,26 @@ th.src .stack { display: flex; justify-content: center; gap: var(--ds-space-hair
 th.dst { position: sticky; left: 0; z-index: 1; background: var(--panel); text-align: left; padding: var(--ds-space-1) var(--ds-space-3); border-right: var(--ds-space-hairline) solid var(--line); font-weight: var(--ds-weight-semibold); white-space: nowrap; }
 th.group { position: sticky; left: 0; text-align: left; padding: var(--ds-space-3) var(--ds-space-3) var(--ds-space-1); color: var(--dim); background: var(--panel); }
 td.cell { padding: var(--ds-space-half); }
-/* A crosspoint is a control, so it is the regular density's control height. */
-.cell button { width: var(--ds-size-control); height: var(--ds-size-control); padding: 0; border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--line); background: var(--fit); display: block; font: var(--ds-text-caption); }
-.cell button:hover { background: var(--fit-hover); }
-.cell button.live { background: var(--live); color: var(--live-ink); }
+/* A crosspoint is a control: the regular density's control height, and the
+   design system's states, set by attributes. Hover and pressed are a raised
+   control's. data-armed="true" (with aria-pressed, which a screen reader
+   hears) is held for the salvo: amber with a diamond, as the next Take is
+   what goes out. aria-busy="true" is being taken: amber at once, no second
+   press, and a pulse once the take has run timing.wait. Taking now is green
+   with a dot. Each colour has a shape with it, so none is told by colour
+   alone. */
+.cell button { width: var(--ds-size-control); height: var(--ds-size-control); padding: 0; border-radius: var(--ds-radius-control); border: var(--ds-space-hairline) solid var(--line); background: var(--fit); color: var(--text); display: block; font: var(--ds-text-caption); cursor: pointer; }
+@media (hover: hover) { .cell button:hover { background: var(--fit-hover); border-color: var(--line-strong); } }
+.cell button:active { background: var(--pressed); }
+.cell button.live { background: var(--live); border-color: var(--live); color: var(--live-ink); }
 .cell button.live::after { content: "●"; }
-.cell button.armed { background: var(--armed); color: var(--armed-ink); }
-.cell button.armed::after { content: "◆"; }
+.cell button[data-armed="true"], .cell button[aria-busy="true"] { background: var(--armed); border-color: var(--armed); color: var(--armed-ink); }
+.cell button[data-armed="true"]:not(.off)::after, .cell button[aria-busy="true"]:not(.off)::after { content: "◆"; }
+.cell button[aria-busy="true"] { cursor: progress; pointer-events: none; animation: ds-pulse var(--ds-motion-cycle-pulse) var(--ds-ease-standard) var(--ds-timing-wait) infinite; }
 .cell button.unfit { background: repeating-linear-gradient(45deg, transparent 0 4px, var(--line) 4px 6px); cursor: help; }
 .cell button.na { background: transparent; border-color: transparent; cursor: default; visibility: hidden; }
-.cell button.busy { animation: pulse 0.8s ease-in-out infinite alternate; }
 .cell button.off { width: calc(var(--ds-size-control) + var(--ds-space-2)); color: var(--dim); }
-.cell button.off.armed { color: var(--armed-ink); }
-.cell button.off.armed::after { content: none; }
-@keyframes pulse { from { background: var(--armed); } to { background: var(--fit); } }
-@media (prefers-reduced-motion: reduce) { .cell button.busy { animation: none; background: var(--armed); } }
+.cell button:disabled { background: transparent; border-color: var(--line); color: var(--off); cursor: not-allowed; }
 tr.hover th.dst, th.src.hover { color: var(--accent-ink); }
 tr.hover td.cell, td.cell.hover { background: var(--cross); }
 .legend { display: flex; flex-wrap: wrap; gap: var(--ds-space-2) var(--ds-space-4); margin: var(--ds-space-3) var(--ds-space-4); color: var(--dim); font: var(--ds-text-caption); }
@@ -2939,9 +2936,11 @@ section.sources { margin: 0 var(--ds-space-4) var(--ds-space-3); }
 .sources-head h2, section.details h2 { color: var(--dim); margin: 0; }
 .sources-head small { color: var(--dim); font: var(--ds-text-caption); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--ds-space-2); }
-.card { display: block; width: 100%; text-align: left; padding: 0; overflow: hidden; background: var(--panel); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); font: var(--ds-text-body); }
-.card:hover { background: var(--panel); border-color: var(--line-strong); }
-.card.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* A source's card opens its details below the cards (aria-expanded), and is
+   drawn selected while they are open. */
+.card { display: block; width: 100%; text-align: left; padding: 0; overflow: hidden; background: var(--panel); color: var(--text); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); font: var(--ds-text-body); cursor: pointer; }
+@media (hover: hover) { .card:hover { border-color: var(--line-strong); } }
+.card[aria-expanded="true"] { border-color: var(--accent); box-shadow: 0 0 0 var(--ds-space-hairline) var(--accent); }
 .screen { position: relative; aspect-ratio: 16 / 9; background: var(--canvas); display: flex; align-items: center; justify-content: center; color: var(--dim); font: var(--ds-text-caption); text-align: center; padding: 0; }
 .screen img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .screen .note { padding: var(--ds-space-2); }
@@ -2949,13 +2948,11 @@ section.sources { margin: 0 var(--ds-space-4) var(--ds-space-3); }
 .meter { flex: 1; position: relative; background: linear-gradient(to top, var(--ok) 0 70%, var(--warn) 70% 85%, var(--bad) 85%); border-radius: 3px; overflow: hidden; }
 .meter i { position: absolute; left: 0; right: 0; top: 0; height: 100%; background: var(--fit); }
 .meter span { position: absolute; left: 0; right: 0; bottom: 2px; text-align: center; font-size: 10px; color: var(--on-canvas); text-shadow: 0 0 2px var(--canvas); font-variant-numeric: tabular-nums; }
-.tally { margin-left: auto; font: var(--ds-text-label); letter-spacing: var(--ds-text-label-tracking); font-weight: var(--ds-weight-bold); padding: 0 var(--ds-space-1); border-radius: calc(var(--ds-radius-control) / 2); background: var(--tally); color: var(--tally-on); }
+.tally { margin-left: auto; flex: none; font: var(--ds-text-label); letter-spacing: var(--ds-text-label-tracking); font-weight: var(--ds-weight-bold); padding: 0 var(--ds-space-1); border-radius: calc(var(--ds-radius-control) / 2); background: var(--tally); color: var(--tally-on); }
 .card.routed .screen { box-shadow: inset 0 0 0 2px var(--tally); }
 .card .meta { padding: var(--ds-space-2); }
 .card .title { display: flex; align-items: center; gap: var(--ds-space-2); font-weight: var(--ds-weight-semibold); }
-.card .title .dot { flex: none; }
 .card .line { color: var(--dim); font: var(--ds-text-caption); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dot.warn { background: var(--warn); }
 th.dst img.thumb { display: block; width: 64px; height: 36px; object-fit: contain; background: var(--canvas); border-radius: var(--ds-radius-control); margin: var(--ds-space-half) 0; }
 section.details { margin: 0 var(--ds-space-4) var(--ds-space-3); padding: var(--ds-space-3); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); background: var(--panel); }
 .details-head { display: flex; align-items: center; gap: var(--ds-space-3); }
@@ -2970,38 +2967,39 @@ section.details h3 { color: var(--dim); margin: var(--ds-space-3) 0 var(--ds-spa
 .chips span { font: var(--ds-text-caption); font-family: var(--ds-font-mono); padding: 0 var(--ds-space-1); border-radius: var(--ds-radius-control); background: var(--fit); }
 section.details ul { margin: var(--ds-space-half) 0 var(--ds-space-half) var(--ds-space-4); padding: 0; font: var(--ds-text-caption); }
 li.problem { color: var(--bad-ink); } li.warning { color: var(--warn-ink); }
+section.details .ds-disclosure { margin-top: var(--ds-space-2); }
 pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-control); padding: var(--ds-space-2); overflow: auto; max-height: 260px; }
-details summary { cursor: pointer; color: var(--dim); font: var(--ds-text-caption); margin-top: var(--ds-space-2); }
 @media (max-width: 600px) { .status { margin-left: 0; width: 100%; } .grid-wrap { max-height: none; } thead th.corner { min-width: 120px; } th.dst { white-space: normal; } }
 </style>
 </head>
 <body>
 <header>
   <h1>ST 2110 Router</h1>
-  <span id="demo" class="badge" hidden>DEMO</span>
+  <span id="demo" class="ds-chip ds-chip--warn" title="A demo facility on this machine: nothing here reaches real equipment" hidden>Demo</span>
   <span id="registry" class="registry"></span>
-  <span class="status"><span id="dot" class="dot"></span><span id="read">Reading the registry…</span></span>
+  <span class="status"><span id="dot" class="ds-dot ds-dot--off"></span><span id="read">Reading the registry…</span></span>
 </header>
 <div class="toolbar">
-  <div class="seg" role="group" aria-label="Level" id="levels"></div>
-  <div class="seg" role="group" aria-label="Mode">
-    <button id="mode-take" aria-pressed="true" title="Each click connects at once">Take on click</button>
+  <div class="ds-seg" role="group" aria-label="Level" id="levels"></div>
+  <div class="ds-seg" role="group" aria-label="Mode">
+    <button id="mode-take" aria-pressed="true" title="Each click on a crosspoint connects it at once">Take on click</button>
     <button id="mode-salvo" aria-pressed="false" title="Arm several crosspoints, then take them together at one PTP time">Salvo</button>
   </div>
-  <button id="fire" class="primary" hidden>Take</button>
-  <button id="clear" hidden>Clear</button>
-  <label class="check"><input type="checkbox" id="dry"> Check only</label>
-  <label class="check" title="Receive each source's stream on this machine to show its picture or sound"><input type="checkbox" id="live"> Live previews</label>
+  <button id="fire" class="ds-btn ds-btn--primary" hidden>Take</button>
+  <button id="clear" class="ds-btn" title="Release every armed crosspoint (Esc)" hidden>Clear</button>
+  <span id="mode-hint" class="hint"></span>
+  <label class="ds-switch" title="Check each connection against the Receiver, and connect nothing"><input type="checkbox" role="switch" id="dry"> Check only</label>
+  <label class="ds-switch" title="Receive each source's stream on this machine to show its picture or sound"><input type="checkbox" role="switch" id="live"> Live previews</label>
   <span class="spacer"></span>
-  <button id="refresh" title="Read the registry again">Refresh</button>
+  <button id="refresh" class="ds-btn" title="Read the registry again">Refresh</button>
 </div>
-<div id="banner" class="banner" hidden></div>
-<div id="info" class="info" hidden></div>
+<div id="banner" class="ds-notice ds-notice--bad notice" role="alert" hidden></div>
+<div id="info" class="ds-notice notice" role="status" hidden></div>
 <section class="sources" aria-label="Sources">
   <div class="sources-head"><h2 class="label">Sources</h2><small id="sources-note"></small></div>
   <div id="cards" class="cards"></div>
 </section>
-<section id="details" class="details" hidden aria-live="polite"></section>
+<section id="details" class="details" aria-label="The open source's details" hidden aria-live="polite"></section>
 <div class="grid-wrap"><div id="grid" class="empty">Reading the registry…</div></div>
 <div class="legend">
   <span><i class="live"></i>taking now</span>
@@ -3037,7 +3035,12 @@ let reading = false;
 let taking = false;
 
 async function call(url, options) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (_) {
+    throw Object.assign(new Error(`Cannot reach the router at ${location.host}: is st2110 router still running?`), { unreachable: true });
+  }
   let body = null;
   try { body = await response.json(); } catch (_) { /* not JSON */ }
   if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
@@ -3050,14 +3053,17 @@ async function read() {
   try {
     state = await call("/api/state");
     if (live === null) setLive(remembered() ?? (state.demo && state.previews > 0));
-    $("dot").className = "dot ok";
+    $("dot").className = "ds-dot ds-dot--ok";
     $("read").textContent = `Read at ${new Date(state.read_at).toLocaleTimeString()}`;
     $("banner").hidden = true;
     render();
   } catch (e) {
-    $("dot").className = "dot bad";
-    $("read").textContent = "Registry unreachable";
-    $("banner").textContent = e.message;
+    $("dot").className = "ds-dot ds-dot--bad";
+    $("read").textContent = e.unreachable ? "Router unreachable" : "Registry unreachable";
+    // Where, what, and what next; the grid keeps what was last read.
+    $("banner").replaceChildren(el("div", { class: "ds-notice__body" },
+      el("div", { class: "ds-notice__title", text: e.unreachable ? "The router is not answering" : "The registry cannot be read" }),
+      el("div", { text: `${e.message}. Trying again every 3 seconds, or Refresh now; the grid shows what was last read.` })));
     $("banner").hidden = false;
   } finally {
     reading = false;
@@ -3126,28 +3132,36 @@ function render() {
       ? el("img", { class: "thumb", alt: "", "data-thumb": r.sender_id }) : null;
     const tr = el("tr", {}, el("th", { class: "dst", title: r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
     columns.forEach((s, c) => {
-      let kind = "fit", label = `Connect ${name(r)} to ${name(s)}`;
+      // The hover says what a click does in this mode, and the state it is in.
+      const isArmed = armed.has(r.id) && armed.get(r.id) === s.id;
+      let kind = "fit", label = salvo
+        ? (isArmed ? `${name(r)} from ${name(s)}, armed for the salvo: click to release` : `Arm ${name(r)} from ${name(s)} for the salvo`)
+        : `${$("dry").checked ? "Check" : "Connect"} ${name(r)} to ${name(s)}: click to ${$("dry").checked ? "check" : "take"} now`;
       if (r.current === s.i) { kind = "live"; label = `${name(r)} is taking ${name(s)}`; }
       else if (s.format && r.format && s.format !== r.format) { kind = "na"; label = ""; }
       else if (!fits.has(s.i)) { kind = "unfit"; label = `${name(r)} cannot take ${name(s)}: click for why`; }
-      const classes = [kind];
-      if (armed.has(r.id) && armed.get(r.id) === s.id) classes.push("armed");
-      if (busy.has(r.id) && (armed.get(r.id) === s.id || pendingTake.get(r.id) === s.id)) classes.push("busy");
       const button = el("button", {
-        class: classes.join(" "), "aria-label": label, title: label,
+        class: kind, "aria-label": label, title: label,
         onclick: () => click(r, s, kind),
       });
+      if (salvo && kind === "fit") button.setAttribute("aria-pressed", String(isArmed));
+      if (isArmed) button.dataset.armed = "true";
+      if (busy.has(r.id) && (armed.get(r.id) === s.id || pendingTake.get(r.id) === s.id)) button.setAttribute("aria-busy", "true");
       if (kind === "na") button.tabIndex = -1;
       tr.append(el("td", { class: "cell", "data-col": c }, button));
     });
     const takes = r.active && r.sender_id;
     const offArmed = armed.has(r.id) && armed.get(r.id) === null;
+    const offTitle = !takes && !offArmed ? `${name(r)} is not taking a stream`
+      : salvo ? (offArmed ? `Disconnecting ${name(r)} is armed for the salvo: click to release` : `Arm disconnecting ${name(r)} for the salvo`)
+      : `${$("dry").checked ? "Check disconnecting" : "Disconnect"} ${name(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
     const off = el("button", {
-      class: "off" + (offArmed ? " armed" : "") + (busy.has(r.id) && pendingTake.get(r.id) === null ? " busy" : ""),
-      text: "off", title: takes ? `Disconnect ${name(r)}` : `${name(r)} is not taking a stream`,
-      "aria-label": `Disconnect ${name(r)}`,
+      class: "off", text: "off", title: offTitle, "aria-label": `Disconnect ${name(r)}`,
       onclick: () => click(r, null, takes ? "fit" : "idle"),
     });
+    if (salvo && (takes || offArmed)) off.setAttribute("aria-pressed", String(offArmed));
+    if (offArmed) off.dataset.armed = "true";
+    if (busy.has(r.id) && pendingTake.get(r.id) === null) off.setAttribute("aria-busy", "true");
     if (!takes && !offArmed) off.disabled = true;
     tr.append(el("td", { class: "cell" }, off));
     if (r.active && r.sender_id && r.current == null) {
@@ -3216,7 +3230,9 @@ async function take(routes) {
     log(outcome);
     if (outcome.succeeded && !$("dry").checked) for (const route of routes) armed.delete(route.receiver);
   } catch (e) {
-    logError(e.message);
+    // Nothing is switched when the router answers with a refusal; when it cannot
+    // be reached, the grid says what is switched once it answers again.
+    logError(e.unreachable ? `${e.message} What is switched shows in the grid once it answers.` : `Nothing was switched: ${e.message}`);
   } finally {
     for (const route of routes) { busy.delete(route.receiver); pendingTake.delete(route.receiver); }
     taking = false;
@@ -3225,16 +3241,26 @@ async function take(routes) {
   }
 }
 
+// A mode shows itself twice: the segment that is pressed, and these words
+// saying what a click does in it. Check only changes what Take says too.
 function renderSalvo() {
+  const dry = $("dry").checked;
   $("mode-take").setAttribute("aria-pressed", String(!salvo));
   $("mode-salvo").setAttribute("aria-pressed", String(salvo));
   $("fire").hidden = !salvo;
   $("clear").hidden = !salvo;
-  $("fire").disabled = !armed.size || taking;
+  // Taking is busy, not disabled: no second press, and a spinner once it has run timing.wait.
+  $("fire").disabled = !armed.size && !taking;
+  if (taking) $("fire").setAttribute("aria-busy", "true"); else $("fire").removeAttribute("aria-busy");
   $("clear").disabled = !armed.size;
   const lead = state ? state.lead : 2;
-  $("fire").textContent = armed.size > 1 ? `Take ${armed.size} together` : `Take ${armed.size || ""}`.trim();
-  $("fire").title = armed.size > 1 ? `They switch together at one PTP time, ${lead} s after they are sent` : "";
+  const verb = dry ? "Check" : "Take";
+  $("fire").textContent = armed.size > 1 ? `${verb} ${armed.size} together` : `${verb} ${armed.size || ""}`.trim();
+  $("fire").title = dry ? "Check each armed crosspoint against its Receiver, and connect nothing"
+    : armed.size > 1 ? `They switch together at one PTP time, ${lead} s after they are sent` : "";
+  $("mode-hint").textContent = salvo
+    ? (dry ? "Arm, then Check: nothing connects" : "Click crosspoints to arm, then Take")
+    : (dry ? "Each click checks: nothing connects" : "Each click connects at once");
 }
 
 function stamp() {
@@ -3298,10 +3324,10 @@ function renderSources(columns) {
   box.replaceChildren(...columns.map((s) => {
     let node = cards.get(s.id);
     if (!node) {
-      node = el("button", { class: "card", "data-sender": s.id, onclick: () => openDetails(s.id) },
+      node = el("button", { class: "card", "data-sender": s.id, "aria-expanded": "false", "aria-controls": "details", onclick: () => openDetails(s.id) },
         el("div", { class: "screen", "data-theme": "dark" }),
         el("div", { class: "meta" },
-          el("div", { class: "title" }, el("span", { class: "dot" }), el("span", { class: "name" })),
+          el("div", { class: "title" }, el("span", { class: "ds-dot ds-dot--off" }), el("span", { class: "name" })),
           el("div", { class: "line where" }), el("div", { class: "line format" }), el("div", { class: "line stats" })));
       cards.set(s.id, node);
     }
@@ -3364,15 +3390,16 @@ function showLive() {
     const s = node.sender;
     const st = liveStatus[s.id];
     const to = routedTo(s);
-    node.classList.toggle("open", opened === s.id);
+    node.setAttribute("aria-expanded", String(opened === s.id));
     node.querySelector(".name").textContent = name(s);
-    node.title = `${name(s)}: click for details`;
+    node.title = opened === s.id ? `${name(s)}: click to close its details` : `${name(s)}: click for details`;
     node.querySelector(".where").textContent = to.length ? `to ${to.join(", ")}` : `${s.device || ""}${s.device ? " · " : ""}not routed`;
     node.querySelector(".format").textContent = (st && st.report && st.report.stream) || s.summary || s.format || "";
     node.querySelector(".stats").textContent = live && st ? statsLine(st.report) : "";
-    const dot = node.querySelector(".dot");
+    // Hollow while nothing is being received, so off is told by its shape too.
+    const dot = node.querySelector(".ds-dot");
     const problems = st && st.report ? st.report.problems.length : 0;
-    dot.className = "dot" + (!live || !st ? "" : st.error ? " bad" : problems ? " warn" : st.report ? " ok" : "");
+    dot.className = "ds-dot " + (!live || !st ? "ds-dot--off" : st.error ? "ds-dot--bad" : problems ? "ds-dot--warn" : st.report ? "ds-dot--ok" : "ds-dot--off");
     screenFor(node.querySelector(".screen"), s, st);
     node.classList.toggle("routed", to.length > 0);
     const title = node.querySelector(".title");
@@ -3449,7 +3476,7 @@ function rational(r) { return r && r.numerator ? (r.denominator && r.denominator
 function renderDetails() {
   const d = details, f = d.flow || {}, src = d.source || {}, snd = d.sender || {};
   const box = $("details");
-  const close = el("button", { text: "Close", onclick: () => openDetails(d.id) });
+  const close = el("button", { class: "ds-btn", text: "Close", onclick: () => openDetails(d.id) });
   const flowFacts = [
     ["Device", d.device], ["Node", d.node], ["Format", f.media_type || f.format],
     ["Picture", f.frame_width ? `${f.frame_width} × ${f.frame_height}${f.interlace_mode && f.interlace_mode !== "progressive" ? " " + f.interlace_mode : ""}` : null],
@@ -3482,7 +3509,7 @@ function renderDetails() {
     el("h3", { class: "label", text: "SDP file" }),
     d.sdp_error ? el("div", { class: "line", text: `Cannot be read: ${d.sdp_error}` }) : legs,
     el("h3", { class: "label", text: "Checks on the SDP file" }), findings,
-    ...(d.sdp ? [el("details", {}, el("summary", { text: "The SDP file" }), el("pre", { class: "sdp", text: d.sdp }))] : []),
+    ...(d.sdp ? [el("details", { class: "ds-disclosure" }, el("summary", { text: "The SDP file" }), el("div", { class: "ds-disclosure__body" }, el("pre", { class: "sdp", text: d.sdp })))] : []),
   );
   showDetailsLive();
 }
@@ -3517,13 +3544,14 @@ $("live").onchange = () => {
 setInterval(watch, 3000);
 setInterval(poll, 500);
 
-$("mode-take").onclick = () => { salvo = false; armed.clear(); render(); };
-$("mode-salvo").onclick = () => { salvo = true; render(); };
-$("clear").onclick = () => { armed.clear(); render(); };
+$("dry").onchange = () => { renderSalvo(); render(); };
+$("mode-take").onclick = () => { salvo = false; armed.clear(); render(); renderSalvo(); };
+$("mode-salvo").onclick = () => { salvo = true; render(); renderSalvo(); };
+$("clear").onclick = () => { armed.clear(); render(); renderSalvo(); };
 $("fire").onclick = () => take([...armed].map(([receiver, sender]) => ({ receiver, sender })));
 $("refresh").onclick = () => read();
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && salvo) { armed.clear(); render(); }
+  if (e.key === "Escape" && salvo) { armed.clear(); render(); renderSalvo(); }
 });
 renderSalvo();
 read();
