@@ -534,6 +534,122 @@ fn asks_for_is_10_tokens_with_demo_auth() {
     );
 }
 
+/// A header of a response's head.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().filter_map(|l| l.split_once(':')).find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim())
+}
+
+/// A person signs in on the page, by the Authorization Code grant with PKCE, as a
+/// browser would follow the redirects, and the router then reads and switches with
+/// their token until they sign out.
+#[test]
+fn signs_a_person_in_with_the_authorization_code_grant() {
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth", "--sign-in"]);
+    let base = format!("http://{}", router.address);
+    // Nothing until someone signs in, and the page is told to ask.
+    let (status, body) = router.request("GET", "/api/state", &[], "");
+    assert_eq!(status, 403, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["sign_in"]["signed_in"], false, "{body}");
+
+    // The page's Sign in sends the browser to the Authorization Server, with a cookie
+    // for the state…
+    let begin = || {
+        let (status, head, _) = router.bytes("GET", "/auth/sign-in", &[], "");
+        assert_eq!(status, 302, "{head}");
+        let location = header(&head, "Location").expect("a Location").to_string();
+        let cookie = header(&head, "Set-Cookie").expect("a cookie").split(';').next().unwrap().to_string();
+        assert!(location.starts_with(&format!("{base}/x-nmos/auth/v1.0/authorize?response_type=code&")), "{location}");
+        assert!(location.contains("&code_challenge_method=S256"), "{location}");
+        let redirect = format!("redirect_uri={}", st2110_nmos::auth::form_encode(&format!("{base}/auth/callback")));
+        assert!(location.contains(&redirect), "{location}");
+        // …which approves at once and sends it back with a code.
+        let (status, head, _) = router.bytes("GET", location.strip_prefix(&base).unwrap(), &[], "");
+        assert_eq!(status, 302, "{head}");
+        let back = header(&head, "Location").expect("a Location").to_string();
+        assert!(back.starts_with(&format!("{base}/auth/callback?code=")), "{back}");
+        (back.strip_prefix(&base).unwrap().to_string(), cookie)
+    };
+    let (callback, cookie) = begin();
+    let state = callback.split("state=").nth(1).unwrap().to_string();
+    assert_eq!(cookie, format!("st2110-sign-in={state}"));
+
+    // A state not begun here is refused, and so is one from another browser.
+    let wrong = callback.replace(&format!("state={state}"), "state=wrong");
+    let (status, _) = router.request("GET", &wrong, &[("Cookie", "st2110-sign-in=wrong")], "");
+    assert_eq!(status, 400);
+    let (status, text) = router.request("GET", &callback, &[], "");
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("not begun in this browser"), "{text}");
+
+    // The callback swaps the code, and goes back to the page.
+    let (status, head, _) = router.bytes("GET", &callback, &[("Cookie", &cookie)], "");
+    assert_eq!(status, 302, "{head}");
+    assert_eq!(header(&head, "Location"), Some("/"));
+    let state_now = router.get("/api/state");
+    assert_eq!(state_now["sign_in"]["signed_in"], true, "{state_now}");
+    assert_eq!(state_now["sign_in"]["scope"], "query connection");
+    assert!(state_now["auth"].as_str().unwrap().contains("whoever signs in"), "{state_now}");
+    let one = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
+    assert_eq!(one["succeeded"], true, "{one:#}");
+    // A code is swapped once.
+    let (status, _) = router.request("GET", &callback, &[("Cookie", &cookie)], "");
+    assert_eq!(status, 400);
+
+    // The demo's server takes a code only with the verifier its challenge was made from.
+    let (callback, _) = begin();
+    let code = callback.split("code=").nth(1).unwrap().split('&').next().unwrap();
+    let redirect = st2110_nmos::auth::form_encode(&format!("{base}/auth/callback"));
+    let (status, body) = router.request(
+        "POST",
+        "/x-nmos/auth/v1.0/token",
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        &format!(
+            "grant_type=authorization_code&code={code}&redirect_uri={redirect}&client_id=st2110-sign-in\
+             &code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        ),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+    // With the right one it gives a refresh token, which renews once (RFC 7636 Appendix B).
+    let (status, head, _) = router.bytes(
+        "GET",
+        &format!(
+            "/x-nmos/auth/v1.0/authorize?response_type=code&client_id=st2110-sign-in&redirect_uri={redirect}\
+             &state=s&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
+        ),
+        &[],
+        "",
+    );
+    assert_eq!(status, 302, "{head}");
+    let code = header(&head, "Location").unwrap().split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let token = |form: String| {
+        let headers = [("Content-Type", "application/x-www-form-urlencoded")];
+        let (status, body) = router.request("POST", "/x-nmos/auth/v1.0/token", &headers, &form);
+        (status, serde_json::from_str::<Value>(&body).unwrap())
+    };
+    let (status, issued) = token(format!(
+        "grant_type=authorization_code&code={code}&redirect_uri={redirect}&client_id=st2110-sign-in\
+         &code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    ));
+    assert_eq!(status, 200, "{issued}");
+    let refresh = issued["refresh_token"].as_str().unwrap();
+    let renew = format!("grant_type=refresh_token&refresh_token={refresh}&client_id=st2110-sign-in");
+    let (status, renewed) = token(renew.clone());
+    assert_eq!(status, 200, "{renewed}");
+    assert_ne!(renewed["access_token"], issued["access_token"]);
+    assert_eq!(token(renew).0, 400, "a refresh token is taken once");
+
+    // Signing out forgets the token: the page is refused again.
+    let (status, body) = router.post("/auth/sign-out", &json!({}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sign_in"]["signed_in"], false);
+    let (status, _) = router.request("GET", "/api/state", &[], "");
+    assert_eq!(status, 403);
+    let (status, _) = router.request("POST", "/auth/sign-out", &[("Origin", "http://evil.example")], "{}");
+    assert_eq!(status, 403);
+}
+
 /// `st2110 connect` with no registry named finds the demo's by unicast DNS-SD, and
 /// with --register finds its Authorization Server the same way, registers by RFC 7591
 /// with the initial access token, and keeps the registration for the next run.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use st2110_nmos::auth::{self, ClientCredentials, Registration, SCOPES, SigningKey, Token};
+use st2110_nmos::auth::{self, ClientCredentials, Registration, SCOPES, SignIn, SigningKey, Token};
 
 use crate::find::{self, LookArgs};
 
@@ -90,19 +90,7 @@ impl Auth {
         if self.auth.is_none() && self.client_id.is_none() && !self.register {
             return Ok(None);
         }
-        let server = match &self.auth {
-            Some(server) => {
-                auth::metadata_url(server).map_err(|e| format!("--auth: {e}"))?;
-                server.clone()
-            }
-            None => {
-                let servers = find::auth_servers(&self.look, timeout)?;
-                let api = &servers[0];
-                let issuer = api.issuer();
-                eprintln!("Authorization Server: {issuer} ({}, found by {})", api.name, api.by);
-                issuer
-            }
-        };
+        let server = self.server(timeout)?;
         if let Some(client_id) = &self.client_id {
             let client_secret = match &self.client_secret_file {
                 Some(path) => std::fs::read_to_string(path)
@@ -138,6 +126,44 @@ impl Auth {
 }
 
 impl Auth {
+    /// The Authorization Server named, or found by DNS-SD.
+    fn server(&self, timeout: Duration) -> Result<String, String> {
+        match &self.auth {
+            Some(server) => {
+                auth::metadata_url(server).map_err(|e| format!("--auth: {e}"))?;
+                Ok(server.clone())
+            }
+            None => {
+                let servers = find::auth_servers(&self.look, timeout)?;
+                let api = &servers[0];
+                let issuer = api.issuer();
+                eprintln!("Authorization Server: {issuer} ({}, found by {})", api.name, api.by);
+                Ok(issuer)
+            }
+        }
+    }
+
+    /// Tokens for whoever signs in on the router's page, as --client-id, with its secret
+    /// when it has one.
+    pub(crate) fn sign_in(&self, timeout: Duration, env_proxy: bool) -> Result<Token, String> {
+        let Some(client_id) = &self.client_id else {
+            return Err(
+                "--sign-in needs --client-id: the id the Authorization Server registered the router with".into()
+            );
+        };
+        let server = self.server(timeout)?;
+        let client_secret = match &self.client_secret_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map(|s| s.trim().to_string())
+                    .map_err(|e| format!("--client-secret-file {}: {e}", path.display()))?,
+            ),
+            None => std::env::var(SECRET_VARIABLE).ok().filter(|s| !s.trim().is_empty()),
+        };
+        let sign_in = SignIn { server, client_id: client_id.clone(), client_secret, scope: self.scope.clone() };
+        Ok(Token::sign_in(sign_in, timeout, env_proxy))
+    }
+
     /// Where registrations are kept.
     fn store(&self) -> Result<PathBuf, String> {
         match &self.client_file {

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use st2110_nmos::ws::{self, Frame};
 
-use super::{Router, live_json, state_json};
+use super::{Router, live_json, sign_in_json, state_json};
 use crate::http::{Request, accept};
 
 /// The resources the router subscribes to: everything the page shows.
@@ -188,7 +188,10 @@ pub(crate) fn page(router: &Arc<Router>, stream: &TcpStream, request: &Request) 
         return;
     };
     let log = router.log.lock().map(|l| l.iter().rev().take(50).rev().cloned().collect::<Vec<_>>()).unwrap_or_default();
-    let hello = json!({"type": "hello", "log": log, "subscribed": router.subscribed(), "auth": router.auth_note()});
+    let hello = json!({
+        "type": "hello", "log": log, "subscribed": router.subscribed(), "auth": router.auth_note(),
+        "sign_in": sign_in_json(router),
+    });
     let mut ok = client.send(&Frame::Text(hello.to_string())).is_ok();
     let known = router.sent.lock().ok().and_then(|s| s.error.clone().or(s.message.clone()));
     if let Some(known) = known {
@@ -271,7 +274,7 @@ pub(crate) fn broadcast_state(router: &Arc<Router>) {
             }
         }
         Err(message) => {
-            let error = json!({"type": "error", "message": message}).to_string();
+            let error = json!({"type": "error", "message": message, "sign_in": sign_in_json(router)}).to_string();
             if sent.error.as_ref() != Some(&error) {
                 router.pages.send(|_| true, &error);
                 sent.error = Some(error);

@@ -18,6 +18,11 @@
 //! loopback address unless told otherwise, and answers only requests addressed to an
 //! IP address or `localhost`, and connection requests and WebSockets from the page
 //! itself, so another web site cannot make them through a visitor's browser.
+//!
+//! With `--sign-in`, the IS-10 token is a person's: someone signs in on the page, in
+//! their browser, by the Authorization Code grant with PKCE ([`sign_in_start`],
+//! [`sign_in_finish`]), and the router then acts with that token for everyone who can
+//! reach the page, until they sign out. The token is held in memory only.
 
 mod demo;
 mod dnssd;
@@ -41,7 +46,7 @@ use serde_json::{Value, json};
 use st2110_connect::client::{self, ConnectionClient};
 use st2110_connect::controller::{self, Route, SenderControl, Settings, Take};
 use st2110_connect::{Destination, SenderChange};
-use st2110_nmos::auth::{ClientCredentials, SigningKey, Token};
+use st2110_nmos::auth::{ClientCredentials, SignIn, SigningKey, Token};
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::{Kind, Manifest, Snapshot, groups, routing};
 
@@ -79,6 +84,8 @@ pub(crate) struct Args {
     pub demo_auth: bool,
     /// With --register: register for `private_key_jwt`, publishing the key here.
     pub private_key_jwt: bool,
+    /// Get tokens by having a person sign in on the page.
+    pub sign_in: bool,
     /// The state file, or `None` to keep nothing.
     pub state: Option<PathBuf>,
 }
@@ -133,6 +140,19 @@ struct Router {
 
 /// Where the router publishes the key it signs IS-10 client assertions with.
 const JWKS_PATH: &str = "/.well-known/jwks.json";
+
+/// Where the page sends a person to sign in, with `--sign-in`.
+const SIGN_IN_PATH: &str = "/auth/sign-in";
+
+/// Where the Authorization Server sends them back: the redirect URI.
+const CALLBACK_PATH: &str = "/auth/callback";
+
+/// Where the page signs out.
+const SIGN_OUT_PATH: &str = "/auth/sign-out";
+
+/// The cookie that ties a sign-in to the browser that began it (RFC 6749 §10.12), so
+/// that no one can finish it from another browser with a code of their own.
+const SIGN_IN_COOKIE: &str = "st2110-sign-in";
 
 pub(crate) fn run(args: &Args) -> io::Result<ExitCode> {
     match serve(args) {
@@ -200,7 +220,23 @@ fn serve(args: &Args) -> Result<(), Failure> {
         _ => return Err(Failure::Usage("give a registry's Query API URL, or --demo".into())),
     };
     let mut jwks = None;
+    if args.sign_in && demo.as_ref().is_some_and(|f| f.auth_server().is_none()) {
+        return Err(Failure::Usage(
+            "--sign-in with --demo needs --demo-auth, whose Authorization Server signs people in".into(),
+        ));
+    }
     let token = match demo.as_mut().and_then(|f| f.auth_server().map(|server| (server, f))) {
+        // The demo's Authorization Server signs people in with its own public client.
+        Some((server, _)) if args.sign_in => Some(Token::sign_in(
+            SignIn {
+                server,
+                client_id: demo::SIGN_IN_CLIENT_ID.into(),
+                client_secret: None,
+                scope: st2110_nmos::auth::SCOPES.into(),
+            },
+            timeout,
+            false,
+        )),
         // The router registers with the demo's Authorization Server for private_key_jwt,
         // as IS-10 recommends a confidential client do, and publishes its key.
         Some((server, facility)) => {
@@ -224,6 +260,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
                 false,
             ))
         }
+        None if args.sign_in => Some(args.auth.sign_in(timeout, true)?),
         None if args.private_key_jwt => {
             // The Authorization Server reads the key from this server, so at an address
             // it can reach.
@@ -318,6 +355,9 @@ fn serve(args: &Args) -> Result<(), Failure> {
             }
         } else if let Some(token) = &router.token {
             writeln!(out, "IS-10: {}", token.describe())?;
+        }
+        if router.token.as_ref().is_some_and(Token::signs_in) {
+            writeln!(out, "Sign in: on the page; the router then acts for everyone who can reach it, with that token")?;
         }
         match router.keeper.path() {
             Some(path) => writeln!(out, "Kept in: {}", path.display())?,
@@ -545,6 +585,12 @@ fn answer(router: &Router, request: &Request) -> Response {
             Ok(()) => watch(router, request),
             Err(message) => Response::error(403, message),
         },
+        ("GET", SIGN_IN_PATH) => sign_in_start(router, request),
+        ("GET", CALLBACK_PATH) => sign_in_finish(router, request),
+        ("POST", SIGN_OUT_PATH) => match same_origin(request) {
+            Ok(()) => sign_out(router),
+            Err(message) => Response::error(403, message),
+        },
         ("GET", "/api/live") => live(router),
         ("GET", "/api/log") => {
             let log = router.log.lock().map(|l| l.clone()).unwrap_or_default();
@@ -555,7 +601,7 @@ fn answer(router: &Router, request: &Request) -> Response {
         (
             _,
             "/" | "/api/state" | "/api/why" | "/api/take" | "/api/sender" | "/api/watch" | "/api/live" | "/api/log"
-            | "/api/preview" | "/api/stream" | "/api/events",
+            | "/api/preview" | "/api/stream" | "/api/events" | SIGN_IN_PATH | CALLBACK_PATH | SIGN_OUT_PATH,
         ) => Response::error(405, "not with that method"),
         _ => Response::error(404, "nothing here"),
     }
@@ -684,13 +730,119 @@ fn device_and_node(snapshot: &Snapshot, resource: &Value) -> (Option<String>, Op
 fn state(router: &Router) -> Response {
     match state_json(router) {
         Ok(body) => Response::json(200, &body),
-        Err(message) => Response::error(502, message),
+        Err(message) => {
+            let sign_in = sign_in_json(router);
+            // Refused until someone signs in, rather than failed.
+            let status = if sign_in["signed_in"] == false { 403 } else { 502 };
+            Response::json(status, &json!({"error": message, "sign_in": sign_in}))
+        }
     }
+}
+
+/// Whether someone has signed in, and who, with `--sign-in`, for the page; `null`
+/// without it.
+fn sign_in_json(router: &Router) -> Value {
+    match router.token.as_ref().filter(|t| t.signs_in()).map(Token::signed_in) {
+        None => Value::Null,
+        Some(None) => json!({"signed_in": false}),
+        Some(Some(who)) => json!({"signed_in": true, "subject": who.subject, "scope": who.scope}),
+    }
+}
+
+/// A short answer in words, for a browser that a sign-in leaves on one of the router's
+/// own addresses rather than on its page. The sign-in's cookie goes with it.
+fn plain(status: u16, text: &str) -> Response {
+    Response {
+        status,
+        content_type: "text/plain; charset=utf-8",
+        headers: vec![
+            ("X-Content-Type-Options", "nosniff".into()),
+            ("Referrer-Policy", "no-referrer".into()),
+            ("Set-Cookie", format!("{SIGN_IN_COOKIE}=; Path=/auth; Max-Age=0; HttpOnly; SameSite=Lax")),
+        ],
+        body: text.as_bytes().to_vec(),
+    }
+}
+
+/// Sends the browser to the Authorization Server to sign in (RFC 6749 §4.1.1), to come
+/// back to the router at the address the browser reached it by, which [`host_allowed`]
+/// has checked is an IP address or `localhost`.
+fn sign_in_start(router: &Router, request: &Request) -> Response {
+    let Some(token) = router.token.as_ref().filter(|t| t.signs_in()) else {
+        return Response::error(404, "this router signs no one in: run it with --sign-in");
+    };
+    let host = request.header("Host").unwrap_or_default();
+    let begun = match token.begin_sign_in(&format!("http://{host}{CALLBACK_PATH}")) {
+        Ok(begun) if !begun.url.contains(char::is_control) => begun,
+        Ok(_) => return plain(502, "The Authorization Server's authorization_endpoint is not an address."),
+        Err(e) => return plain(502, &format!("Cannot sign in: {e}. Go back to the router's page to try again.")),
+    };
+    let mut response = plain(302, "Signing in at the Authorization Server");
+    response.headers.retain(|(name, _)| *name != "Set-Cookie");
+    response.headers.push(("Location", begun.url));
+    // Lax, so that the browser sends it back when the server sends it here.
+    response.headers.push((
+        "Set-Cookie",
+        format!("{SIGN_IN_COOKIE}={}; Path=/auth; Max-Age=300; HttpOnly; SameSite=Lax", begun.state),
+    ));
+    response
+}
+
+/// Where the Authorization Server sends the browser back (RFC 6749 §4.1.2): the code
+/// is swapped for a token, if the sign-in was begun here and in this browser, and the
+/// browser goes back to the page.
+fn sign_in_finish(router: &Router, request: &Request) -> Response {
+    let Some(token) = router.token.as_ref().filter(|t| t.signs_in()) else {
+        return Response::error(404, "this router signs no one in: run it with --sign-in");
+    };
+    let again = "Go back to the router's page to sign in again.";
+    if let Some(refused) = request.param("error") {
+        // RFC 6749 §4.1.2.1.
+        let why = request.param("error_description").map_or(refused.clone(), |d| format!("{refused}: {d}"));
+        return plain(400, &format!("The Authorization Server did not sign you in ({why}). {again}"));
+    }
+    let state = request.param("state").unwrap_or_default();
+    let kept = request
+        .header("Cookie")
+        .into_iter()
+        .flat_map(|c| c.split(';'))
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(name, _)| *name == SIGN_IN_COOKIE)
+        .map(|(_, value)| value);
+    if state.is_empty() || kept != Some(state.as_str()) {
+        return plain(400, &format!("This sign-in was not begun in this browser, or took too long. {again}"));
+    }
+    let Some(code) = request.param("code").filter(|c| !c.is_empty()) else {
+        return plain(400, &format!("The Authorization Server sent no code. {again}"));
+    };
+    match token.finish_sign_in(&state, &code) {
+        Ok(_) => {
+            router.changes.raise();
+            let mut response = plain(302, "Signed in");
+            response.headers.push(("Location", "/".into()));
+            response
+        }
+        Err(e) => plain(400, &format!("Signing in failed: {e}. {again}")),
+    }
+}
+
+/// Forgets the token got by signing in: the router acts for no one until someone signs
+/// in again.
+fn sign_out(router: &Router) -> Response {
+    let Some(token) = router.token.as_ref().filter(|t| t.signs_in()) else {
+        return Response::error(404, "this router signs no one in");
+    };
+    token.sign_out();
+    router.changes.raise();
+    Response::json(200, &json!({"sign_in": sign_in_json(router)}))
 }
 
 /// The registry, as the page shows it: every Sender, and every Receiver with the
 /// Senders it can take and the one it takes now.
 fn state_json(router: &Router) -> Result<Value, String> {
+    if router.token.as_ref().is_some_and(|t| t.signs_in() && t.signed_in().is_none()) {
+        return Err("No one has signed in, and the router reads the registry with their token".into());
+    }
     let read = router.query_client(false).and_then(|registry| {
         let mut snapshot = registry.snapshot().map_err(|e| e.to_string())?;
         router.add_sdp(&registry, &mut snapshot);
@@ -748,7 +900,7 @@ fn state_json(router: &Router) -> Result<Value, String> {
     let body = json!({
         "registry": router.registry, "demo": router.demo.is_some(), "read_at": read_at as u64,
         "lead": router.settings.lead.as_secs_f64(), "previews": router.previews.most(),
-        "auth": router.auth_note(), "subscribed": router.subscribed(),
+        "auth": router.auth_note(), "sign_in": sign_in_json(router), "subscribed": router.subscribed(),
         "senders": senders, "receivers": receivers,
     });
     if let Ok(mut last) = router.last.lock() {

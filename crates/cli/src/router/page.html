@@ -2878,6 +2878,7 @@ select.ds-field {
 header { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2) var(--ds-space-4); padding: var(--ds-space-3) var(--ds-space-4); border-bottom: var(--ds-space-hairline) solid var(--line); background: var(--panel); }
 h1 { margin: 0; font: var(--ds-text-title); }
 .registry { color: var(--dim); font: var(--ds-text-caption); overflow-wrap: anywhere; }
+.account { display: inline-flex; align-items: center; gap: var(--ds-space-2); }
 .status { margin-left: auto; display: flex; align-items: center; gap: var(--ds-space-2); color: var(--dim); font: var(--ds-text-caption); }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2) var(--ds-space-3); padding: var(--ds-space-3) var(--ds-space-4); }
 .spacer { flex: 1; }
@@ -3008,6 +3009,7 @@ pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-spa
   <span id="demo" class="ds-chip ds-chip--warn" title="A demo facility on this machine: nothing here reaches real equipment" hidden>Demo</span>
   <span id="registry" class="registry"></span>
   <span id="auth" class="ds-chip" title="Requests to the registry and the Nodes carry an IS-10 access token" hidden>IS-10</span>
+  <span id="account" class="account" hidden></span>
   <span id="status" class="status"><span id="dot" class="ds-dot ds-dot--off"></span><span id="read">Reading the registry…</span></span>
 </header>
 <div class="toolbar">
@@ -3065,6 +3067,7 @@ const armed = new Map();   // receiver id -> sender id, or null to disconnect
 const busy = new Set();    // receiver ids being switched
 let reading = false;
 let taking = false;
+let signIn = null;         // with --sign-in: whether someone has signed in, and who; null without it
 
 async function call(url, options) {
   let response;
@@ -3100,6 +3103,7 @@ function listen() {
     let m;
     try { m = JSON.parse(event.data); } catch (_) { return; }
     if ("subscribed" in m) subscribed = m.subscribed;
+    if ("sign_in" in m) showSignIn(m.sign_in);
     if (m.type === "hello") showLog(m.log || []);
     else if (m.type === "state") applyState(m);
     else if (m.type === "read") { readAt = m.read_at; showStatus(); }
@@ -3143,8 +3147,36 @@ function monitorTitle(m) {
   return (m.domains || []).map((d) => `${d.domain}: ${d.status}${d.message ? " (" + d.message + ")" : ""}`).join("\n");
 }
 
+// With --sign-in the router acts with the token of whoever signed in, for everyone
+// using the page: the header says who, or offers Sign in.
+function showSignIn(next) {
+  signIn = next;
+  const box = $("account");
+  box.hidden = !signIn;
+  if (!signIn) return;
+  if (signIn.signed_in) {
+    const scope = signIn.scope ? ` (scopes: ${signIn.scope})` : "";
+    box.replaceChildren(
+      el("span", { class: "ds-chip", title: `The router reads and switches with this sign-in's token, for everyone using this page${scope}`, text: signIn.subject ? `Signed in as ${signIn.subject}` : "Signed in" }),
+      el("button", { class: "ds-btn ds-btn--quiet ds-btn--small", title: "Forget the token: the router reads and switches nothing until someone signs in again", text: "Sign out", onclick: signOut }));
+  } else {
+    box.replaceChildren(el("a", { class: "ds-btn ds-btn--small", href: "/auth/sign-in", text: "Sign in" }));
+  }
+}
+
+async function signOut() {
+  try {
+    const body = await call("/auth/sign-out", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    showSignIn(body.sign_in);
+  } catch (e) {
+    showFailure(e.message, e.unreachable);
+  }
+  read();
+}
+
 function applyState(next) {
   state = next;
+  if ("sign_in" in next) showSignIn(next.sign_in);
   readAt = next.read_at;
   if ("subscribed" in next) subscribed = next.subscribed;
   if (live === null) setLive(remembered() ?? (state.demo && state.previews > 0));
@@ -3157,7 +3189,7 @@ function applyState(next) {
 // How the page hears of changes shows in the status: live as they happen, read every
 // 3 seconds by the router, or read every 3 seconds by the page itself.
 function showStatus() {
-  if (!$("banner").hidden && $("dot").className.includes("bad")) return;
+  if (!$("banner").hidden) return;
   if (readAt == null) return;
   const time = new Date(readAt).toLocaleTimeString();
   $("dot").className = "ds-dot ds-dot--ok";
@@ -3174,6 +3206,22 @@ function showStatus() {
 }
 
 function showFailure(message, unreachable) {
+  // Not signed in is not a failure: it asks for the one thing that starts the router.
+  if (!unreachable && signIn && !signIn.signed_in) {
+    $("dot").className = "ds-dot ds-dot--off";
+    $("read").textContent = "Not signed in";
+    $("status").title = "";
+    $("banner").className = "ds-notice ds-notice--warn notice";
+    $("banner").replaceChildren(
+      el("div", { class: "ds-notice__body" },
+        el("div", { class: "ds-notice__title", text: "Sign in to use the router" }),
+        el("div", { text: "The registry and the Devices ask for an IS-10 token, and the router gets one when someone signs in. It then reads and switches with that token for everyone using this page, until they sign out." })),
+      el("div", { class: "ds-notice__actions" }, el("a", { class: "ds-btn ds-btn--primary", href: "/auth/sign-in", text: "Sign in" })));
+    $("banner").hidden = false;
+    if (!state) $("grid").textContent = "Nothing to show until someone signs in.";
+    return;
+  }
+  $("banner").className = "ds-notice ds-notice--bad notice";
   $("dot").className = "ds-dot ds-dot--bad";
   $("read").textContent = unreachable ? "Router unreachable" : "Registry unreachable";
   $("status").title = "";
@@ -3195,6 +3243,7 @@ async function read() {
     $("banner").hidden = true;
     applyState(next);
   } catch (e) {
+    if (e.body && "sign_in" in e.body) showSignIn(e.body.sign_in);
     showFailure(e.message, e.unreachable);
   } finally {
     reading = false;
