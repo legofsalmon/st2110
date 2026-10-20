@@ -172,6 +172,10 @@ export interface SenderView {
   streams: Stream[];
   /** Ids of the Receivers taking its stream. */
   receivers: string[];
+  /** Its IS-11 status state, such as `constrained`, when it was read. */
+  compat?: string;
+  /** How many IS-11 active constraint sets it has, when they were read. */
+  active_constraints?: number;
 }
 
 export interface ReceiverView {
@@ -184,6 +188,52 @@ export interface ReceiverView {
   active: boolean;
   sender_id: string | null;
   sender_label: string | null;
+  /** Its IS-11 status state, such as `compliant_stream`, when it was read. */
+  compat?: string;
+}
+
+/** A Node's network interface, with what LLDP says of it (TR-1001-1). */
+export interface InterfaceView {
+  name: string;
+  chassis_id: string | null;
+  port_id: string | null;
+  /** The switch's chassis ID, from attached_network_device. */
+  switch: string | null;
+  /** The switch's port ID, from attached_network_device. */
+  switch_port: string | null;
+}
+
+export interface NodeView {
+  id: string | null;
+  label: string;
+  interfaces: InterfaceView[];
+}
+
+/** One IS-08 Output channel: the Input and its channel (from 0), or null for silence. */
+export interface ChannelRoute {
+  input: string | null;
+  channel_index: number | null;
+}
+
+export interface OutputMap {
+  id: string;
+  name: string | null;
+  channels: ChannelRoute[];
+}
+
+/** A Device's IS-08 active channel map. */
+export interface ChannelMapView {
+  device_id: string;
+  device: string;
+  outputs: OutputMap[];
+}
+
+/** What the IS-09 System API gives the system. */
+export interface SystemView {
+  url: string;
+  ptp_domain: number | null;
+  announce_receipt_timeout: number | null;
+  heartbeat_interval: number | null;
 }
 
 export interface Grandmaster {
@@ -210,6 +260,9 @@ export interface RegistryReport {
   summary: RegistrySummary;
   senders: SenderView[];
   receivers: ReceiverView[];
+  nodes: NodeView[];
+  channel_maps?: ChannelMapView[];
+  system?: SystemView;
   findings: Finding[];
 }
 

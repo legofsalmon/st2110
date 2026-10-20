@@ -159,6 +159,67 @@ fn nmos_lists_a_clean_registry() {
     }
 }
 
+/// The test facility as read with its control APIs and a System API: the camera's
+/// video Sender held by IS-11, the monitor's IS-08 map, and the system's settings.
+fn facility_with_controls(domain: u64) -> String {
+    let mut facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    let set = serde_json::json!({"urn:x-nmos:cap:format:frame_width": {"enum": [1920]}});
+    facility["stream_compat"] = serde_json::json!({
+        "5e0d0001-0000-4000-8000-000000000001": {
+            "status": {"state": "constrained"},
+            "active": {"constraint_sets": [set]},
+            "supported": {"parameter_constraints": ["urn:x-nmos:cap:format:frame_width"]},
+        },
+        "7ecf0001-0000-4000-8000-000000000001": {"status": {"state": "compliant_stream"}},
+    });
+    let channels = serde_json::json!([{"label": "L"}, {"label": "R"}]);
+    facility["channel_mapping"] = serde_json::json!({
+        "de710002-0000-4000-8000-000000000002": {
+            "io": {
+                "inputs": {"in1": {"properties": {"name": "Input 1", "description": ""}, "channels": channels,
+                                   "parent": {"id": null, "type": null}, "caps": {}}},
+                "outputs": {"out1": {"properties": {"name": "Speakers", "description": ""}, "channels": channels,
+                                     "source_id": null, "caps": {"routable_inputs": null}}},
+            },
+            "active": {"activation": {}, "map": {"out1": {
+                "0": {"input": "in1", "channel_index": 1},
+                "1": {"input": null, "channel_index": null},
+            }}},
+        },
+    });
+    facility["system"] = serde_json::json!({
+        "url": "http://system.studio.example/x-nmos/system/v1.0/global",
+        "global": {"is04": {"heartbeat_interval": 5}, "ptp": {"announce_receipt_timeout": 3, "domain_number": domain}},
+    });
+    facility.to_string()
+}
+
+#[test]
+fn nmos_shows_interfaces_control_apis_and_the_system() {
+    let output = with_stdin(&["nmos", "-"], &facility_with_controls(127));
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    for line in [
+        "  System API: PTP domain 127, announce timeout 3, heartbeat every 5 s \
+         (http://system.studio.example/x-nmos/system/v1.0/global)",
+        "nodes:\n  \"Camera 1\" (a0de0001)\n    eth0 c8-00-84-10-00-01 → switch a4-6c-2a-00-0a-00 port Ethernet1/1\n",
+        "video/raw, 1 receiver, IS-11 constrained to 1 constraint set\n",
+        "from \"CAM 1 video\" (5e0d0001), IS-11 compliant stream\n",
+        "channel maps:\n  \"Monitor 1\" (de710002)\n    Speakers (out1): 1 ← in1:2, 2 silent\n",
+        "registry: no problems found",
+    ] {
+        assert!(text.contains(line), "no {line:?} in\n{text}");
+    }
+    // The Sender's SDP file says domain 127; the System API says otherwise.
+    let text = stdout(&with_stdin(&["nmos", "--quiet", "-"], &facility_with_controls(0)));
+    assert!(text.contains("warning[system-ptp-domain]"), "{text}");
+    // A System API that does not answer is a finding about the system.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let system = format!("--system=http://127.0.0.1:{port}");
+    let text = stdout(&st2110(&["nmos", "--quiet", "--timeout", "2", &system, FACILITY]));
+    assert!(text.starts_with("registry: warning[system-global]"), "{text}");
+}
+
 #[test]
 fn nmos_reports_findings_and_quotes_sdp_lines() {
     let output = with_stdin(&["nmos", "-"], &broken_facility());
@@ -404,6 +465,73 @@ fn connect_plans_makes_and_refuses_connections() {
         "receiver \"MON 1 video\" (7ecf0001): cancelled the activation due at 2026-09-27 12:01:00.000000000 UTC\n"
     );
     std::fs::remove_file(snapshot).unwrap();
+}
+
+#[test]
+fn connect_plans_channel_maps_and_held_senders() {
+    // The camera's IS-11 API and the monitor's IS-08 API, read-only.
+    let port = serve(|_, target| match target.rsplit_once("/v1.0/") {
+        Some((_, "senders/5e0d0001-0000-4000-8000-000000000001/constraints/supported")) => (
+            200,
+            r#"{"parameter_constraints": ["urn:x-nmos:cap:format:frame_width", "urn:x-nmos:cap:format:grain_rate"]}"#
+                .into(),
+        ),
+        Some((_, "io")) => (
+            200,
+            serde_json::json!({
+                "inputs": {"in1": {"properties": {"name": "Input 1"}, "channels": [{"label": "L"}, {"label": "R"}]}},
+                "outputs": {"out1": {"properties": {"name": "Speakers"}, "channels": [{"label": "L"}, {"label": "R"}],
+                                     "caps": {"routable_inputs": null}}},
+            })
+            .to_string(),
+        ),
+        _ => (404, String::new()),
+    });
+    let mut facility: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(FACILITY).unwrap()).unwrap();
+    facility["devices"][0]["controls"] = serde_json::json!([{"type": "urn:x-nmos:control:stream-compat/v1.0",
+        "href": format!("http://127.0.0.1:{port}/x-nmos/streamcompatibility/v1.0/")}]);
+    facility["devices"][1]["controls"] = serde_json::json!([{"type": "urn:x-nmos:control:cm-ctrl/v1.0",
+        "href": format!("http://127.0.0.1:{port}/x-nmos/channelmapping/v1.0/")}]);
+    let snapshot = facility.to_string();
+
+    let mapped = with_stdin(
+        &["connect", "-", "--device", "Monitor 1", "--map", "Speakers:2=Input 1:1", "--map", "out1:1=-", "--dry-run"],
+        &snapshot,
+    );
+    assert_eq!(mapped.status.code(), Some(0), "{}", String::from_utf8_lossy(&mapped.stderr));
+    assert_eq!(stdout(&mapped), "device \"Monitor 1\" (de710002) map: planned\n  out1: 1 silent, 2 ← in1:1\n");
+
+    let held = with_stdin(
+        &["connect", "-", "--sender", "CAM 1 video", "--constrain-for", "MON 1 video", "--dry-run"],
+        &snapshot,
+    );
+    assert_eq!(held.status.code(), Some(0), "{}", String::from_utf8_lossy(&held.stderr));
+    let text = stdout(&held);
+    assert!(
+        text.starts_with(
+            "sender \"CAM 1 video\" (5e0d0001) held to 2 constraint sets: planned\n\
+             \x20 set 1: frame_width 1920, grain_rate 50 or 60000/1001\n\
+             \x20 set 2: frame_width 1280, grain_rate 25 to 60\n\
+             \x20 note: the Sender cannot be held to "
+        ),
+        "{text}"
+    );
+
+    let refused = with_stdin(&["connect", "-", "--device", "Monitor 1", "--map", "out1:3=in1:1"], &snapshot);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stdout(&refused).contains("problem: Output \"Speakers\" (out1) has 2 channels, so it has no channel 3"));
+
+    let usage = |args: &[&str]| {
+        let output = with_stdin(args, &snapshot);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    assert!(usage(&["connect", "-", "--device", "Monitor 1"]).contains("--device needs --map"));
+    assert!(usage(&["connect", "-", "--cancel"]).contains("--cancel needs --receiver, or --device"));
+    assert!(
+        usage(&["connect", "-", "--device", "Monitor 1", "--map", "out1=in1"])
+            .contains("--map out1=in1 is not a route")
+    );
 }
 
 const PTP_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ptp/tests/fixtures");

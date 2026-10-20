@@ -88,6 +88,11 @@ enum Command {
         /// Do not fetch the Senders' SDP files.
         #[arg(long)]
         no_sdp: bool,
+        /// Read the IS-09 System API's global settings too, show them, and check the
+        /// registry against them: `--system=URL`, or `--system` alone to find it by
+        /// DNS-SD (_nmos-system._tcp).
+        #[arg(long, value_name = "URL", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        system: Option<String>,
         #[command(flatten)]
         auth: auth::Auth,
     },
@@ -104,7 +109,14 @@ enum Command {
     /// With --sender and --enable, --disable or --destination, it turns that Sender on
     /// or off, or sends it to other multicast groups or unicast addresses. A Receiver
     /// connected to a unicast (rtp.ucast) Sender has the Sender pointed at it first,
-    /// naming it as the Sender's receiver_id.
+    /// naming it as the Sender's receiver_id. An IS-07 event Receiver is told where the
+    /// Sender's events are (its WebSocket connection_uri, or MQTT broker and topic),
+    /// with no SDP file.
+    ///
+    /// With --sender and --constrain-for, it holds that Sender to what the Receivers
+    /// named can all take, through IS-11, and --unconstrain lets it go. With --device and
+    /// --map, it changes that Device's IS-08 audio channel map, now or as --at or --in
+    /// say; --device with --cancel cancels the map activations waiting on it.
     ///
     /// Each connection is checked against the Receiver's constraints and capabilities
     /// before anything is sent, and on its /active endpoint and in the registry after.
@@ -145,9 +157,12 @@ enum Command {
         /// Disconnect it.
         #[arg(long, group = "take", requires = "receiver")]
         disconnect: bool,
-        /// Cancel the activation scheduled on it.
-        #[arg(long, group = "take", requires = "receiver", conflicts_with_all = ["at", "after", "dry_run"])]
+        /// Cancel the activation scheduled on it, or with --device, the IS-08 map
+        /// activations waiting on that Device.
+        #[arg(long, group = "take", conflicts_with_all = ["at", "after", "dry_run"])]
         cancel: bool,
+        #[command(flatten)]
+        controls: Box<connect::Controls>,
         /// A JSON file of connections to make together, such as
         /// [{"receiver": "MON 1", "sender": "CAM 2"}, {"receiver": "MON 2", "sdp":
         /// "feed.sdp"}, {"receiver": "MON 3", "disconnect": true}].
@@ -491,10 +506,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
-        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, auth } => {
+        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, system, auth } => {
             match registry(target, &auth, timeout) {
                 Ok(target) => {
-                    let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, auth };
+                    let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, system, auth };
                     nmos::run(&target, &fetch, format, quiet, deny_warnings)
                 }
                 Err(code) => Ok(code),
@@ -511,6 +526,7 @@ fn main() -> ExitCode {
             sdp,
             disconnect,
             cancel,
+            controls,
             salvo,
             group,
             at,
@@ -540,6 +556,7 @@ fn main() -> ExitCode {
                 sdp,
                 disconnect,
                 cancel,
+                controls: *controls,
                 salvo,
                 group,
                 at,

@@ -99,3 +99,14 @@ pub(crate) fn auth_servers(args: &LookArgs, timeout: Duration) -> Result<Vec<Api
     }
     Ok(servers)
 }
+
+/// The IS-09 System API found by DNS-SD (_nmos-system._tcp), the lowest priority first.
+/// Says on standard error which one, and how it was found.
+pub(crate) fn system(args: &LookArgs, timeout: Duration) -> Result<String, String> {
+    let seen = find::find(ApiKind::System, &args.look(timeout));
+    let Some(api) = find::by_priority(&seen.apis).into_iter().next() else {
+        return Err(nothing("System API", &seen));
+    };
+    eprintln!("System API: {} ({}, found by {})", api.url, api.name, api.by);
+    Ok(api.url.clone())
+}

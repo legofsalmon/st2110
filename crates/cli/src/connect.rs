@@ -9,7 +9,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 use st2110_connect::client::{self, ConnectionClient};
+use st2110_connect::compat::{self, Constrained, Hold};
 use st2110_connect::controller::{self, Connection, Outcome, Route, SenderControl, Settings, State, Take};
+use st2110_connect::mapping::{self, Remap, Remapped, Route as MapRoute};
 use st2110_connect::{Activation, Destination, SenderChange};
 use st2110_nmos::auth::Token;
 use st2110_nmos::client::{Options, QueryClient};
@@ -33,6 +35,7 @@ pub(crate) struct Args {
     pub sdp: Option<PathBuf>,
     pub disconnect: bool,
     pub cancel: bool,
+    pub controls: Controls,
     pub salvo: Option<PathBuf>,
     pub group: bool,
     pub at: Option<String>,
@@ -47,9 +50,51 @@ pub(crate) struct Args {
     pub auth: crate::auth::Auth,
 }
 
+/// The options for the control APIs beside IS-05: IS-08 channel maps and IS-11 Sender
+/// constraints.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct Controls {
+    /// The Device whose IS-08 audio channel map --map changes, or whose waiting map
+    /// activations --cancel cancels: its id, its label, the start of its id, or one
+    /// of its Senders or Receivers.
+    #[arg(long, value_name = "DEVICE", conflicts_with_all = ["receiver", "sender", "salvo", "group"])]
+    pub device: Option<String>,
+    /// A channel route for --device: OUTPUT:CHANNEL=INPUT:CHANNEL, such as
+    /// main:1=mic:2, with channels counted from 1 and each Output and Input named by
+    /// its id or name; OUTPUT:CHANNEL=- leaves it silent. Give it once per channel;
+    /// the others stay as they are.
+    #[arg(long, value_name = "ROUTE", requires = "device", conflicts_with = "cancel")]
+    pub map: Vec<String>,
+    /// Hold the --sender to what this Receiver can take, through IS-11: its active
+    /// constraints become the constraint sets every Receiver named so accepts. Give it
+    /// once per Receiver.
+    #[arg(
+        long,
+        value_name = "RECEIVER",
+        requires = "sender",
+        conflicts_with_all = ["receiver", "enable", "disable", "destination", "salvo", "cancel", "unconstrain"]
+    )]
+    pub constrain_for: Vec<String>,
+    /// Take the --sender's IS-11 active constraints away.
+    #[arg(
+        long,
+        requires = "sender",
+        conflicts_with_all = ["receiver", "enable", "disable", "destination", "salvo", "cancel"]
+    )]
+    pub unconstrain: bool,
+}
+
 pub(crate) fn run(args: &Args, format: Format) -> io::Result<ExitCode> {
     let changes_sender = args.enable || args.disable || !args.destination.is_empty();
+    let holds_sender = !args.controls.constrain_for.is_empty() || args.controls.unconstrain;
     let result = match (&args.salvo, &args.receiver, &args.sender, &args.sdp, args.disconnect) {
+        _ if args.controls.device.is_some() => {
+            remap_device(args, args.controls.device.as_deref().unwrap_or_default(), format)
+        }
+        (None, None, Some(sender), None, false) if holds_sender => hold(args, sender, format),
+        (_, None, ..) if args.cancel => {
+            Err(Failure::Usage("--cancel needs --receiver, or --device for the map activations waiting on it".into()))
+        }
         (None, Some(receiver), ..) if args.cancel => cancel(args, receiver, format),
         (None, None, Some(sender), None, false) if changes_sender => control(args, sender, format),
         (None, None, Some(_), None, false) => Err(Failure::Usage(
@@ -382,6 +427,151 @@ fn state_code(state: State) -> &'static str {
     }
 }
 
+/// Changes a Device's IS-08 channel map, or cancels the activations waiting on it.
+fn remap_device(args: &Args, device: &str, format: Format) -> Result<ExitCode, Failure> {
+    let change = if args.cancel {
+        Remap::Cancel
+    } else if args.controls.map.is_empty() {
+        return Err(Failure::Usage("--device needs --map to change its channel map, or --cancel".into()));
+    } else {
+        let routes = args.controls.map.iter().map(|r| MapRoute::parse(r).map_err(|e| format!("--map {e}")));
+        Remap::Routes(routes.collect::<Result<Vec<_>, _>>()?)
+    };
+    let settings = settings(args)?;
+    let timeout = timeout(args)?;
+    let token = args.auth.token(timeout, true)?;
+    let (snapshot, _) = load(&args.target, timeout, false, token.as_ref())?;
+    let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
+    let report = mapping::remap(&snapshot, device, &change, &client, &settings)?;
+    let mut out = io::stdout().lock();
+    match format {
+        Format::Text => write_remap(&mut out, &report, args.tai_utc, Style::detect())?,
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, &report)?;
+            writeln!(out)?;
+        }
+    }
+    Ok(if report.state.is_success() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+fn write_remap(out: &mut impl Write, report: &Remapped, tai_utc: i32, style: Style) -> io::Result<()> {
+    let action = report.request.as_ref().and_then(|r| r.get("action")).and_then(Value::as_object);
+    let what = if report.request.is_some() || !report.problems.is_empty() { "map" } else { "cancel" };
+    let mut line = format!(
+        "{} {what}: {}",
+        style.paint("1", &report.device.describe()),
+        style.paint(state_code(report.state), report.state.describe())
+    );
+    if let Some(time) = report.activation_time.as_deref().and_then(PtpTime::parse) {
+        line.push_str(&format!(" for {} UTC", time.utc(tai_utc)));
+    }
+    if let (State::Scheduled, Some(id)) = (report.state, &report.activation_id) {
+        line.push_str(&format!(" as activation {id}"));
+    }
+    writeln!(out, "{line}")?;
+    // Channels counted from 1, as --map takes them.
+    for (output, channels) in action.into_iter().flatten() {
+        let mut routes: Vec<(usize, String)> = channels
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(index, route)| {
+                let index = index.parse::<usize>().ok()? + 1;
+                let text = match (route.get("input").and_then(Value::as_str), route.get("channel_index")) {
+                    (Some(input), Some(Value::Number(channel))) => {
+                        format!("{index} ← {input}:{}", channel.as_u64().unwrap_or(0) + 1)
+                    }
+                    (Some(input), _) => format!("{index} ← {input}"),
+                    (None, _) => format!("{index} silent"),
+                };
+                Some((index, text))
+            })
+            .collect();
+        routes.sort();
+        let routes: Vec<String> = routes.into_iter().map(|(_, text)| text).collect();
+        writeln!(out, "  {output}: {}", routes.join(", "))?;
+    }
+    for (label, texts) in [("note", &report.notes), ("problem", &report.problems), ("warning", &report.warnings)] {
+        for text in texts {
+            writeln!(out, "  {label}: {text}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Holds a Sender to what the Receivers named can take, through IS-11, or lets it go.
+fn hold(args: &Args, sender: &str, format: Format) -> Result<ExitCode, Failure> {
+    let wanted = if args.controls.unconstrain { Hold::Nothing } else { Hold::For(args.controls.constrain_for.clone()) };
+    let settings = settings(args)?;
+    let timeout = timeout(args)?;
+    let token = args.auth.token(timeout, true)?;
+    let (snapshot, _) = load(&args.target, timeout, false, token.as_ref())?;
+    let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
+    let report = compat::constrain(&snapshot, sender, &wanted, &client, &settings)?;
+    let mut out = io::stdout().lock();
+    match format {
+        Format::Text => write_hold(&mut out, &report, Style::detect())?,
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, &report)?;
+            writeln!(out)?;
+        }
+    }
+    Ok(if report.state.is_success() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+fn write_hold(out: &mut impl Write, report: &Constrained, style: Style) -> io::Result<()> {
+    let sets = report.request.as_ref().and_then(|r| r.get("constraint_sets")).and_then(Value::as_array);
+    let what = match sets {
+        Some(sets) => format!("held to {}", plural(sets.len(), "constraint set")),
+        None if report.problems.is_empty() => "let go".to_string(),
+        None => "not held".to_string(),
+    };
+    let mut line = format!(
+        "{} {what}: {}",
+        style.paint("1", &report.sender.describe()),
+        style.paint(state_code(report.state), report.state.describe())
+    );
+    if let Some(status) = &report.status {
+        line.push_str(&format!(", now {}", status.replace('_', " ")));
+    }
+    writeln!(out, "{line}")?;
+    for (i, set) in sets.into_iter().flatten().enumerate() {
+        let constraints: Vec<String> = set
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(urn, constraint)| format!("{} {}", urn.rsplit(':').next().unwrap_or(urn), allowed(constraint)))
+            .collect();
+        writeln!(out, "  set {}: {}", i + 1, constraints.join(", "))?;
+    }
+    for (label, texts) in [("note", &report.notes), ("problem", &report.problems), ("warning", &report.warnings)] {
+        for text in texts {
+            writeln!(out, "  {label}: {text}")?;
+        }
+    }
+    Ok(())
+}
+
+/// What a parameter constraint allows, such as `1920`, `50 or 60000/1001` or `1280 to 1920`.
+fn allowed(constraint: &Value) -> String {
+    let value = |v: &Value| match (v.get("numerator"), v.get("denominator")) {
+        (Some(n), Some(d)) if d.as_u64() != Some(1) => format!("{n}/{d}"),
+        (Some(n), _) => n.to_string(),
+        _ => v.as_str().map_or_else(|| v.to_string(), str::to_string),
+    };
+    let mut parts = Vec::new();
+    if let Some(values) = constraint.get("enum").and_then(Value::as_array) {
+        parts.push(values.iter().map(value).collect::<Vec<_>>().join(" or "));
+    }
+    match (constraint.get("minimum"), constraint.get("maximum")) {
+        (Some(low), Some(high)) => parts.push(format!("{} to {}", value(low), value(high))),
+        (Some(low), None) => parts.push(format!("at least {}", value(low))),
+        (None, Some(high)) => parts.push(format!("at most {}", value(high))),
+        (None, None) => {}
+    }
+    if parts.is_empty() { "anything".to_string() } else { parts.join(", ") }
+}
+
 /// Makes the connections asked for.
 fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     let routes = routes(args)?;
@@ -460,6 +650,18 @@ fn legs(connection: &Connection) -> Vec<String> {
             let text = |name: &str| leg.get(name).and_then(Value::as_str);
             if leg.get("rtp_enabled") == Some(&Value::Bool(false)) {
                 return "off".to_string();
+            }
+            // An IS-07 event Receiver: where the events are, over WebSocket or MQTT.
+            if let Some(uri) = text("connection_uri") {
+                return format!("events from {uri}");
+            }
+            if let Some(topic) = text("broker_topic") {
+                let broker = match (text("source_host"), leg.get("source_port").and_then(Value::as_u64)) {
+                    (Some(host), Some(port)) => format!(" on broker {host}:{port}"),
+                    (Some(host), None) => format!(" on broker {host}"),
+                    _ => String::new(),
+                };
+                return format!("events from MQTT topic {topic}{broker}");
             }
             let address = text("multicast_ip").or(text("interface_ip")).unwrap_or("?");
             let address = if address.contains(':') { format!("[{address}]") } else { address.to_string() };

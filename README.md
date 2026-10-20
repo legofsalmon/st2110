@@ -32,8 +32,8 @@ Every finding cites the clause behind it.
 | Crate | What it is |
 |---|---|
 | [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 103 rules. No dependencies; `serde` is an optional feature. |
-| [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching, BCP-002-01 natural groups, the registry checker's 26 rules, and the crosspoint matrix of which Senders each Receiver can take. The Query API client is the optional `client` feature. |
-| [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
+| [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 and BCP-004-02 capability matching, BCP-002-01 natural groups, the registry checker's 32 rules (with what IS-11, IS-08 and IS-09 APIs report), and the crosspoint matrix of which Senders each Receiver can take. The Query API client is the optional `client` feature. |
+| [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client, the controller that makes salvos and rolls them back, IS-11 Sender constraints and IS-08 channel maps are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps, and daily-jam time code with colour framing and the ST 309 date. `serde` is an optional feature. |
 | [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 55 rules, with ST 2022-7 pairs measured merged. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
@@ -71,6 +71,13 @@ $ st2110 nmos http://registry.example:8080
 http://registry.example:8080/x-nmos/query/v1.3/ (IS-04 v1.3)
   2 nodes, 2 devices, 2 sources, 2 flows, 2 senders (2 active), 2 receivers (2 active)
   PTP: 1 clock locked to 08-00-11-ff-fe-21-e1-b0; 1 clock unlocked
+nodes:
+  "Camera 1" (a0de0001)
+    eth0 c8-00-84-10-00-01 → switch a4-6c-2a-00-0a-00 port Ethernet1/1
+    eth1 c8-00-84-10-00-02 → switch a4-6c-2a-00-0b-00 port Ethernet1/1
+  "Monitor 1" (a0de0002)
+    eth0 c8-00-84-10-01-01 → switch a4-6c-2a-00-0a-00 port Ethernet1/2
+    eth1 c8-00-84-10-01-02 → switch a4-6c-2a-00-0b-00 port Ethernet1/2
 senders:
   "CAM 1 audio" (5e0d0002) on Camera 1: active, rtp.mcast, audio/L24, 1 receiver
     stream 0 (line 5, ST 2110-30) 239.10.10.2:5006: L24 48 kHz, 8 channels (51,ST), 1 ms, level A, 9.22 Mb/s
@@ -93,6 +100,9 @@ registry: 1 error, 3 warnings, 0 notes
   - It pages through each collection and asks for resources registered at every version. It falls back when a registry answers 501 to either request, and reads every page of a registry that pages without being asked. It asks a v1.0 registry, which has neither, for each collection whole.
   - Where the registry returned older resources too, it reads each collection again without them, to learn which resources are at the version it reads through.
   - It reads each Sender's and Receiver's IS-05 `/active` parameters from its Device's Connection API, to compare them with the registry's `subscription`.
+  - Where a Device advertises an IS-11 Stream Compatibility Management API, it reads each Sender's and Receiver's `status`, and each Sender's active and supported constraints; the state is shown after each one, such as `IS-11 constrained to 1 constraint set`. Where a Device advertises an IS-08 Channel Mapping API, it reads `/io` and `/map/active`, and lists the map under `channel maps:` with channels counted from 1, as `Speakers (out1): 1 ← in1:2, 2 silent`.
+- Each Node is listed with its interfaces: the LLDP port ID it sends and, where it says (TR-1001-1), the switch and port it is plugged into.
+- `--system=URL` also reads an IS-09 System API's `/global`, or `--system` alone finds one by DNS-SD (`_nmos-system._tcp`). It shows the PTP domain, announce timeout and heartbeat interval every Node is to use, and checks each Sender's `a=ts-refclk` domain against it.
   - It goes through the proxy in `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` unless `NO_PROXY` names the host, and checks HTTPS certificates against the system's trust store.
 - `--save FILE` keeps what it read as a JSON snapshot. `st2110 nmos FILE` checks a snapshot again without the network, and `-` reads one from standard input.
 - `--no-sdp` skips the SDP files, and `--timeout` sets the seconds allowed for each response (5 by default).
@@ -163,6 +173,19 @@ sender "CAM 1 video" (5e0d0001) on: done at 2026-10-20 12:00:02.113542817 UTC
   leg 2: to 239.20.1.9:5004
 $ st2110 connect http://127.0.0.1:8110 --sender "CAM 1 audio" --disable
 sender "CAM 1 audio" (5e0d0002) off: done at 2026-10-20 12:00:04.832702143 UTC
+```
+
+- An IS-07 event Receiver (`websocket` or `mqtt`) taken to a registered Sender is told where the Sender's events are, from the Sender's `/active`: its `connection_uri` over WebSocket, or its broker and `broker_topic` over MQTT, with the other parameters the Receiver's constraints list. It is sent no SDP file, and refused one. Its `caps.event_types` are checked against the Flow's `event_type`, `*` wildcards and all.
+- `--sender` with `--constrain-for RECEIVER` (once for each Receiver) holds the Sender to what those Receivers can all take, through its Device's IS-11 Stream Compatibility Management API. It reads the Sender's `/constraints/supported`, combines the Receivers' enabled BCP-004-01 constraint sets with each other and with the Sender's own BCP-004-02 capabilities, leaves out the constraints the Sender cannot be held to (and says which), `PUT`s the sets to `/constraints/active` and shows the Sender's IS-11 state after. `--unconstrain` takes them away. A Device may refuse while the Sender is sending; turn it off first.
+- `--device` with `--map OUT:CH=IN:CH` (once for each channel, counted from 1, each Output and Input named by its id or name; `OUT:CH=-` for silence) changes a Device's IS-08 audio channel map. The routes are checked against the Device's `/io` first: the channels exist, and the Output can take the Input (`routable_inputs`). It takes effect at once and is checked on `/map/active`, or is left scheduled with its activation id when `--at` or `--in` says when. A Device refuses a map while another activation waits on the same Outputs; `--device` with `--cancel` cancels those.
+
+```console
+$ st2110 connect http://127.0.0.1:8110 --sender "CAM 1 video" --constrain-for "MON 1 video" --constrain-for "MON 2 video"
+sender "CAM 1 video" (5e0d0001) held to 1 constraint set: done, now constrained
+  set 1: frame_width 1920, frame_height 1080, grain_rate 50
+$ st2110 connect http://127.0.0.1:8110 --device "Monitor 1" --map Speakers:1=mic:2 --map Speakers:2=mic:1
+device "Monitor 1" (de710002) map: done
+  out1: 1 ← in1:2, 2 ← in1:1
 ```
 
 - TARGET may also be a snapshot saved with `st2110 nmos --save`, when the registry is out of reach; the registry check is then skipped.
@@ -470,6 +493,9 @@ It reads SDP only, so it cannot confirm that a sender does what its SDP says; `s
 | PTP | Unlocked clocks, locked clocks that follow different grandmasters (unless both are traceable to TAI), and a Sender whose `a=ts-refclk` disagrees with its Source's clock |
 | Tags | BCP-002-01 `grouphint` values that are not `<group>:<role>[:<scope>]`, and two Senders or two Receivers with one role in one group; Nodes and Devices that give BCP-002-02 asset tags but not the Manufacturer, Product Name and Instance Identifier (and a Device's Function), or give the same three as another |
 | Connections | Subscriptions that contradict `active`, or the IS-05 `/active` parameters (`master_enable`, `sender_id`, `receiver_id`); active Receivers taking from an inactive Sender; Receivers whose BCP-004-01 `caps` reject what their Sender sends, and constraint sets without `caps.version` or with nothing but `meta` attributes in them |
+| Capabilities | BCP-004-02 Sender `caps`: `caps.version` with `constraint_sets`, no empty sets, and a stream the Sender's own sets accept; IS-07 `event_types` against the Flow's `event_type` |
+| Control APIs | IS-11 Senders in `active_constraints_violation` or `no_essence` and active Receivers in `non_compliant_stream`, active constraints the Sender's `/constraints/supported` leaves out or its stream breaks; IS-08 active maps that name Outputs, Inputs or channels `/io` does not have, or route an Input an Output's `routable_inputs` leave out |
+| System | With `--system`, an IS-09 System API that cannot be read or gives a heartbeat interval, PTP domain or announce timeout out of range, and Senders whose `a=ts-refclk` domain is not the system's. IS-04 Nodes do not report their heartbeat interval, so it is shown but not compared |
 | SDP files | Each Sender's `manifest_href` and whether it answers, every SDP rule above, one interface binding per stream, multicast or unicast addresses to match the transport, the file against the Flow, Source and Sender attributes that the NMOS capabilities register maps to SDP (with BCP-006-01's JPEG XS `profile`, `level` and `sublevel`, which a Flow leaves out for Unrestricted), and against the one its Connection API serves at `/transportfile` |
 
 It reads resources registered at any IS-04 version from v1.0 to v1.3. It holds a resource to the schema of the version it reads through when the registry says the resource is at that version, by returning it without a downgrade query, or when it reads a Node's own API; otherwise it reports an attribute as missing only when every version that could have registered the resource requires it.
