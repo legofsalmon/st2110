@@ -3,14 +3,16 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 
 use st2110_ptp::Message;
+use st2110_sdp::Essence;
 
 use crate::capture::{CaptureError, Format, Frame, Reader};
 use crate::flow::{Flow, Key, RtpPacket, SdpStream};
 use crate::net::{self, Packet};
 use crate::ptp::Monitor;
-use crate::report::{Capture, Finding, Report, TimescaleReport};
+use crate::report::{Capture, Finding, FlowReport, RelativeReport, Report, TimescaleReport};
 use crate::stats::NANOS;
 use crate::timescale::{Decision, Detector};
 use crate::{FLOW_LIMIT, Options, Timeline, plural, rules};
@@ -29,14 +31,11 @@ enum Event {
         t: i128,
         key: Key,
         packet: RtpPacket,
+        /// The whole RTP packet, for a stream whose payloads are read.
+        bytes: Option<Box<[u8]>>,
     },
     /// `layer2` when the message came over Ethernet rather than UDP.
-    Ptp {
-        t: i128,
-        from: String,
-        layer2: bool,
-        message: Box<Message>,
-    },
+    Ptp { t: i128, from: String, layer2: bool, message: Box<Message> },
 }
 
 impl Event {
@@ -67,7 +66,7 @@ impl Running {
     fn event(&mut self, event: Event) {
         let shift = self.decision.shift;
         match event {
-            Event::Rtp { t, key, packet } => {
+            Event::Rtp { t, key, packet, bytes } => {
                 let i = match self.index.get(&key) {
                     Some(&i) => i,
                     None if self.flows.len() >= FLOW_LIMIT => {
@@ -84,7 +83,7 @@ impl Running {
                         self.flows.len() - 1
                     }
                 };
-                self.flows[i].push(t + shift, packet);
+                self.flows[i].push(t + shift, packet, bytes.as_deref());
             }
             Event::Ptp { t, from, layer2, message } => self.ptp.push(t + shift, &from, layer2, &message),
         }
@@ -151,7 +150,15 @@ impl Analyser {
                     }
                 } else if let Some(packet) = RtpPacket::read(&d) {
                     c.rtp += 1;
-                    Event::Rtp { t, key: (d.source, d.destination), packet }
+                    let key = (d.source, d.destination);
+                    let streams = match (&self.running, &self.detector) {
+                        (Some(running), _) => &running.sdp[..],
+                        (None, Some((_, _, sdp))) => &sdp[..],
+                        (None, None) => &[][..],
+                    };
+                    let reads = SdpStream::find(streams, key).is_some_and(|i| streams[i].reads_payloads());
+                    let bytes = (reads && d.complete()).then(|| d.payload.into());
+                    Event::Rtp { t, key, packet, bytes }
                 } else {
                     return;
                 }
@@ -185,9 +192,11 @@ impl Analyser {
         }
         let (detector, events, sdp) = self.detector.as_mut().expect("deciding until running");
         match &event {
-            Event::Rtp { t, key, packet } => {
-                let rate = SdpStream::find(sdp, *key).and_then(|i| sdp[i].clock_rate());
-                detector.rtp(*t, *key, packet.header.timestamp, rate);
+            Event::Rtp { t, key, packet, .. } => {
+                let stream = SdpStream::find(sdp, *key).map(|i| &sdp[i]);
+                let rate = stream.and_then(SdpStream::clock_rate);
+                let offset = stream.map_or(0, SdpStream::audio_offset);
+                detector.rtp(*t, *key, packet.header.timestamp.wrapping_sub(offset), rate);
             }
             Event::Ptp { t, message, .. } => detector.ptp(*t, message),
         }
@@ -230,6 +239,7 @@ impl Analyser {
             flows.push(report);
             findings.extend(more);
         }
+        relate(&mut flows);
         if capture.fragments > 0 && !fragmented_flows {
             // Later fragments whose first fragment the capture missed.
             findings.insert(
@@ -282,6 +292,64 @@ pub fn analyse(input: impl Read, options: &Options) -> Result<Report, CaptureErr
         }
     }
     Ok(analyser.finish(error))
+}
+
+/// Lines each audio and ancillary data flow up with a video flow, as RP 2110-25:2023
+/// §4.11.4, §4.12.4 and §4.12.5 measure them: against the video from the same sender,
+/// or else the first video in the capture.
+fn relate(flows: &mut [FlowReport]) {
+    /// A video flow, as the others are lined up with it.
+    struct Video {
+        index: usize,
+        sender: Option<IpAddr>,
+        latency: Option<f64>,
+        rtp_offset: Option<f64>,
+        /// A frame, in ticks of the 90 kHz clock.
+        frame: Option<f64>,
+    }
+    let sender = |flow: &FlowReport| flow.source.parse::<SocketAddr>().ok().map(|a| a.ip());
+    let videos: Vec<Video> = flows
+        .iter()
+        .filter(|f| matches!(f.essence, Essence::Video | Essence::CompressedVideo))
+        .filter_map(|f| {
+            let v = f.video.as_ref()?;
+            let frame = v
+                .frame_rate
+                .as_deref()
+                .and_then(|r| st2110_sdp::parse_frame_rate(r).ok())
+                .map(|(r, _)| 90_000.0 * r.denominator() as f64 / r.numerator() as f64);
+            Some(Video {
+                index: f.index,
+                sender: sender(f),
+                latency: v.latency.map(|s| s.mean),
+                rtp_offset: v.rtp_offset.map(|s| s.mean),
+                frame,
+            })
+        })
+        .collect();
+    let Some(first) = videos.first() else { return };
+    for flow in flows.iter_mut() {
+        let (latency, offset) = match (flow.essence, &flow.video, &flow.audio) {
+            (Essence::Ancillary, Some(anc), _) => (anc.latency.map(|s| s.mean), anc.rtp_offset.map(|s| s.mean)),
+            (Essence::Audio | Essence::Aes3, _, Some(audio)) => (audio.latency.map(|s| s.mean), None),
+            _ => continue,
+        };
+        let from = sender(flow);
+        let video = videos.iter().find(|v| v.sender.is_some() && v.sender == from).unwrap_or(first);
+        // RP 2110-25 NOTE 1: brought within half a frame.
+        let rtp_offset = offset.zip(video.rtp_offset).map(|(anc, video_offset)| {
+            let difference = video_offset - anc;
+            match video.frame.filter(|&frame| frame > 0.0) {
+                Some(frame) => difference - frame * (difference / frame).round(),
+                None => difference,
+            }
+        });
+        flow.relative = Some(RelativeReport {
+            video: video.index,
+            differential_latency_us: latency.zip(video.latency).map(|(own, video)| own - video),
+            rtp_offset,
+        });
+    }
 }
 
 /// A MAC address, as `02:00:00:00:00:01`.

@@ -600,6 +600,18 @@ export interface FlowReport {
   duplicates: number;
   video: VideoReport | null;
   audio: AudioReport | null;
+  /** For audio and ancillary data, how it lines up with a video flow. */
+  relative: RelativeReport | null;
+}
+
+/** RP 2110-25 measurements of an audio or ancillary data flow against a video flow. */
+export interface RelativeReport {
+  /** The video flow, by its index. */
+  video: number;
+  /** AVDL or ANC VDL: this flow's mean latency less the video's, in microseconds. */
+  differential_latency_us: number | null;
+  /** RRTPOFFSET, for ancillary data: in 90 kHz ticks, within half a frame. */
+  rtp_offset: number | null;
 }
 
 export interface MessageCount {

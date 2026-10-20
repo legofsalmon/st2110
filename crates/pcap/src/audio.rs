@@ -218,11 +218,29 @@ impl AudioEngine {
         );
         let mut ts_df = Accumulator::default();
         let mut over = Tally::default();
+        let mut beyond = Tally::default();
+        // AES67's limit for senders: under 17 packet times or 17 ms, whichever is smaller.
+        let ceiling = packet_time_us.map(|us| (17.0 * us).min(17_000.0));
         for &(start, value) in &self.delay_factors {
             ts_df.add(value);
             if packet_time_us.is_some_and(|limit| value > limit) {
                 over.hit_max(start, value);
             }
+            if ceiling.is_some_and(|limit| value >= limit) {
+                beyond.hit_max(start, value);
+            }
+        }
+        if let (Some(limit), Some(us)) = (ceiling, packet_time_us) {
+            add(
+                &rules::TS_DF_LIMIT,
+                &beyond,
+                format!(
+                    "TS-DF reached {:.1} µs in {} of {} 200 ms windows, not under the {limit:.1} µs that AES67 allows a sender with a packet time of {us:.1} µs",
+                    beyond.worst.unwrap_or_default(),
+                    beyond.count,
+                    self.delay_factors.len()
+                ),
+            );
         }
         if let Some(limit) = packet_time_us {
             add(

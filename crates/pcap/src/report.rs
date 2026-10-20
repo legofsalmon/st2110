@@ -134,6 +134,23 @@ pub struct FlowReport {
     pub video: Option<VideoReport>,
     /// Audio measurements.
     pub audio: Option<AudioReport>,
+    /// For audio and ancillary data, how it lines up with a video flow.
+    pub relative: Option<RelativeReport>,
+}
+
+/// RP 2110-25 measurements of an audio or ancillary data flow against a video flow: the
+/// one from the same sender, or else the first video flow in the capture.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RelativeReport {
+    /// The video flow, by [`FlowReport::index`].
+    pub video: usize,
+    /// AVDL (§4.11.4) or ANC VDL (§4.12.4): this flow's mean latency less the video's,
+    /// in microseconds. Negative when the video's latency is higher.
+    pub differential_latency_us: Option<f64>,
+    /// RRTPOFFSET (§4.12.5), for ancillary data: the video's mean RTP offset less this
+    /// flow's, in ticks of the 90 kHz clock, brought within half a frame.
+    pub rtp_offset: Option<f64>,
 }
 
 /// RP 2110-25 measurements of ST 2110-20, -22 and -40 streams. Times are in

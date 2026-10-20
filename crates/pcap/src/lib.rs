@@ -11,7 +11,10 @@
 //!   RTP offset, latency and the gaps between frames) and runs the two ST 2110-21 timing
 //!   models, the network compatibility model (CINST) and the virtual receiver buffer (VRX);
 //! - for audio, measures latency, packet intervals and the timestamped delay factor of
-//!   EBU Tech 3337, and checks the packet time and channel count against the SDP file.
+//!   EBU Tech 3337, and checks the packet time and channel count against the SDP file;
+//! - for ancillary data, AES3, fast metadata and timed text with an SDP file, checks what
+//!   the payloads hold and the sending rules that need them read;
+//! - lines each audio and ancillary data flow up with a video flow, as RP 2110-25 does.
 //!
 //! PTP messages are decoded and checked against the ST 2059-2 profile, and followed
 //! across the capture: grandmaster changes, rival masters, message rates, and Sync and
@@ -39,6 +42,7 @@
 mod analyser;
 mod audio;
 pub mod capture;
+mod data;
 mod flow;
 pub mod net;
 mod ptp;
@@ -53,7 +57,7 @@ pub use analyser::{Analyser, analyse};
 pub use capture::{CaptureError, Format, Frame, Reader};
 pub use report::{
     AudioReport, AudioWindow, Capture, CinstReport, Clock, Finding, FlowReport, MessageCount, PtpDomainReport,
-    PtpPortReport, PtpReport, Report, TimescaleReport, VideoReport, VideoWindow, VrxReport,
+    PtpPortReport, PtpReport, RelativeReport, Report, TimescaleReport, VideoReport, VideoWindow, VrxReport,
 };
 pub use stats::Stats;
 

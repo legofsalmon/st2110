@@ -175,9 +175,214 @@ pub fn anc_header(payload: &[u8]) -> Option<AncHeader> {
     })
 }
 
+/// The value of an RFC 8331 payload header's 22 reserved bits, which are 0.
+pub fn anc_reserved(payload: &[u8]) -> Option<u32> {
+    let b = payload.get(5..8)?;
+    Some(u32::from(b[0] & 0x3F) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))
+}
+
+/// The Line_Number that RFC 8331 §2.1 reserves for a packet with no line given, and the
+/// one for any line from two after the switching line to the last before active video.
+pub const ANC_ANY_LINE: u16 = 0x7FF;
+/// See [`ANC_ANY_LINE`].
+pub const ANC_VANC_LINE: u16 = 0x7FE;
+/// The Line_Number of a line too high for 11 bits.
+pub const ANC_HIGH_LINE: u16 = 0x7FD;
+/// Horizontal_Offset values from this one up name a region, not an offset.
+pub const ANC_REGION_OFFSET: u16 = 0xFFC;
+
+/// One SMPTE ST 291-1 ANC data packet in an RFC 8331 payload, its words as they arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AncPacket {
+    /// C: the colour-difference data channel, rather than luma.
+    pub chroma: bool,
+    /// The digital interface line, or one of the codes from [`ANC_HIGH_LINE`] up.
+    pub line: u16,
+    /// Words from SAV, or one of the codes from [`ANC_REGION_OFFSET`] up.
+    pub horizontal: u16,
+    /// StreamNum, when the S bit says one is given.
+    pub stream: Option<u8>,
+    /// The 10-bit DID word.
+    pub did: u16,
+    /// The 10-bit SDID word, or DBN of a Type 1 packet.
+    pub sdid: u16,
+    /// The 10-bit Data_Count word.
+    pub data_count: u16,
+    /// The user data words.
+    pub user_data: Vec<u16>,
+    /// The 10-bit checksum word.
+    pub checksum: u16,
+}
+
+impl AncPacket {
+    /// Whether the packet proposes an exact line or data stream, which ST 2110-40:2023
+    /// §5.2.2 says needs a `VPID_Code`: a Line_Number other than 0x7FE and 0x7FF, or a
+    /// stream number.
+    pub fn exact_location(&self) -> bool {
+        !matches!(self.line, ANC_VANC_LINE | ANC_ANY_LINE) || self.stream.is_some()
+    }
+
+    /// What is wrong with its words, by ST 291-1:2011 §6 and RFC 8331 §2.1: b8 of the
+    /// DID, SDID or DBN, and Data_Count is the even parity of b7 to b0, b9 is NOT b8, and
+    /// the checksum is the 9-bit sum of the words from the DID to the last user data
+    /// word, with its b9 NOT b8.
+    pub fn word_problem(&self) -> Option<String> {
+        for (name, word) in [("DID", self.did), ("SDID", self.sdid), ("Data_Count", self.data_count)] {
+            if !parity_word(word) {
+                return Some(format!("its {name} word {word:#05X} has the wrong parity bits"));
+            }
+        }
+        let sum = [self.did, self.sdid, self.data_count]
+            .iter()
+            .chain(&self.user_data)
+            .fold(0_u16, |sum, word| sum.wrapping_add(word & 0x1FF))
+            & 0x1FF;
+        let expected = sum | if sum & 0x100 == 0 { 0x200 } else { 0 };
+        (self.checksum != expected)
+            .then(|| format!("its checksum word is {:#05X}, not the {expected:#05X} its words sum to", self.checksum))
+    }
+
+    /// The DID and the SDID as `DID_SDID` names them: a Type 1 packet, whose DID has b7
+    /// set, has a DBN in place of the SDID and is listed with SDID 0x00 (RFC 8331 §3.1).
+    pub fn type_id(&self) -> (u8, u8) {
+        let did = (self.did & 0xFF) as u8;
+        (did, if did & 0x80 != 0 { 0 } else { (self.sdid & 0xFF) as u8 })
+    }
+}
+
+/// A 10-bit word whose b8 is the even parity of b7 to b0 and whose b9 is NOT b8.
+fn parity_word(word: u16) -> bool {
+    let b8 = (word & 0xFF).count_ones() % 2 == 1;
+    (word & 0x100 != 0) == b8 && (word & 0x200 != 0) != b8
+}
+
+/// Reads `count` ANC data packets from `data`, the RFC 8331 payload after its 8-octet
+/// header, as far as the Length field counts. Each packet starts on a 32-bit word and
+/// ends with the bits that complete its last word. `Err` says how the packets fail to
+/// fill `data` exactly.
+pub fn anc_packets(data: &[u8], count: u8) -> Result<Vec<AncPacket>, String> {
+    let mut bits = Bits { data, at: 0 };
+    let mut packets = Vec::with_capacity(usize::from(count));
+    for n in 1..=count {
+        let packet = (|| {
+            let chroma = bits.read(1)? == 1;
+            let line = bits.read(11)? as u16;
+            let horizontal = bits.read(12)? as u16;
+            let given = bits.read(1)? == 1;
+            let stream = bits.read(7)? as u8;
+            let did = bits.read(10)? as u16;
+            let sdid = bits.read(10)? as u16;
+            let data_count = bits.read(10)? as u16;
+            let user_data = (0..data_count & 0xFF).map(|_| bits.read(10).map(|w| w as u16)).collect::<Option<_>>()?;
+            let checksum = bits.read(10)? as u16;
+            bits.align()?;
+            Some(AncPacket {
+                chroma,
+                line,
+                horizontal,
+                stream: given.then_some(stream),
+                did,
+                sdid,
+                data_count,
+                user_data,
+                checksum,
+            })
+        })();
+        match packet {
+            Some(packet) => packets.push(packet),
+            None => return Err(format!("ANC packet {n} of {count} runs past the {} octets of data", data.len())),
+        }
+    }
+    let used = bits.at / 8;
+    if used != data.len() {
+        return Err(format!("the ANC packets fill {used} of its {} octets", data.len()));
+    }
+    Ok(packets)
+}
+
+/// Reads bits, most significant first.
+struct Bits<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl Bits<'_> {
+    fn read(&mut self, n: usize) -> Option<u32> {
+        if self.at + n > self.data.len() * 8 {
+            return None;
+        }
+        let mut value = 0;
+        for _ in 0..n {
+            let bit = self.data[self.at / 8] >> (7 - self.at % 8) & 1;
+            value = value << 1 | u32::from(bit);
+            self.at += 1;
+        }
+        Some(value)
+    }
+
+    /// Skips to the next 32-bit word, if the bits that complete this one are there.
+    fn align(&mut self) -> Option<()> {
+        let to = self.at.div_ceil(32) * 32;
+        (to <= self.data.len() * 8).then(|| self.at = to)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 10-bit word: the octet with its parity bits.
+    fn word(value: u8) -> u16 {
+        let b8 = u16::from(value.count_ones() % 2 == 1);
+        u16::from(value) | b8 << 8 | (b8 ^ 1) << 9
+    }
+
+    /// Packs the header and words of one ANC packet, word-aligned.
+    fn pack(header: u32, words: &[u16]) -> Vec<u8> {
+        let mut bits: Vec<bool> = (0..32).rev().map(|i| header >> i & 1 == 1).collect();
+        for w in words {
+            bits.extend((0..10).rev().map(|i| w >> i & 1 == 1));
+        }
+        bits.resize(bits.len().div_ceil(32) * 32, false);
+        bits.chunks(8).map(|byte| byte.iter().fold(0, |b, &bit| b << 1 | u8::from(bit))).collect()
+    }
+
+    #[test]
+    fn reads_anc_packets() {
+        // A Type 2 packet on line 9 of the luma channel: DID 0x61, SDID 0x01, two words.
+        let (did, sdid, dc) = (word(0x61), word(0x01), word(2));
+        let udw = [word(0x96), word(0x69)];
+        let sum = [did, sdid, dc, udw[0], udw[1]].iter().fold(0, |s, w| s + (w & 0x1FF)) & 0x1FF;
+        let checksum = sum | if sum & 0x100 == 0 { 0x200 } else { 0 };
+        let data = pack(9 << 20 | 0xFFF << 8, &[did, sdid, dc, udw[0], udw[1], checksum]);
+        assert_eq!(data.len(), 12);
+        let packets = anc_packets(&data, 1).unwrap();
+        let p = &packets[0];
+        assert_eq!((p.chroma, p.line, p.horizontal, p.stream), (false, 9, 0xFFF, None));
+        assert_eq!((p.type_id(), p.user_data.len(), p.word_problem()), ((0x61, 0x01), 2, None));
+        assert!(p.exact_location());
+
+        let mut bad = p.clone();
+        bad.checksum ^= 1;
+        assert!(bad.word_problem().unwrap().starts_with("its checksum word is"));
+        bad.did = 0x061;
+        assert_eq!(bad.word_problem().as_deref(), Some("its DID word 0x061 has the wrong parity bits"));
+
+        // A Type 1 packet is listed with SDID 0x00, and 0x7FF with S set is still exact.
+        let mut type1 = p.clone();
+        (type1.did, type1.sdid, type1.line, type1.stream) = (word(0xE7), word(0x05), ANC_ANY_LINE, Some(0));
+        assert_eq!(type1.type_id(), (0xE7, 0x00));
+        assert!(type1.exact_location());
+        type1.stream = None;
+        assert!(!type1.exact_location());
+
+        assert_eq!(anc_packets(&data[..8], 1).unwrap_err(), "ANC packet 1 of 1 runs past the 8 octets of data");
+        let mut long = data.clone();
+        long.extend([0; 4]);
+        assert_eq!(anc_packets(&long, 1).unwrap_err(), "the ANC packets fill 12 of its 16 octets");
+        assert_eq!(anc_packets(&[], 0), Ok(Vec::new()));
+        assert_eq!(anc_reserved(&[0, 0, 0, 0, 1, 0x80, 0, 1]), Some(1));
+    }
 
     #[test]
     fn reads_the_jpeg_xs_payload_header() {
