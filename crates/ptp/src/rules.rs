@@ -27,7 +27,7 @@ rules! {
     PTP_DOMAIN = "ptp-domain", Error, "ST 2059-2:2021 §6.5.2",
         "`domainNumber` is 0 to 127, the range the profile allows; the default is 127.";
     ANNOUNCE_INTERVAL = "announce-interval", Error, "ST 2059-2:2021 §6.5.2",
-        "An Announce message's `logMessageInterval` is −3 (8 a second) to 1 (one every 2 s); the default is −2, 4 a second.";
+        "An Announce message's `logMessageInterval` is −3 (8 a second) to 1 (one every 2 s); the default is 0, one a second (−2 was the 2015 edition's default).";
     SYNC_INTERVAL = "sync-interval", Error, "ST 2059-2:2021 §6.5.2",
         "A Sync or Follow_Up message's `logMessageInterval` is −7 (128 a second) to −1 (2 a second); the default is −3, 8 a second.";
     DELAY_REQ_INTERVAL = "delay-req-interval", Error, "ST 2059-2:2021 §6.5.3",

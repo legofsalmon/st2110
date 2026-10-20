@@ -350,7 +350,13 @@ fn write_domain(out: &mut impl Write, domain: &PtpDomainReport) -> io::Result<()
         [one] => format!("grandmaster {one}"),
         many => format!("grandmasters {}", many.join(", ")),
     };
-    writeln!(out, "  PTP domain {}: {grandmasters}", domain.domain)?;
+    let profile = match (domain.sdo_id, domain.layer2) {
+        (0, false) => String::new(),
+        (0x100, true) => " (gPTP, IEEE 802.1AS)".to_string(),
+        (sdo, true) => format!(" (sdoId {sdo:#05x}, over Ethernet)"),
+        (sdo, false) => format!(" (sdoId {sdo:#05x})"),
+    };
+    writeln!(out, "  PTP domain {}{profile}: {grandmasters}", domain.domain)?;
     for port in &domain.ports {
         let messages: Vec<String> = port
             .messages

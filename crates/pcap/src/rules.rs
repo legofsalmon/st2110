@@ -39,7 +39,7 @@ rules! {
         "A UDP datagram is at most 1460 octets, the Standard UDP Size Limit, or the `MAXUDP` that the SDP file signals, at most 8960.";
 
     // Video and ancillary data.
-    MARKER_BIT = "marker-bit", Error, "ST 2110-20:2022 §6.1 · RFC 8331 §2.1",
+    MARKER_BIT = "marker-bit", Error, "ST 2110-20:2022 §6.1 · RFC 8331 §2.1 · RFC 9134 §4.2",
         "The marker bit is set on the last packet of each frame, or of each field of interlaced video, and on no other packet.";
     RTP_ALIGNMENT = "rtp-alignment", Warning, "ST 2110-10:2022 §7.6 · ST 2059-1:2021",
         "Video and ancillary data timestamps fall on frame boundaries (field boundaries, for interlaced video) counted from the SMPTE Epoch and truncated to the 90 kHz clock.";
@@ -55,6 +55,8 @@ rules! {
         "Every packet arrives no later than its read time on the schedule that `TP` and `TROFF` give.";
     FRAME_PACKETS = "frame-packets", Error, "ST 2110-22:2022 §4",
         "Compressed video sends the same number of packets for every frame.";
+    JXS_PAYLOAD_HEADER = "jxs-payload-header", Error, "RFC 9134 §4.3",
+        "JPEG XS payload headers keep T and K for the whole stream, set L with M (and equal to it in codestream mode), use no reserved I value, and mark fields only in interlaced video.";
 
     // Audio.
     PACKET_TIME = "packet-time", Error, "ST 2110-30:2025 §6.2.1 · RFC 8866 §6.4",

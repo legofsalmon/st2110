@@ -361,6 +361,7 @@ impl Flow {
                 marker: h.marker,
                 video: (kind == VideoKind::Uncompressed).then(|| rtp::video_header(head)).flatten(),
                 anc: (kind == VideoKind::Ancillary).then(|| rtp::anc_header(head).map(|a| a.field)).flatten(),
+                jxs: (kind == VideoKind::Compressed).then(|| rtp::jxs_header(head)).flatten(),
             });
         }
         if let Some(audio) = &mut self.audio {
@@ -368,9 +369,19 @@ impl Flow {
         }
     }
 
-    /// ST 2110-10's limit on UDP datagrams, in octets.
+    /// ST 2110-10's limit on UDP datagrams, in octets. ST 2110-30 PCM audio (§6.2.1) and
+    /// ST 2110-40 ancillary data (§5.2.1) keep to the standard limit whatever `MAXUDP` says.
     fn udp_limit(&self) -> u32 {
-        self.sdp.as_ref().and_then(|s| s.maxudp).map_or(1460, |m| m.min(8960))
+        let Some(sdp) = &self.sdp else { return 1460 };
+        let standard_only = match sdp.essence {
+            Essence::Ancillary => true,
+            Essence::Audio => !sdp.encoding.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("AM824")),
+            _ => false,
+        };
+        if standard_only {
+            return 1460;
+        }
+        sdp.maxudp.map_or(1460, |m| m.min(8960))
     }
 
     pub(crate) fn finish(mut self, timeline: &Timeline) -> (FlowReport, Vec<Finding>) {
@@ -729,6 +740,21 @@ impl SeqTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_audio_and_anc_keep_to_the_standard_udp_limit() {
+        let fixture = |name: &str, extra: &str| {
+            let path = format!("{}/../sdp/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(path).unwrap().replace("TSMODE=SAMP", &format!("TSMODE=SAMP{extra}"));
+            SdpStream::read(&[crate::SdpFile { name: name.into(), text }]).remove(0)
+        };
+        let key: Key = ("192.168.10.21:5004".parse().unwrap(), "239.10.10.1:5004".parse().unwrap());
+        let limit = |sdp| Flow::new(0, key, Some(sdp), true).udp_limit();
+        assert_eq!(limit(fixture("audio-pcm.sdp", "; MAXUDP=8960")), 1460);
+        assert_eq!(limit(fixture("anc.sdp", ";MAXUDP=8960")), 1460);
+        assert_eq!(limit(fixture("video-dup.sdp", "; MAXUDP=8960")), 8960);
+        assert_eq!(limit(fixture("video-dup.sdp", "")), 1460);
+    }
 
     #[test]
     fn counts_loss_and_disorder() {

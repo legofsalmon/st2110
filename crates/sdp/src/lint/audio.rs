@@ -58,7 +58,7 @@ pub(super) fn check_pcm(m: &Media<'_>, d: &mut Diagnostics) {
         };
         d.report(&rules::AUDIO_LEVEL, m.index, line, message);
     }
-    packet_size(m, line, samples_per_packet(rate, ms), channels, bytes_per_sample, d);
+    packet_size(m, line, samples_per_packet(rate, ms), channels, bytes_per_sample, true, d);
 }
 
 pub(super) fn check_aes3(m: &Media<'_>, d: &mut Diagnostics) {
@@ -127,7 +127,7 @@ pub(super) fn check_aes3(m: &Media<'_>, d: &mut Diagnostics) {
         )
         .cite("ST 2110-31:2022 Table 3");
     }
-    packet_size(m, line, samples, n, 4, d);
+    packet_size(m, line, samples, n, 4, false, d);
 }
 
 fn sample_rate(m: &Media<'_>, line: usize, rate: u32, reference: &'static str, d: &mut Diagnostics) -> bool {
@@ -171,9 +171,31 @@ fn packet_time<'a>(m: &Media<'a>) -> Option<(usize, &'a str, Option<f64>)> {
     Some((attr.line, text, ms))
 }
 
-fn packet_size(m: &Media<'_>, line: usize, samples: u32, channels: u16, bytes_per_sample: u32, d: &mut Diagnostics) {
+/// Checks one packet's payload against the UDP size limit. ST 2110-30 PCM keeps to the
+/// standard limit whatever `MAXUDP` says (§6.2.1); ST 2110-31 may use the extended one.
+fn packet_size(
+    m: &Media<'_>,
+    line: usize,
+    samples: u32,
+    channels: u16,
+    bytes_per_sample: u32,
+    standard_only: bool,
+    d: &mut Diagnostics,
+) {
     let payload = u64::from(samples) * u64::from(channels) * u64::from(bytes_per_sample);
-    let maxudp = m.maxudp();
+    let maxudp = if standard_only {
+        if let Some(octets) = m.maxudp().filter(|&o| o > 1460) {
+            d.report(
+                &rules::MAXUDP_STANDARD_ONLY,
+                m.index,
+                line,
+                format!("MAXUDP={octets}, but ST 2110-30 audio uses the standard 1460-octet UDP size limit"),
+            );
+        }
+        None
+    } else {
+        m.maxudp()
+    };
     let limit = payload_limit(maxudp);
     if payload > u64::from(limit) {
         d.report(

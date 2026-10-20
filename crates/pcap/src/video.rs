@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 use st2110_sdp::{Rational, Rule};
 
 use crate::report::{CinstReport, Finding, VideoReport, VideoWindow, VrxReport};
-use crate::rtp::{AncField, VideoHeader};
+use crate::rtp::{AncField, JxsHeader, JxsScan, VideoHeader};
 use crate::rules;
 use crate::stats::{Accumulator, NANOS, Seconds, Tally};
 use crate::{Timeline, plural};
@@ -107,11 +107,14 @@ pub(crate) struct Arrival {
     pub marker: bool,
     pub video: Option<VideoHeader>,
     pub anc: Option<AncField>,
+    pub jxs: Option<JxsHeader>,
 }
 
 impl Arrival {
     fn second_field(&self) -> bool {
-        self.video.is_some_and(|v| v.second_field) || self.anc == Some(AncField::Second)
+        self.video.is_some_and(|v| v.second_field)
+            || self.anc == Some(AncField::Second)
+            || self.jxs.is_some_and(|j| j.scan == JxsScan::Second)
     }
 
     /// Whether the payload header shows the packet starts a frame: its first row
@@ -196,6 +199,11 @@ pub(crate) struct VideoEngine {
     future: Tally,
     late: Tally,
     packets_vary: Tally,
+    /// The T and K bits of the first JPEG XS packet, which every packet repeats.
+    jxs_mode: Option<(bool, bool)>,
+    jxs_wrong: Tally,
+    /// What the first JPEG XS payload header found wrong said.
+    jxs_problem: Option<String>,
 }
 
 /// The largest frame rate numerator and denominator, and NPACKETS, that the timing and
@@ -239,6 +247,9 @@ impl VideoEngine {
             future: Tally::default(),
             late: Tally::default(),
             packets_vary: Tally::default(),
+            jxs_mode: None,
+            jxs_wrong: Tally::default(),
+            jxs_problem: None,
         }
     }
 
@@ -246,6 +257,9 @@ impl VideoEngine {
     pub(crate) fn push(&mut self, a: Arrival) {
         if a.second_field() {
             self.saw_second_field = true;
+        }
+        if let Some(j) = a.jxs {
+            self.check_jxs(&a, j);
         }
         if let Some(v) = a.video {
             self.max_row = self.max_row.max(Some(v.row));
@@ -263,6 +277,47 @@ impl VideoEngine {
         self.process(a);
     }
 
+    /// Checks an RFC 9134 payload header (§4.3) against the stream's own and the SDP file's.
+    fn check_jxs(&mut self, a: &Arrival, j: JxsHeader) {
+        let mode = (j.sequential, j.slice_mode);
+        let first = *self.jxs_mode.get_or_insert(mode);
+        let problem = if j.scan == JxsScan::Reserved {
+            Some("I=01, which RFC 9134 reserves".to_string())
+        } else if mode != first {
+            Some(format!(
+                "T={} K={} changed from T={} K={}, which stay the same for the whole stream",
+                u8::from(mode.0),
+                u8::from(mode.1),
+                u8::from(first.0),
+                u8::from(first.1)
+            ))
+        } else if !j.sequential && !j.slice_mode {
+            Some("T=0 (out of order) with K=0: out-of-order sending needs slice mode, K=1".to_string())
+        } else if !j.slice_mode && j.last != a.marker {
+            Some(format!(
+                "in codestream mode L ({}) and M ({}) are equal on every packet",
+                u8::from(j.last),
+                u8::from(a.marker)
+            ))
+        } else if a.marker && !j.last {
+            Some("M=1 without L=1: the end of a frame or field ends a packetization unit".to_string())
+        } else {
+            match (self.config.interlaced, j.scan) {
+                (Some(false), JxsScan::First | JxsScan::Second) => {
+                    Some("I marks a field, but the SDP file describes progressive video".to_string())
+                }
+                (Some(true), JxsScan::Progressive) if !self.config.segmented => {
+                    Some("I=00 (progressive), but the SDP file describes interlaced video".to_string())
+                }
+                _ => None,
+            }
+        };
+        if let Some(problem) = problem {
+            self.jxs_wrong.hit(a.t);
+            self.jxs_problem.get_or_insert(problem);
+        }
+    }
+
     /// Whether the video is interlaced: from the SDP file, or else from the field bits.
     fn interlaced(&self) -> bool {
         self.config.interlaced.unwrap_or(self.saw_second_field)
@@ -272,9 +327,10 @@ impl VideoEngine {
         self.config.segmented || (self.config.interlaced.is_none() && self.fields_share_timestamp)
     }
 
-    /// Whether each field carries its own timestamp, so that a unit is a field.
+    /// Whether each field carries its own timestamp, so that a unit is a field. Interlaced
+    /// JPEG XS stamps each field too (VSF TR-08:2026 §8.1.2.3).
     fn field_units(&self) -> bool {
-        self.interlaced() && !self.segmented() && self.kind != VideoKind::Compressed
+        self.interlaced() && !self.segmented()
     }
 
     /// Works out the frame rate from the held timestamps, then measures the held packets.
@@ -305,8 +361,10 @@ impl VideoEngine {
         }
     }
 
+    /// Whether the marker bit ends each unit. RFC 9134 §4.2 sets it on the last packet of
+    /// each JPEG XS frame or field, as ST 2110-20 does.
     fn checks_marker(&self) -> bool {
-        self.kind != VideoKind::Compressed && !self.segmented()
+        !self.segmented()
     }
 
     fn process(&mut self, a: Arrival) {
@@ -534,7 +592,7 @@ impl VideoEngine {
     }
 
     fn raster(&self) -> Raster {
-        Raster::new(self.interlaced() || self.segmented(), self.height())
+        Raster::new(self.interlaced() || self.segmented(), self.height(), self.rate)
     }
 
     /// The image height: from the SDP file, or else from the rows the payload headers
@@ -573,6 +631,15 @@ impl VideoEngine {
             format!(
                 "{} had the marker bit set but more packets of the same {unit_word} followed",
                 plural(self.marker_extra.count, "packet")
+            ),
+        );
+        add(
+            &rules::JXS_PAYLOAD_HEADER,
+            &self.jxs_wrong,
+            format!(
+                "{} had a payload header at odds with RFC 9134; the first: {}",
+                plural(self.jxs_wrong.count, "packet"),
+                self.jxs_problem.as_deref().unwrap_or_default()
             ),
         );
         add(
@@ -793,16 +860,21 @@ struct Raster {
 }
 
 impl Raster {
-    fn new(fields: bool, height: Option<u32>) -> Self {
+    fn new(fields: bool, height: Option<u32>, rate: Option<Rational>) -> Self {
         if !fields {
             let offset = if height.is_none_or(|h| h >= 1080) { (43, 1125) } else { (28, 750) };
             return Self { active: (1080, 1125), offset };
         }
         // The legacy ST 2110-21:2017 values for 525, 625 and 1125 lines, which ST 2110-21:2022
-        // Table 1 is meant to keep.
-        let lines = match height {
-            Some(h) if h <= 487 => 525,
-            Some(h) if h <= 576 => 625,
+        // Table 1 is meant to keep. SD is told apart by its frame rate where it is known, since
+        // Extended Window Mode carries up to 512 lines of 525-line video and 608 of 625-line
+        // (RP 2110-24 §4.3–4.4).
+        let sd_rate = rate.map(|r| (r.numerator(), r.denominator()));
+        let lines = match (height, sd_rate) {
+            (Some(h), Some((30_000, 1001))) if h <= 512 => 525,
+            (Some(h), Some((25, 1))) if h <= 608 => 625,
+            (Some(h), None) if h <= 487 => 525,
+            (Some(h), None) if h <= 576 => 625,
             _ => 1125,
         };
         match lines {
@@ -1117,7 +1189,7 @@ mod tests {
     fn schedules_reads() {
         // 1080p50, 40 packets a frame, gapped: TRS = 20 ms × 1080/1125 ÷ 40 = 480 µs,
         // TRODEFAULT = 43/1125 × 20 ms = 764.444… µs.
-        let raster = Raster::new(false, Some(1080));
+        let raster = Raster::new(false, Some(1080), None);
         let s = Schedule::new(rate(50, 1), 40, true, raster, false, None);
         let ns = |v: i128| v as f64 / s.scale as f64;
         assert!((ns(s.read(0, 0)) - 764_444.444).abs() < 0.001);
@@ -1128,7 +1200,7 @@ mod tests {
         assert_eq!(s.read(0, 0) / s.scale, 100_000);
         assert_eq!((s.read(0, 1) - s.read(0, 0)) / s.scale, 500_000);
         // 1080i50 gapped: the second field's reads start half a frame after the first's.
-        let raster = Raster::new(true, Some(1080));
+        let raster = Raster::new(true, Some(1080), Some(rate(25, 1)));
         let s = Schedule::new(rate(25, 1), 40, true, raster, true, None);
         assert_eq!(s.read(0, 20) - s.read(0, 0), s.frame / 2);
         assert!((s.offset as f64 / s.scale as f64 - 22.0 / 1125.0 * 40_000_000.0).abs() < 0.001);
@@ -1136,6 +1208,19 @@ mod tests {
         let tpa0 = 7 * 40_000_000 + 900_000;
         assert_eq!(s.frame_index(tpa0), 7);
         assert_eq!(s.frame_index(7 * 40_000_000 - 2_000_000), 7);
+    }
+
+    #[test]
+    fn extended_window_sd_keeps_its_line_system() {
+        // RP 2110-24 Extended Window Mode: 512 lines of 525-line video, 608 of 625-line.
+        let ntsc = Raster::new(true, Some(512), Some(rate(30_000, 1001)));
+        assert_eq!((ntsc.active, ntsc.offset), ((487, 525), (20, 525)));
+        let pal = Raster::new(true, Some(608), Some(rate(25, 1)));
+        assert_eq!((pal.active, pal.offset), ((576, 625), (26, 625)));
+        // 1080i at 25 frames a second is still 1125 lines.
+        assert_eq!(Raster::new(true, Some(1080), Some(rate(25, 1))).offset, (22, 1125));
+        // Without a rate, the height decides.
+        assert_eq!(Raster::new(true, Some(486), None).offset, (20, 525));
     }
 
     #[test]

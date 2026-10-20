@@ -33,6 +33,15 @@ pub(super) fn check_anc(m: &Media<'_>, d: &mut Diagnostics) {
         return;
     };
     params::check(m, line, fmtp, &ANC_NAMES, d);
+    if let Some(octets) = m.maxudp().filter(|&o| o > 1460) {
+        d.report(
+            &rules::MAXUDP_STANDARD_ONLY,
+            m.index,
+            line,
+            format!("MAXUDP={octets}, but ST 2110-40 ancillary data keeps to the standard 1460-octet UDP size limit"),
+        )
+        .cite("ST 2110-40:2023 §5.2.1");
+    }
     if fmtp.has("exactframerate") {
         super::exact_frame_rate(m, d, line, fmtp, ANC);
     } else {

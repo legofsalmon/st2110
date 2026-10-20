@@ -86,6 +86,53 @@ pub fn video_header(payload: &[u8]) -> Option<VideoHeader> {
     })
 }
 
+/// How a JPEG XS frame is scanned, and which picture segment a packet is part of: the I
+/// field of RFC 9134 §4.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JxsScan {
+    /// Progressive (00).
+    Progressive,
+    /// The value 01, reserved.
+    Reserved,
+    /// The first picture segment (field) of an interlaced frame (10).
+    First,
+    /// The second picture segment (11).
+    Second,
+}
+
+/// The RFC 9134 payload header that starts every ST 2110-22 JPEG XS packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JxsHeader {
+    /// T: packets are sent in order.
+    pub sequential: bool,
+    /// K: slice packetization mode, rather than codestream mode.
+    pub slice_mode: bool,
+    /// L: the last packet of a packetization unit.
+    pub last: bool,
+    /// I: progressive, or which field.
+    pub scan: JxsScan,
+    /// The frame number, modulo 32.
+    pub frame_counter: u8,
+}
+
+/// Reads the 4-octet payload header of RFC 9134 §4.3.
+pub fn jxs_header(payload: &[u8]) -> Option<JxsHeader> {
+    let b = *payload.first()?;
+    payload.get(3)?;
+    Some(JxsHeader {
+        sequential: b & 0x80 != 0,
+        slice_mode: b & 0x40 != 0,
+        last: b & 0x20 != 0,
+        scan: match (b >> 3) & 0b11 {
+            0b00 => JxsScan::Progressive,
+            0b01 => JxsScan::Reserved,
+            0b10 => JxsScan::First,
+            _ => JxsScan::Second,
+        },
+        frame_counter: ((b & 0b111) << 2) | (payload[1] >> 6),
+    })
+}
+
 /// Which field an ST 2110-40 packet's data belongs to: the F field of RFC 8331 §2.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AncField {
@@ -131,6 +178,17 @@ pub fn anc_header(payload: &[u8]) -> Option<AncHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_jpeg_xs_payload_header() {
+        // T=1 K=0 L=1 I=11 F=0b10110: 1011_1101 1000_0000, then SEP and P.
+        let h = jxs_header(&[0b1011_1101, 0b1000_0000, 0, 5]).unwrap();
+        assert!(h.sequential && !h.slice_mode && h.last);
+        assert_eq!(h.scan, JxsScan::Second);
+        assert_eq!(h.frame_counter, 0b10110);
+        assert_eq!(jxs_header(&[0x08, 0, 0, 0]).unwrap().scan, JxsScan::Reserved);
+        assert!(jxs_header(&[0, 0, 0]).is_none());
+    }
 
     #[test]
     fn reads_headers() {
