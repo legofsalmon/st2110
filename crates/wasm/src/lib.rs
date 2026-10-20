@@ -515,11 +515,23 @@ export interface VrxReport {
   troffset_us: number;
   troffset_signalled: boolean;
   vrxfull: number;
+  /** VRXPEAK. */
   peak: number;
+  /** VRXMIN: the least it held, just after a read. */
+  min: number | null;
+  /** VRXAVG: its mean level just before each read. */
+  average: number | null;
+  /** VRXMIN-SS and VRXAVG-SS, from each frame's first read to its last packet. */
+  steady_min: number | null;
+  steady_average: number | null;
+  /** VRXMIN-GAP: the least it held between frames. */
+  gap_min: number | null;
   underflows: number;
   overflows: number;
   /** From each packet's arrival to its read time. */
   margin_us: Stats | null;
+  /** Margin (RP 2110-25 §4.8.6): from each frame's first packet to its first read. */
+  frame_margin_us: Stats | null;
   method: string;
 }
 
@@ -532,6 +544,8 @@ export interface VideoWindow {
   gap: Stats | null;
   cinst: number | null;
   vrx: number | null;
+  vrx_min: number | null;
+  vrx_average: number | null;
 }
 
 /** RP 2110-25 measurements of video and ancillary data. Times are in microseconds, RTP
@@ -545,6 +559,8 @@ export interface VideoReport {
   units: number;
   packets_per_frame: Stats | null;
   npackets: number | null;
+  /** Octets of IP packets in each whole frame of compressed video. */
+  octets_per_frame: Stats | null;
   /** First packet time, from each frame's reference time. */
   fpt: Stats | null;
   rtp_offset: Stats | null;
@@ -600,6 +616,18 @@ export interface FlowReport {
   duplicates: number;
   video: VideoReport | null;
   audio: AudioReport | null;
+  /** For audio and ancillary data, how it lines up with a video flow. */
+  relative: RelativeReport | null;
+}
+
+/** RP 2110-25 measurements of an audio or ancillary data flow against a video flow. */
+export interface RelativeReport {
+  /** The video flow, by its index. */
+  video: number;
+  /** AVDL or ANC VDL: this flow's mean latency less the video's, in microseconds. */
+  differential_latency_us: number | null;
+  /** RRTPOFFSET, for ancillary data: in 90 kHz ticks, within half a frame. */
+  rtp_offset: number | null;
 }
 
 export interface MessageCount {

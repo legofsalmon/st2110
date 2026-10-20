@@ -129,6 +129,41 @@ fn jpeg_xs(m: &Media<'_>, line: usize, fmtp: &Fmtp, d: &mut Diagnostics) {
     {
         d.report(&rules::PARAM_VALUE, m.index, line, format!("transmode={value} is not 0 or 1")).cite("RFC 9134");
     }
+    tr08_profile(m, line, fmtp, d);
+}
+
+/// The profiles, levels, sublevels and depths that VSF TR-08:2026 §8.1.1 allows, as
+/// RFC 9134 writes them: without spaces.
+fn tr08_profile(m: &Media<'_>, line: usize, fmtp: &Fmtp, d: &mut Diagnostics) {
+    let mut report = |message: String| {
+        d.report(&rules::JXSV_PROFILE, m.index, line, message);
+    };
+    let is = |value: &str, names: &[&str]| names.iter().any(|name| name.eq_ignore_ascii_case(value));
+    let four_two_zero = fmtp.value("sampling").is_some_and(|s| s.ends_with("4:2:0"));
+    if let Some(profile) = fmtp.value("profile") {
+        if is(profile, &["High420.12"]) && !four_two_zero {
+            report(format!("profile={profile} carries 4:2:0 only; other sampling uses High444.12 or TDC444.12"));
+        } else if !is(profile, &["High444.12", "TDC444.12", "High420.12"]) {
+            report(format!("profile={profile}: TR-08 uses High444.12 or TDC444.12, or High420.12 for 4:2:0"));
+        }
+    }
+    if let Some(level) = fmtp.value("level")
+        && !is(level, &["1k-1", "2k-1", "4k-2", "8k-2"])
+    {
+        report(format!("level={level}: TR-08 uses 1k-1, 2k-1, 4k-2 or 8k-2"));
+    }
+    if let Some(sublevel) = fmtp.value("sublevel")
+        && !is(sublevel, &["Sublev2bpp", "Sublev3bpp", "Sublev4bpp"])
+    {
+        report(format!(
+            "sublevel={sublevel}: TR-08 uses Sublev2bpp, Sublev3bpp or Sublev4bpp, for at most 4 bits a pixel"
+        ));
+    }
+    if let Some(depth) = fmtp.value("depth")
+        && !matches!(depth, "8" | "10" | "12")
+    {
+        report(format!("depth={depth}: TR-08 codes 8, 10 or 12 bits a sample"));
+    }
 }
 
 pub(super) fn describe(m: &Media<'_>) -> (String, Option<f64>) {

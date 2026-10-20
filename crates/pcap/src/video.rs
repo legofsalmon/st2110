@@ -94,6 +94,11 @@ pub(crate) struct VideoConfig {
     pub troff_us: Option<u32>,
     pub cmax: Option<u32>,
     pub maxudp: Option<u32>,
+    /// The `b=AS` of compressed video, in kilobits a second.
+    pub bandwidth_kbps: Option<u64>,
+    /// Whether to keep each unit's first arrival and timestamp, for comparing the
+    /// streams of a multi-stream group.
+    pub keep_starts: bool,
 }
 
 /// One packet, as the timing measurements see it.
@@ -105,6 +110,8 @@ pub(crate) struct Arrival {
     pub seq: u32,
     pub timestamp: u32,
     pub marker: bool,
+    /// Octets of the IP packet.
+    pub bytes: u32,
     pub video: Option<VideoHeader>,
     pub anc: Option<AncField>,
     pub jxs: Option<JxsHeader>,
@@ -143,6 +150,8 @@ struct Frame {
     first_seq: Option<u32>,
     /// Whether every packet so far arrived, with the first one known.
     whole: bool,
+    /// Octets of the IP packets so far.
+    bytes: u64,
 }
 
 /// An arrival as the timing models need it.
@@ -182,6 +191,10 @@ pub(crate) struct VideoEngine {
     last: Option<Arrival>,
     frame: Option<Frame>,
     npackets: Option<u32>,
+    /// Octets of the first whole frame, which every frame of compressed video repeats.
+    nbytes: Option<u64>,
+    /// Each unit's first arrival and timestamp, when kept.
+    starts: Vec<(i128, u32)>,
     held_models: Vec<ModelArrival>,
     models_off: Option<&'static str>,
     cinst: Option<Cinst>,
@@ -192,6 +205,7 @@ pub(crate) struct VideoEngine {
     latency: Accumulator,
     gap: Accumulator,
     frame_packets: Accumulator,
+    frame_bytes: Accumulator,
     windows: Seconds<Window>,
     marker_missing: Tally,
     marker_extra: Tally,
@@ -204,7 +218,11 @@ pub(crate) struct VideoEngine {
     jxs_wrong: Tally,
     /// What the first JPEG XS payload header found wrong said.
     jxs_problem: Option<String>,
+    bytes_vary: Tally,
 }
+
+/// Units whose first arrival and timestamp are kept for comparing streams, at most.
+const STARTS_LIMIT: usize = 1 << 16;
 
 /// The largest frame rate numerator and denominator, and NPACKETS, that the timing and
 /// models take: far past any format, and small enough that their products cannot overflow.
@@ -230,6 +248,8 @@ impl VideoEngine {
             last: None,
             frame: None,
             npackets: None,
+            nbytes: None,
+            starts: Vec::new(),
             held_models: Vec::new(),
             models_off,
             cinst: None,
@@ -240,6 +260,7 @@ impl VideoEngine {
             latency: Accumulator::default(),
             gap: Accumulator::default(),
             frame_packets: Accumulator::default(),
+            frame_bytes: Accumulator::default(),
             windows: Seconds::default(),
             marker_missing: Tally::default(),
             marker_extra: Tally::default(),
@@ -250,7 +271,13 @@ impl VideoEngine {
             jxs_mode: None,
             jxs_wrong: Tally::default(),
             jxs_problem: None,
+            bytes_vary: Tally::default(),
         }
+    }
+
+    /// Each unit's first arrival and timestamp, when kept, and the frame rate.
+    pub(crate) fn starts(&self) -> (&[(i128, u32)], Option<Rational>) {
+        (&self.starts, self.rate)
     }
 
     /// Takes the next packet, in arrival order.
@@ -381,6 +408,9 @@ impl VideoEngine {
                 if a.second_field() != unit.second_field && self.kind == VideoKind::Uncompressed {
                     self.fields_share_timestamp = true;
                 }
+                if let Some(frame) = &mut self.frame {
+                    frame.bytes += u64::from(a.bytes);
+                }
                 let unit = self.unit.as_mut().expect("matched above");
                 unit.packets += 1;
                 unit.last_t = a.t;
@@ -434,13 +464,17 @@ impl VideoEngine {
             _ => None,
         };
         let continues_frame = second_field && previous.is_some_and(|u| !u.second_field);
+        let bytes = u64::from(a.bytes);
         self.frame = if !second_field {
-            Some(Frame { tpa0: a.t, first_seq, whole: first_seq == Some(a.seq) })
+            Some(Frame { tpa0: a.t, first_seq, whole: first_seq == Some(a.seq), bytes })
         } else if continues_frame {
-            self.frame.map(|f| Frame { whole: f.whole && first_seq == Some(a.seq), ..f })
+            self.frame.map(|f| Frame { whole: f.whole && first_seq == Some(a.seq), bytes: f.bytes + bytes, ..f })
         } else {
             None
         };
+        if self.config.keep_starts && self.starts.len() < STARTS_LIMIT {
+            self.starts.push((a.t, a.timestamp));
+        }
         self.unit = Some(Unit {
             timestamp: a.timestamp,
             last_t: a.t,
@@ -468,6 +502,14 @@ impl VideoEngine {
         let Some(first) = frame.first_seq else { return };
         let packets = unit.last_seq.wrapping_sub(first).saturating_add(1);
         self.frame_packets.add(f64::from(packets));
+        if self.kind == VideoKind::Compressed {
+            self.frame_bytes.add(frame.bytes as f64);
+            match self.nbytes {
+                None => self.nbytes = Some(frame.bytes),
+                Some(n) if n != frame.bytes => self.bytes_vary.hit(next.t),
+                Some(_) => {}
+            }
+        }
         match self.npackets {
             None => {
                 self.npackets = Some(packets);
@@ -680,6 +722,38 @@ impl VideoEngine {
                 self.frame_packets.stats().map_or(0.0, |s| s.max)
             ),
         );
+        let octets = self.frame_bytes.stats();
+        add(
+            &rules::FRAME_BYTES,
+            &self.bytes_vary,
+            format!(
+                "frames carried from {} to {} octets of IP packets",
+                octets.map_or(0.0, |s| s.min),
+                octets.map_or(0.0, |s| s.max)
+            ),
+        );
+        if let (Some(signalled), Some(rate), Some(octets)) = (self.config.bandwidth_kbps, self.rate, octets)
+            && self.kind == VideoKind::Compressed
+        {
+            // Bits a frame times frames a second, in kilobits a second rounded up.
+            let kbps =
+                (octets.mean * 8.0 * rate.numerator() as f64 / (rate.denominator() as f64 * 1000.0)).ceil() as u64;
+            if kbps != signalled {
+                let frames = if octets.min == octets.max {
+                    format!("{} octets of IP packets a frame", octets.min)
+                } else {
+                    format!("{:.0} octets of IP packets a frame, on average,", octets.mean)
+                };
+                findings.push(Finding::new(
+                    &rules::CBR_RATE,
+                    format!("b=AS:{signalled}, but {frames} at {rate} frames a second make {kbps} kb/s"),
+                    Some(flow),
+                    None,
+                    timeline.at(self.bytes_vary.first.or(self.frame.map(|f| f.tpa0))),
+                    1,
+                ));
+            }
+        }
         let cinst = self.cinst.as_ref().map(|c| {
             let sender = match (self.config.cmax, self.config.sender) {
                 (Some(_), _) => "the CMAX the SDP file signals".to_string(),
@@ -758,13 +832,19 @@ impl VideoEngine {
                 gap: w.gap.stats(),
                 cinst: None,
                 vrx: None,
+                vrx_min: None,
+                vrx_average: None,
             })
             .collect();
         if let Some(c) = self.cinst {
             merge(&mut windows, c.seconds.finish(), |w, peak| w.cinst = Some(peak));
         }
         if let Some(v) = self.vrx {
-            merge(&mut windows, v.seconds.finish(), |w, peak| w.vrx = Some(peak));
+            merge(&mut windows, v.seconds.finish(), |w, second| {
+                w.vrx = second.peak;
+                w.vrx_min = second.min;
+                w.vrx_average = second.average.stats().map(|s| s.mean);
+            });
         }
         let report = VideoReport {
             frame_rate: self.rate.map(|r| r.to_string()),
@@ -774,6 +854,7 @@ impl VideoEngine {
             units: self.units,
             packets_per_frame: self.frame_packets.stats(),
             npackets: self.npackets,
+            octets_per_frame: self.frame_bytes.stats(),
             fpt: self.fpt.stats(),
             rtp_offset: self.rtp_offset.stats(),
             latency: self.latency.stats(),
@@ -789,7 +870,7 @@ impl VideoEngine {
 }
 
 /// Fills in each window's value from a per-second series, adding windows it lacks.
-fn merge(windows: &mut Vec<VideoWindow>, series: Vec<(i64, u64)>, set: impl Fn(&mut VideoWindow, u64)) {
+fn merge<T>(windows: &mut Vec<VideoWindow>, series: Vec<(i64, T)>, set: impl Fn(&mut VideoWindow, T)) {
     for (second, value) in series {
         match windows.binary_search_by_key(&second, |w| w.second) {
             Ok(i) => set(&mut windows[i], value),
@@ -802,6 +883,8 @@ fn merge(windows: &mut Vec<VideoWindow>, series: Vec<(i64, u64)>, set: impl Fn(&
                     gap: None,
                     cinst: None,
                     vrx: None,
+                    vrx_min: None,
+                    vrx_average: None,
                 };
                 set(&mut window, value);
                 windows.insert(i, window);
@@ -1049,7 +1132,10 @@ fn lcm(a: i128, b: i128) -> i128 {
 }
 
 /// The virtual receiver buffer, by event history with each packet read at its own read
-/// time (ST 2110-21:2022 §6.6.2; RP 2110-25:2023 Annex A).
+/// time (ST 2110-21:2022 §6.6.2; RP 2110-25:2023 §4.9.2 and Annex A). The buffer's
+/// level is taken before each read for its average, as §4.9.2 asks, and after it for its
+/// minimum, which a gapped schedule takes to 0 between frames; the steady state of a
+/// frame runs from its first read, TPR0, to its last packet's arrival.
 struct Vrx {
     schedule: Schedule,
     gapped: bool,
@@ -1062,7 +1148,30 @@ struct Vrx {
     margin: Accumulator,
     underflow: Tally,
     overflow: Tally,
-    seconds: Seconds<u64>,
+    seconds: Seconds<VrxSecond>,
+    /// The frame whose packets are arriving: its index, its first read and its latest
+    /// arrival, in schedule units.
+    frame: Option<(i128, i128, i128)>,
+    min: Option<u64>,
+    average: Accumulator,
+    steady_min: Option<u64>,
+    steady_average: Accumulator,
+    gap_min: Option<u64>,
+    /// TROFFSET − FPT for each frame whose first packet arrived (RP 2110-25 §4.8.6).
+    frame_margin: Accumulator,
+}
+
+/// One second of the virtual receiver buffer.
+#[derive(Default)]
+struct VrxSecond {
+    peak: Option<u64>,
+    min: Option<u64>,
+    average: Accumulator,
+}
+
+/// The lower of a minimum so far and a new level.
+fn lowest(min: &mut Option<u64>, level: u64) {
+    *min = Some(min.map_or(level, |m| m.min(level)));
 }
 
 impl Vrx {
@@ -1097,18 +1206,34 @@ impl Vrx {
             underflow: Tally::default(),
             overflow: Tally::default(),
             seconds: Seconds::default(),
+            frame: None,
+            min: None,
+            average: Accumulator::default(),
+            steady_min: None,
+            steady_average: Accumulator::default(),
+            gap_min: None,
+            frame_margin: Accumulator::default(),
         }
     }
 
     fn arrive(&mut self, t: i128, tpa0: i128, j: u32) {
         let now = t * self.schedule.scale;
-        while self.buffer.peek().is_some_and(|Reverse(read)| *read < now) {
-            self.buffer.pop();
-        }
         let n = self.schedule.frame_index(tpa0);
+        let same_frame = self.frame.is_some_and(|(current, _, _)| current == n);
+        // Every read before this arrival, with the level just before it.
+        while let Some(&Reverse(read)) = self.buffer.peek().filter(|Reverse(read)| *read < now) {
+            let before = self.buffer.len() as u64;
+            self.buffer.pop();
+            self.sample(read, before, same_frame);
+        }
+        let read0 = self.schedule.read(n, 0);
+        self.frame = Some((n, read0, now));
         let read = self.schedule.read(n, i128::from(j));
         let margin = (read - now) as f64 / self.schedule.scale as f64 / 1000.0;
         self.margin.add(margin);
+        if j == 0 {
+            self.frame_margin.add(margin);
+        }
         if read < now {
             self.underflow.hit_max(t, -margin);
             return;
@@ -1117,9 +1242,28 @@ impl Vrx {
         let level = self.buffer.len() as u64;
         self.peak = self.peak.max(level);
         let second = self.seconds.at(t);
-        *second = (*second).max(level);
+        second.peak = Some(second.peak.unwrap_or(0).max(level));
         if level > self.vrxfull {
             self.overflow.hit_max(t, level as f64);
+        }
+    }
+
+    /// Accounts for a read at `read`, in schedule units, of a buffer that held `before`
+    /// packets, made before an arrival of the frame in progress when `same_frame`, or
+    /// else of the next one.
+    fn sample(&mut self, read: i128, before: u64, same_frame: bool) {
+        let after = before - 1;
+        lowest(&mut self.min, after);
+        self.average.add(before as f64);
+        let second = self.seconds.at(read / self.schedule.scale);
+        lowest(&mut second.min, after);
+        second.average.add(before as f64);
+        let Some((_, read0, last)) = self.frame else { return };
+        if read >= read0 && (same_frame || read <= last) {
+            lowest(&mut self.steady_min, after);
+            self.steady_average.add(before as f64);
+        } else if !same_frame && read > last {
+            lowest(&mut self.gap_min, after);
         }
     }
 
@@ -1130,10 +1274,17 @@ impl Vrx {
             troffset_signalled: self.signalled,
             vrxfull: self.vrxfull,
             peak: self.peak,
+            min: self.min,
+            average: self.average.stats().map(|s| s.mean),
+            steady_min: self.steady_min,
+            steady_average: self.steady_average.stats().map(|s| s.mean),
+            gap_min: self.gap_min,
             underflows: self.underflow.count,
             overflows: self.overflow.count,
             margin_us: self.margin.stats(),
-            method: "event history, each packet read at its own time, over the whole capture".to_string(),
+            frame_margin_us: self.frame_margin.stats(),
+            method: "event history, each packet read at its own time, over the whole capture and in each frame's steady state"
+                .to_string(),
         }
     }
 }

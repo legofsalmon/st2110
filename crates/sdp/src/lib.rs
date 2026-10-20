@@ -33,6 +33,7 @@
 
 pub mod audio;
 mod clock;
+pub mod data;
 mod diag;
 mod fmtp;
 mod lint;

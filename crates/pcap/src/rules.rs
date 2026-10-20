@@ -58,6 +58,44 @@ rules! {
     JXS_PAYLOAD_HEADER = "jxs-payload-header", Error, "RFC 9134 §4.3",
         "JPEG XS payload headers keep T and K for the whole stream, set L with M (and equal to it in codestream mode), use no reserved I value, and mark fields only in interlaced video.";
 
+    // Ancillary data.
+    ANC_KEEPALIVE = "anc-keepalive", Error, "ST 2110-40:2023 §5.5",
+        "Ancillary data streams send at least one packet for every frame, field or PsF segment, with ANC_Count 0 and the marker set when there is nothing to carry.";
+    ANC_PAYLOAD = "anc-payload", Error, "RFC 8331 §2.1 · ST 291-1:2011 §6",
+        "The payload's Length and ANC_Count match the ANC packets it carries, its reserved bits are 0, and every ANC packet's parity bits and checksum are right.";
+    ANC_FIELD = "anc-field", Error, "RFC 8331 §2.1",
+        "No payload header has the F field 0b01, which RFC 8331 does not allow.";
+    ANC_DID_SDID = "anc-did-sdid", Error, "RFC 8331 §3.1",
+        "When the SDP file lists `DID_SDID`, every ANC packet is of a type it lists, Type 1 packets as SDID 0x00.";
+    ANC_LOCATION = "anc-location", Error, "ST 2110-40:2023 §5.2.2",
+        "ANC packets that propose an exact line or data stream have a `VPID_Code` in the SDP file, and the locations proposed rise through each frame as the packets are sent.";
+    ANC_AUDIO_EDH_PACKETS = "anc-audio-edh-packets", Warning, "ST 2110-40:2023 §5.2.1",
+        "No ANC packet is embedded audio, an audio control packet or EDH, which ST 2110-40 says not to carry.";
+    ANC_SEND_TIME = "anc-send-time", Error, "ST 2110-40:2023 §6.4, §6.5",
+        "Ancillary data packets are sent within the window of the transmission model that `TM` names, CTM when it names none: by the frame start plus the earliest packet offset plus 1 ms (CTM) or 8 line times (LLTM), and no more than a frame before that.";
+    FRAME_BYTES = "frame-bytes", Error, "ST 2110-22:2022 §4",
+        "Compressed video sends the same number of octets for every frame.";
+    CBR_RATE = "cbr-rate", Error, "ST 2110-22:2022 §7.3",
+        "The SDP file's `b=AS` is the measured rate of whole IP packets: octets a frame times the frame rate, in kilobits a second rounded up.";
+    MULTISTREAM_TIMESTAMP = "multistream-timestamp", Error, "RP 2110-23:2019 §5.5",
+        "The streams of a `MULTI-2SI` or `MULTI-SD` group carry the same RTP timestamp for each frame.";
+
+    // ST 2110-20 payloads.
+    SRD_LENGTH = "srd-length", Error, "ST 2110-20:2022 §6.1.4, §6.2",
+        "Each packet has one to three sample row data headers, whose lengths are whole pixel groups, never zero beside another header, and fit the payload.";
+    SRD_ORDER = "srd-order", Error, "ST 2110-20:2022 §6.1.4, §6.1.5",
+        "Row segments run down the field or frame, and from left to right within a row: rows and offsets only increase.";
+    SRD_GEOMETRY = "srd-geometry", Error, "ST 2110-20:2022 §6.1.4, §7.2",
+        "Row segments lie within the `width` and `height` the SDP file gives, with each field of interlaced and PsF video holding half the rows.";
+    BPM_BLOCKS = "bpm-blocks", Error, "ST 2110-20:2022 §6.3.3",
+        "In block packing mode, every packet but the last of a field or frame carries a multiple of 180 octets of sample data.";
+    GPM_SHORT = "gpm-short", Warning, "ST 2110-20:2022 §6.3.2",
+        "In general packing mode, IP datagrams under 1000 octets come only at the end of a field or frame.";
+
+    // JPEG XS.
+    JXSV_ALIGNMENT = "jxsv-alignment", Warning, "VSF TR-08:2026 §8.1.2",
+        "JPEG XS packets carry payload data in multiples of 8 octets, except the last packet of a field or frame.";
+
     // Audio.
     PACKET_TIME = "packet-time", Error, "ST 2110-30:2025 §6.2.1 · RFC 8866 §6.4",
         "Audio packets hold the samples that the SDP file's `ptime` gives, so consecutive timestamps step by the sampling rate times the packet time.";
@@ -65,6 +103,26 @@ rules! {
         "Audio packets hold the channels that the SDP file's `a=rtpmap` gives: the payload is samples times channels times octets per sample.";
     TS_DF = "ts-df", Warning, "EBU Tech 3337 · RP 2110-25:2023",
         "The timestamped delay factor over each 200 ms of an audio stream is at most one packet time.";
+    TS_DF_LIMIT = "ts-df-limit", Error, "AES67-2018 · RP 2110-25:2023 §4.11.1",
+        "The timestamped delay factor over each 200 ms of an audio stream stays under 17 packet times or 17 ms, whichever is smaller: the most AES67 allows a sender.";
+    AM824_SUBFRAME = "am824-subframe", Error, "ST 2110-31:2022 §5.4",
+        "Every AM824 subframe starts with two 0 bits, F is set on the first subframe of each AES3 frame and clear on the second, and B is set only on a first subframe.";
+    AM824_HEADER = "am824-header", Error, "ST 2110-31:2022 §5.3",
+        "AES3 packets have the marker bit and the CSRC count set to 0.";
+
+    // Fast metadata and timed text.
+    FMX_MARKER = "fmx-marker", Error, "ST 2110-41:2026 §5.2",
+        "Fast metadata packets have the marker bit set to 0.";
+    FMX_INTERVAL = "fmx-interval", Error, "ST 2110-41:2026 §5.1",
+        "A fast metadata stream sends a packet at least every 500 ms, with no Data Item Packages if it has nothing to send.";
+    FMX_PAYLOAD = "fmx-payload", Error, "ST 2110-41:2026 §5.4",
+        "The Data Item Packages fill each payload exactly, none of them split across packets, and no Data Item Length is 0.";
+    TTML_PAYLOAD = "ttml-payload", Error, "RFC 8759 §4.1",
+        "Timed text payload headers have the reserved bits 0 and a Length equal to the octets of User Data Words that follow.";
+    TTML_DOCUMENT = "ttml-document", Error, "RFC 8759 §4.1, §8",
+        "The packets of one TTML document share its timestamp, the marker set on the last, and the next document has a different timestamp.";
+    TTML_DOCUMENT_LOSS = "ttml-document-loss", Error, "RFC 8759 §8",
+        "No TTML document loses a fragment: a document is put together from all its packets, so one lost packet loses it whole.";
 
     // PTP, across messages.
     PTP_GRANDMASTER_CHANGE = "ptp-grandmaster-change", Warning, "IEEE 1588-2008 §9.3",

@@ -149,6 +149,7 @@ mod tests {
             legs: vec![Leg { destination: "239.1.1.1:5004".parse().unwrap(), source: None }],
             clock: Some(Clock::Traceable),
             ttl: 32,
+            rtp_offset: 0,
         };
         // 1.2 s of bars, into a capture in memory on UTC.
         let destination = stream.legs[0].destination;

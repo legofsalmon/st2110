@@ -31,11 +31,11 @@ Every finding cites the clause behind it.
 
 | Crate | What it is |
 |---|---|
-| [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
+| [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 103 rules. No dependencies; `serde` is an optional feature. |
 | [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching, the registry checker's 21 rules, and the crosspoint matrix of which Senders each Receiver can take. The Query API client is the optional `client` feature. |
 | [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
-| [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 22 rules. `serde` is an optional feature. |
+| [`crates/pcap`](crates/pcap) (`st2110-pcap`) | pcap and pcapng reader, RP 2110-25 measurements, the ST 2110-21 network compatibility and virtual receiver models, and the analyser's 48 rules. `serde` is an optional feature. |
 | [`crates/media`](crates/media) (`st2110-media`) | ST 2110-20 and -30 packetisers and depacketisers, ST 2110-21 pacing, ST 2022-7 merging and reordering, colour bars and tone, the SDP files senders write, and PNG, WAV and pcap writers. The sockets are the optional `net` feature, and `serde` is another. |
 | [`crates/discover`](crates/discover) (`st2110-discover`) | Stream discovery: SAP (RFC 2974) listening and announcing, a DNS-SD browser over multicast and unicast DNS for NMOS registries and Nodes, and the reader that lists their Senders' streams with those SAP announces, each once. |
 | [`crates/cli`](crates/cli) (`st2110`) | The command line: `st2110 lint`, `st2110 nmos`, `st2110 connect`, `st2110 router`, `st2110 ptp`, `st2110 pcap`, `st2110 time`, `st2110 discover`, `st2110 send`, `st2110 receive` and `st2110 view`. The window `view` opens is the default `view` feature. |
@@ -217,7 +217,7 @@ studio.pcap: pcap (nanosecond), 108515 frames in 0.499 s: 108497 RTP packets in 
     video: 1080 lines, progressive, 50 frames a second, 25 frames, 4320 packets a frame
     first packet time 746.0 µs (744.7 to 747.3), RTP offset 0.0 ticks (0.0 to 0.0), latency 746.0 µs (744.7 to 747.3)
     CINST peaked at 2, CMAX 5 for 2110TPN; fits 2110TPN, 2110TPNL, 2110TPW
-    virtual receiver buffer peaked at 5 of VRXFULL 8, gapped reads from TROFFSET 764.4 µs; packets arrived 17.0 µs or more before their reads
+    virtual receiver buffer peaked at 5 of VRXFULL 8 and averaged 3.1 (3.4, and at least 2, in each frame's steady state), gapped reads from TROFFSET 764.4 µs; Margin 18.4 µs (17.0 to 19.8); packets arrived 17.0 µs or more before their reads
   flow 2: 192.168.10.22:5006 to 239.10.10.2:5006, ST 2110-30, camera1-audio.sdp stream 0
     499 packets (payload type 97, SSRC 22220002) at 9.5 Mb/s
     audio: L24, 48000 Hz, 8 channels, 48 samples a packet (1000.0 µs)
@@ -233,7 +233,7 @@ studio.pcap: 2 flows, 1 error, 0 warnings, 0 notes
 
 - `st2110 pcap FILE...` reads pcap and pcapng files as it goes, so a capture of any size will do; `-` reads standard input. It reads Ethernet with VLAN tags, Linux cooked captures and raw IP, over IPv4 or IPv6, and PTP over UDP or Ethernet.
 - `--sdp FILE` gives a stream's SDP file, as often as needed. Each flow is matched to a stream by its destination and, where the stream has a source filter, its sender. It is checked against that stream and modelled on the schedule its `TP` and `TROFF` give. A flow without an SDP file is recognised from its packets, with its frame rate, image height or channels.
-- For video and ancillary data it measures, frame by frame, the first packet time from each frame's reference time counted from the SMPTE Epoch, the RTP offset and the latency, as RP 2110-25 does. It runs the ST 2110-21 network compatibility model (CINST against each sender type's CMAX) and the virtual receiver buffer (against VRXFULL, with underflows). For audio it measures latency, packet intervals and the timestamped delay factor (TS-DF) of each 200 ms. `--format json` gives the video and audio measurements for each second of the capture as well as overall.
+- For video and ancillary data it measures, frame by frame, the first packet time from each frame's reference time counted from the SMPTE Epoch, the RTP offset and the latency, as RP 2110-25 does. It runs the ST 2110-21 network compatibility model (CINST against each sender type's CMAX) and the virtual receiver buffer (against VRXFULL, with underflows), by event history: its peak, its minimum and its average before each read, over the whole capture and in each frame's steady state from the first read to the last packet, with RP 2110-25's Margin for each frame. It checks each ST 2110-20 packet's sample row data headers against the format, and that ST 2110-22 frames keep one size, at the rate `b=AS` gives. For audio it measures latency, packet intervals and the timestamped delay factor (TS-DF) of each 200 ms, counting latency from the `a=mediaclk:direct=` offset that AES67 allows. Each audio and ancillary data flow is lined up with a video flow, the one from the same sender or else the first: the audio or ANC video differential latency (AVDL, ANC VDL) and, for ancillary data, the relative RTP offset. `--format json` gives the video and audio measurements for each second of the capture as well as overall.
 - It follows each PTP domain: grandmasters, ports, message rates, Sync messages without a Follow_Up, Delay_Req messages without a Delay_Resp, and two ports announcing at once. Every message also gets the checks `st2110 ptp` makes, each reported once for its port.
 - The timing measurements need the capture's timestamps on PTP time. A capture timestamped by a NIC whose clock ptp4l disciplines, as `tcpdump -j adapter_unsynced` does, counts PTP time; one timestamped by the system clock counts UTC, which it moves 37 s onto PTP time (`--tai-utc` changes that). It works out which from the capture's PTP Sync messages, or else from the RTP timestamps, and says why; `--timescale ptp` or `utc` says so outright. When it cannot tell, it skips what needs PTP time and measures the rest.
 - `--quiet` and `--deny-warnings` work as they do for `lint`.
@@ -321,7 +321,7 @@ bars.sdp: arrived whole
 - `st2110 send video [FORMAT]` sends EBU colour bars, with a box that moves along the black strip beneath them, as ST 2110-20 video. FORMAT is 1080p50 unless it names another, such as 2160p59.94 or 1280x720p25; video is progressive. `--sampling`, `--depth`, `--colorimetry`, `--tcs`, `--range` and `--packing` choose the rest. `st2110 send audio` sends a 1 kHz tone at −18 dBFS as ST 2110-30 audio; `--channels`, `--sample-rate`, `--bits`, `--packet-time`, `--tone` and `--level` choose it. A packet holds a whole number of samples, so at 44.1 kHz `--packet-time 1` gives 44 of them, 997.7 µs, which the SDP file writes as `a=ptime:1` and a receiver rounds back to 44.
 - Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Unless it says `narrow`, `narrow-linear` or `wide`, that is `wide` below 900 000 packets a second and `narrow-linear` from there, where ST 2110-21 defines no wide sender. Each audio packet goes as its last sample falls due.
 - `--to` gives the destination, a multicast group or a unicast address; give it twice for the two legs of an ST 2022-7 pair, which carry the same packets. `--interface` gives the address to send from, once for every leg or once for each; otherwise the routing table picks. `--ttl` sets the multicast time to live and `--dscp` the DSCP, AF41 by default, as AES67 marks media.
-- It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it.
+- It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it. Audio's says `TSMODE=SAMP`, as its timestamps are the sampling instants, with the packet time as `TSDELAY`.
 - `--sap` announces the stream by SAP as well, as AES67 devices do, for `st2110 discover` and ST 2110 Viewer to find: to 239.255.255.255:9875, or `--sap=ADDRESS:PORT`, as it starts and every 30 s after, withdrawing the announcement when `--duration` ends. A sender stopped with Ctrl-C cannot withdraw it, so listeners mark the stream as maybe stopped 90 s later.
 - It times packets by the system clock, taking TAI to be 37 s ahead of it (`--tai-utc` changes that). On a machine whose clock `phc2sys` keeps to PTP, name the grandmaster with `--clock <grandmaster>:<domain>` or `--clock traceable`, and its streams line up with every other sender's. Otherwise the SDP file names this machine's MAC address as `localmac`, which only Linux can find; elsewhere give `--clock`.
 - `--duration` sends for that many seconds, and without it the sender runs until it is stopped. With `--pcap FILE` it writes the packets into a capture instead, as fast as it can make them, each at the time it would have gone out, on UTC as a capture made with the system clock is. `st2110 pcap` measures such a capture, and `st2110 receive --pcap` reads it.
@@ -413,16 +413,16 @@ Severities follow the standards' own words. An **error** breaks a "shall" (or an
 |---|---|
 | RFC 8866 | Line syntax and order, required and repeated lines, `o=`, `t=`, `c=` with multicast TTL, `b=`, `rtpmap`/`fmtp` pairing |
 | ST 2110-10 | Dynamic payload types, `ts-refclk` (PTP version, grandmaster, domain, `localmac`), `mediaclk:direct=0`, `source-filter`, `MAXUDP`, `TSMODE`, `TSDELAY` |
-| ST 2022-7, RP 2110-23 | `DUP` legs that match and are addressed apart, `MULTI-2SI` stream counts and addresses, `FID` without ANC |
-| ST 2110-20, -21 | Required parameters and their values, the `SSN` edition rule, interlace and PsF, pixel groups, block packing, `TP`, default `TROFF`, RFC 4175 look-alikes |
-| RP 2110-24 | SD width, height and pixel aspect ratio |
-| ST 2110-22 | `b=AS`, `TP`, frame rate, JPEG XS `packetmode` (VSF TR-08) |
-| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels, packet size against the standard UDP limit (-30) or `MAXUDP` (-31), `channel-order`, AM824 channel pairs |
-| ST 2110-40, -41, -43 | ANC `SSN`/`TM`/`exactframerate`, `DID_SDID`, `VPID_Code`; FMX `SSN` and `DIT`; TTML clock and `codecs` |
+| ST 2022-7, RP 2110-23 | `DUP` legs that match and are addressed apart, `MULTI-2SI` stream counts and addresses, one format and `TROFF` for a multi-stream group's streams and `DUP` for all of them or none, `FID` without ANC |
+| ST 2110-20, -21 | Required parameters and their values, the `SSN` edition rule, interlace and PsF, pixel groups, block packing, `TP`, default `TROFF` for progressive video and for 1125-line interlaced and PsF video, RFC 4175 look-alikes |
+| RP 2110-24 | SD sampling, width, height and pixel aspect ratio |
+| ST 2110-22 | `b=AS`, `TP`, frame rate, JPEG XS `packetmode`, profile, level, sublevel and depth (VSF TR-08) |
+| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels (the -31 X levels at 44.1 and 96 kHz too), packet size against the standard UDP limit (-30) or `MAXUDP` (-31), `channel-order`, AM824 channel pairs |
+| ST 2110-40, -41, -43 | The media type on the `m=` line; ANC `SSN`/`TM`/`exactframerate`, `DID_SDID` (and embedded audio or EDH in it), `VPID_Code`; FMX `SSN`, `DIT` and the audio clock of MGA metadata (ST 2127-2); TTML clock and `codecs` |
 
-It follows the editions current on pub.smpte.org in September 2026: ST 2110-10:2022, -20:2022, -21:2022, -22:2022, -30:2025, -31:2022, -40:2023, -41:2024 (whose SSN the 2026 edition keeps), -43:2021, RP 2110-23:2019, RP 2110-24:2023 and ST 2022-7:2019.
+It follows the editions current on pub.smpte.org in September 2026: ST 2110-10:2022, -20:2022, -21:2022, -22:2022, -30:2025, -31:2022, -40:2023, -41:2024 (whose SSN the 2026 edition keeps), -43:2021, RP 2110-23:2019, RP 2110-24:2023 and ST 2022-7:2019, with VSF TR-08:2026 for JPEG XS.
 
-It reads SDP only, so it cannot confirm that a sender does what its SDP says; `st2110 pcap` checks that in a capture. It also leaves out the interlaced `TROFF` defaults, which ST 2110-21:2022 Table 1 misprints for 525 and 625 lines, and the ST 2110-31 levels at 44.1 and 96 kHz.
+It reads SDP only, so it cannot confirm that a sender does what its SDP says; `st2110 pcap` checks that in a capture. It also leaves out the interlaced `TROFF` defaults of 525- and 625-line video, which ST 2110-21:2022 Table 1 misprints, and the JPEG XS level that a picture's size and rate call for (TR-08 asks for the lowest that fits).
 
 ### NMOS registries
 
@@ -452,14 +452,20 @@ It follows ST 2059-1:2021 and ST 2059-2:2021, with IEEE 1588-2008 and -2019.
 | Area | Checks |
 |---|---|
 | RTP | Lost packets, with 32-bit sequence numbers where ST 2110-20 and -40 extend them; packets out of order or repeated; SSRC changes; the SDP file's payload type |
-| ST 2110-10 | IP fragments, and datagrams over 1460 octets or the `MAXUDP` signalled (PCM audio and ancillary data keep to 1460 whatever `MAXUDP` says) |
+| ST 2110-10 | IP fragments, and datagrams over 1460 octets or the `MAXUDP` signalled (PCM audio, ancillary data and fast metadata keep to 1460 whatever `MAXUDP` says) |
 | Video and ancillary data | Marker bits on the last packet of each frame or field, timestamps on the frame grid, packets that arrive before the time their timestamp names, and latency over JT-NM's 1 ms (35 ms for ancillary data) as a note |
+| ST 2110-20 | Up to three sample row data headers, with lengths of whole pixel groups, rows and offsets that only increase, and segments within the SDP file's `width` and `height`; 180-octet blocks in block packing, and datagrams under 1000 octets only at the end of a field or frame in general packing |
 | ST 2110-21 | CINST over CMAX for the sender type in `TP`, or the `CMAX` signalled, and the virtual receiver buffer's overflows and underflows |
-| ST 2110-22 | The same number of packets in every frame, and the RFC 9134 payload header: T and K held, L with M, fields only in interlaced video, each field with its own timestamp (VSF TR-08) |
-| ST 2110-30, -31 | Packets holding the samples `ptime` gives and the channels `a=rtpmap` gives, and TS-DF within a packet time |
+| ST 2110-22 | The same number of packets and octets in every frame, at the rate `b=AS` gives; the RFC 9134 payload header: T and K held, L with M, fields only in interlaced video, each field with its own timestamp; JPEG XS payloads in multiples of 8 octets but for the last of a frame or field (VSF TR-08) |
+| RP 2110-23 | The same timestamp for each frame across the streams of a `MULTI-2SI` or `MULTI-SD` group |
+| ST 2110-30, -31 | Packets holding the samples `ptime` gives and the channels `a=rtpmap` gives, TS-DF within a packet time (a warning) and under AES67's 17 packet times or 17 ms (an error); for -31, the marker bit and CSRC count at 0, and each AM824 subframe's leading 0 bits and the F and B bits of AES3 framing |
+| ST 2110-40 | The RFC 8331 payload: Length and ANC_Count against the packets carried, the reserved bits, no F field of 0b01, and each packet's parity bits and checksum; packet types against `DID_SDID`, with embedded audio and EDH as warnings; exact locations only with `VPID_Code`, rising through each frame; a packet for every frame or field; send times inside the window of the CTM or LLTM that `TM` names |
+| ST 2110-41, -43 | Fast metadata: the marker bit at 0, a packet at least every 500 ms, and Data Item Packages that fill each payload with no Data Item Length of 0. Timed text: the RFC 8759 payload header, one timestamp a document with the marker on its last packet and another for the next, keep-alives between documents, and the documents a lost packet takes with it |
 | PTP | Each domain kept apart by its number and sdoId (gPTP and AES67 on domain 0 are two), with ST 2059-2's checks only for its own profile over UDP; one grandmaster through the capture, one port announcing at a time, Announce and Sync rates to match `logMessageInterval`, and a Follow_Up for every two-step Sync and a Delay_Resp for every Delay_Req |
 
-It follows RP 2110-25:2023 for what it measures, with ST 2110-21:2022 for the models and EBU Tech 3337 for TS-DF.
+It follows RP 2110-25:2023 for what it measures, with ST 2110-21:2022 for the models and EBU Tech 3337 for TS-DF. Of RP 2110-25 Annex A's two ways to model the virtual receiver buffer it uses event history; the residence time method is not yet there.
+
+The payload checks of ST 2110-31, -40, -41 and -43 need the stream's SDP file. The ANC send window is widened to hold any T_EPO, since the exact one needs the line timing of an SDI format the SDP file does not give, and it is checked only against its late end when `TROFF` moves the frame start. It leaves out the AES3 block of 192 frames, channel status and the P bit, which AES3-3 defines rather than ST 2110-31, and the ST 2110-41 network compatibility model.
 
 ## Use the library
 
@@ -546,6 +552,7 @@ let stream = Description {
     legs: vec![Leg { destination: "239.10.1.1:5004".parse()?, source: Some("192.168.10.21".parse()?) }],
     clock: Some(Clock::Traceable),
     ttl: 32,
+    rtp_offset: 0,
 };
 std::fs::write("bars.sdp", stream.sdp(1))?;
 let mut transmitter = Transmitter::new(&stream.legs, &["192.168.10.21".parse().ok()], 32, 34, 37)?;
@@ -637,7 +644,7 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo test --workspace
 ```
 
-To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A PTP rule goes in `crates/ptp/src/rules.rs`, is raised from `crates/ptp/src/check.rs`, and needs a case in `crates/ptp/tests/decode.rs`. A capture rule goes in `crates/pcap/src/rules.rs`, is raised from the flow, video, audio or PTP modules beside it, and needs a capture that raises it in `crates/pcap/tests/captures.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
+To add an SDP rule, add it to the catalogue in `crates/sdp/src/rules.rs`, raise it from the check in `crates/sdp/src/lint/`, and add a case to `crates/sdp/tests/rules.rs`. A registry rule goes in `crates/nmos/src/rules.rs`, is raised from `crates/nmos/src/check.rs`, and needs a case in `crates/nmos/tests/checks.rs`. A PTP rule goes in `crates/ptp/src/rules.rs`, is raised from `crates/ptp/src/check.rs`, and needs a case in `crates/ptp/tests/decode.rs`. A capture rule goes in `crates/pcap/src/rules.rs`, is raised from the flow, video, audio, data or PTP modules beside it, and needs a capture that raises it in `crates/pcap/tests/captures.rs`. A test fails for any rule without one. Then regenerate the docs, which another test compares:
 
 ```console
 $ cargo run -q -p st2110-cli -- rules --format markdown > docs/rules.md

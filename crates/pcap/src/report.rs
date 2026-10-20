@@ -134,6 +134,23 @@ pub struct FlowReport {
     pub video: Option<VideoReport>,
     /// Audio measurements.
     pub audio: Option<AudioReport>,
+    /// For audio and ancillary data, how it lines up with a video flow.
+    pub relative: Option<RelativeReport>,
+}
+
+/// RP 2110-25 measurements of an audio or ancillary data flow against a video flow: the
+/// one from the same sender, or else the first video flow in the capture.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RelativeReport {
+    /// The video flow, by [`FlowReport::index`].
+    pub video: usize,
+    /// AVDL (§4.11.4) or ANC VDL (§4.12.4): this flow's mean latency less the video's,
+    /// in microseconds. Negative when the video's latency is higher.
+    pub differential_latency_us: Option<f64>,
+    /// RRTPOFFSET (§4.12.5), for ancillary data: the video's mean RTP offset less this
+    /// flow's, in ticks of the 90 kHz clock, brought within half a frame.
+    pub rtp_offset: Option<f64>,
 }
 
 /// RP 2110-25 measurements of ST 2110-20, -22 and -40 streams. Times are in
@@ -155,6 +172,9 @@ pub struct VideoReport {
     pub packets_per_frame: Option<Stats>,
     /// NPACKETS: packets in the first whole frame, as the ST 2110-21 models count them.
     pub npackets: Option<u32>,
+    /// Octets of the IP packets of each whole frame of compressed video, which ST 2110-22
+    /// keeps constant and its `b=AS` counts.
+    pub octets_per_frame: Option<Stats>,
     /// First packet time: from the frame's reference time N × TFRAME to its first packet.
     pub fpt: Option<Stats>,
     /// RTP offset: the frame's timestamp less the one its reference time gives.
@@ -193,6 +213,10 @@ pub struct VideoWindow {
     pub cinst: Option<u64>,
     /// The fullest the virtual receiver buffer was.
     pub vrx: Option<u64>,
+    /// The emptiest it was, just after a read.
+    pub vrx_min: Option<u64>,
+    /// VRXAVG: its mean level just before each read.
+    pub vrx_average: Option<f64>,
 }
 
 /// The network compatibility model (ST 2110-21:2022 §6.6.1).
@@ -231,14 +255,30 @@ pub struct VrxReport {
     pub troffset_signalled: bool,
     /// VRXFULL: the most packets the buffer may hold.
     pub vrxfull: u64,
-    /// The most it held.
+    /// VRXPEAK: the most it held.
     pub peak: u64,
+    /// VRXMIN: the least it held, just after a read; 0 between the frames of a gapped
+    /// schedule.
+    pub min: Option<u64>,
+    /// VRXAVG: its mean level just before each read.
+    pub average: Option<f64>,
+    /// VRXMIN-SS: the least it held in the steady state of a frame, from the first read
+    /// (TPR0) to the last packet's arrival.
+    pub steady_min: Option<u64>,
+    /// VRXAVG-SS: its mean level before each read in the steady state.
+    pub steady_average: Option<f64>,
+    /// VRXMIN-GAP: the least it held between the last packet of one frame and the first
+    /// of the next.
+    pub gap_min: Option<u64>,
     /// Packets that arrived after their read time.
     pub underflows: u64,
     /// Arrivals that left the buffer over VRXFULL.
     pub overflows: u64,
     /// From each packet's arrival to its read time, in microseconds.
     pub margin_us: Option<Stats>,
+    /// Margin, as RP 2110-25 §4.8.6 defines it: TROFFSET less the first packet time,
+    /// from each frame's first packet to its first read, in microseconds.
+    pub frame_margin_us: Option<Stats>,
     /// How the buffer was modelled.
     pub method: String,
 }

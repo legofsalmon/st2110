@@ -4,10 +4,12 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use st2110_sdp::{Essence, Param, Rule};
+use st2110_sdp::{Essence, MediaClock, Param, Rational, Rule};
 
 use crate::audio::{AudioConfig, AudioEngine};
+use crate::data::{self, DataConfig, DataEngine};
 use crate::net::Datagram;
+use crate::payload::{self, PayloadChecks, PayloadConfig};
 use crate::report::{Finding, FlowReport};
 use crate::rtp::{self, AncField};
 use crate::stats::Tally;
@@ -18,13 +20,17 @@ use crate::{SdpFile, Timeline, plural, rules};
 /// A flow's source and destination.
 pub(crate) type Key = (SocketAddr, SocketAddr);
 
+/// Octets of payload kept from each packet: the ST 2110-20 payload header with three
+/// sample row data headers, which holds the shorter headers of ST 2110-40 and RFC 9134.
+const HEAD: usize = 20;
+
 /// An RTP packet, as much of it as the measurements need.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RtpPacket {
     pub header: rtp::Header,
     /// The first octets of the payload, which hold the payload header of ST 2110-20
     /// video and ST 2110-40 ancillary data.
-    head: [u8; 8],
+    head: [u8; HEAD],
     head_len: u8,
     /// Octets of payload, by the UDP length: the RTP header and padding left out.
     pub payload_len: u32,
@@ -41,8 +47,8 @@ impl RtpPacket {
     pub(crate) fn read(d: &Datagram<'_>) -> Option<Self> {
         let header = rtp::header(d.payload, d.complete())?;
         let payload = d.payload.get(header.length..).unwrap_or_default();
-        let mut head = [0; 8];
-        let n = payload.len().min(8);
+        let mut head = [0; HEAD];
+        let n = payload.len().min(HEAD);
         head[..n].copy_from_slice(&payload[..n]);
         let overhead = 8 + header.length + header.padding;
         Some(Self {
@@ -82,7 +88,14 @@ pub(crate) struct SdpStream {
     channels: Option<u16>,
     ptime_ms: Option<f64>,
     video: VideoConfig,
+    payload: PayloadConfig,
     maxudp: Option<u32>,
+    data: DataConfig,
+    /// The RTP clock's offset from `a=mediaclk:direct=`, modulo 2³².
+    rtp_offset: u32,
+    /// The `MULTI-2SI` or `MULTI-SD` group it belongs to, such as
+    /// `camera1.sdp a=group:MULTI-2SI 1 2 3 4`, whose streams share their timestamps.
+    pub multistream: Option<String>,
     /// Whether a flow has matched it.
     pub matched: bool,
 }
@@ -118,7 +131,57 @@ impl SdpStream {
                     troff_us: number("TROFF"),
                     cmax: number("CMAX"),
                     maxudp: number("MAXUDP"),
+                    keep_starts: false,
+                    bandwidth_kbps: sdp
+                        .media
+                        .get(stream.index)
+                        .into_iter()
+                        .flat_map(|m| m.fields_of('b'))
+                        .filter_map(|field| st2110_sdp::parse_bandwidth(&field.value).ok())
+                        .find_map(|(kind, kbps)| (kind == "AS").then_some(kbps)),
                 };
+                let data = DataConfig {
+                    did_sdid: params
+                        .iter()
+                        .filter(|p| p.name.eq_ignore_ascii_case("DID_SDID"))
+                        .filter_map(|p| st2110_sdp::data::did_sdid(p.value.as_deref()?))
+                        .collect(),
+                    vpid: param(params, "VPID_Code").is_some(),
+                    tm: value(params, "TM").map(|tm| tm.trim().to_string()),
+                    frame_rate: video.frame_rate,
+                    troff_us: video.troff_us,
+                    channels: stream.channels,
+                };
+                let section = sdp.media.get(stream.index);
+                let rtp_offset = match section
+                    .and_then(|m| m.attribute("mediaclk"))
+                    .or_else(|| sdp.session.attribute("mediaclk"))
+                    .map(|a| MediaClock::parse(a.text()))
+                {
+                    // RTP timestamps count modulo 2³², and so does the offset.
+                    Some(Ok(MediaClock::Direct { offset: Some(offset) })) => offset as u32,
+                    _ => 0,
+                };
+                let payload = PayloadConfig {
+                    sampling: value(params, "sampling").map(str::to_string),
+                    depth: value(params, "depth").map(str::to_string),
+                    width: number("width"),
+                    height: number("height"),
+                    fields: param(params, "interlace").is_some(),
+                    packing: value(params, "PM").map(str::to_string),
+                    jpeg_xs: stream.encoding.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("jxsv")),
+                };
+                let multistream = stream.mid.as_deref().and_then(|mid| {
+                    sdp.session.attributes_named("group").map(|a| a.text()).find(|text| {
+                        let mut words = text.split_whitespace();
+                        words
+                            .next()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("MULTI-2SI") || s.eq_ignore_ascii_case("MULTI-SD"))
+                            && words.any(|w| w == mid)
+                    })
+                });
+                let mut video = video;
+                video.keep_starts = multistream.is_some();
                 streams.push(Self {
                     label: format!("{} stream {}", file.name, stream.index),
                     destination: stream.destination.as_deref().and_then(|d| d.parse().ok()),
@@ -132,6 +195,10 @@ impl SdpStream {
                     ptime_ms: ptime,
                     maxudp: video.maxudp,
                     video,
+                    data,
+                    rtp_offset,
+                    payload,
+                    multistream: multistream.map(|group| format!("{} a=group:{group}", file.name)),
                     matched: false,
                 });
             }
@@ -164,6 +231,21 @@ impl SdpStream {
     /// The RTP clock rate the stream declares.
     pub(crate) fn clock_rate(&self) -> Option<u32> {
         self.clock_rate
+    }
+
+    /// What audio timestamps count from: the offset `a=mediaclk:direct=` gives, which
+    /// AES67 allows and ST 2110-10 sets to 0. Other essences are taken at 0, as ST
+    /// 2110-10 requires of them.
+    pub(crate) fn audio_offset(&self) -> u32 {
+        match self.essence {
+            Essence::Audio | Essence::Aes3 => self.rtp_offset,
+            _ => 0,
+        }
+    }
+
+    /// Whether the payload checks read the stream's payloads, which are then kept.
+    pub(crate) fn reads_payloads(&self) -> bool {
+        matches!(self.essence, Essence::Ancillary | Essence::Aes3 | Essence::FastMetadata | Essence::TimedText)
     }
 }
 
@@ -231,7 +313,9 @@ pub(crate) struct Flow {
     fragments: Tally,
     oversize: Tally,
     video: Option<Box<VideoEngine>>,
+    payload: Option<Box<PayloadChecks>>,
     audio: Option<Box<AudioEngine>>,
+    data: Option<DataEngine>,
 }
 
 impl Flow {
@@ -259,12 +343,15 @@ impl Flow {
             fragments: Tally::default(),
             oversize: Tally::default(),
             video: None,
+            payload: None,
             audio: None,
+            data: None,
         }
     }
 
-    /// Takes the next packet, which arrived at `t` on the analysis timeline.
-    pub(crate) fn push(&mut self, t: i128, p: RtpPacket) {
+    /// Takes the next packet, which arrived at `t` on the analysis timeline. `bytes` is
+    /// the whole RTP packet, kept for a stream whose payloads are read.
+    pub(crate) fn push(&mut self, t: i128, p: RtpPacket, bytes: Option<&[u8]>) {
         self.packets += 1;
         self.bytes += u64::from(p.ip_length);
         if self.first.is_none() {
@@ -273,12 +360,12 @@ impl Flow {
         self.last = self.last.max(t);
         self.payload_type.get_or_insert(p.header.payload_type);
         if self.kind.is_some() {
-            self.process(t, p);
+            self.process(t, p, bytes);
             return;
         }
         if self.sdp.is_some() {
             self.classify();
-            self.process(t, p);
+            self.process(t, p, bytes);
             return;
         }
         if self.pending.last().is_none_or(|(_, last)| last.header.timestamp != p.header.timestamp) {
@@ -305,18 +392,25 @@ impl Flow {
             Kind::Video(video) => {
                 let config = self.sdp.as_ref().map(|s| s.video.clone()).unwrap_or_default();
                 self.video = Some(Box::new(VideoEngine::new(*video, config, self.absolute)));
+                if *video != VideoKind::Ancillary {
+                    let config = self.sdp.as_ref().map(|s| s.payload.clone()).unwrap_or_default();
+                    let raw = *video == VideoKind::Uncompressed;
+                    self.payload = Some(Box::new(PayloadChecks::new(raw, &config)));
+                }
             }
             Kind::Audio(config) => self.audio = Some(Box::new(AudioEngine::new(config.clone(), self.absolute))),
             Kind::Other(_) => {}
         }
+        self.data = self.sdp.as_ref().and_then(|s| DataEngine::new(s.essence, s.data.clone(), self.absolute));
         self.seq.wide = kind.wide_sequence();
         self.kind = Some(kind);
+        // Only flows without an SDP stream are held, and their payloads are not kept.
         for (t, p) in std::mem::take(&mut self.pending) {
-            self.process(t, p);
+            self.process(t, p, None);
         }
     }
 
-    fn process(&mut self, t: i128, p: RtpPacket) {
+    fn process(&mut self, t: i128, p: RtpPacket, bytes: Option<&[u8]>) {
         if p.fragmented {
             self.fragments.hit(t);
         }
@@ -354,27 +448,51 @@ impl Flow {
                 _ => unreachable!("a video engine runs only for video"),
             };
             let head = p.head();
+            if let Some(payload) = &mut self.payload {
+                payload.push(&payload::Packet {
+                    t,
+                    seq,
+                    timestamp: h.timestamp,
+                    marker: h.marker,
+                    head,
+                    payload_len: p.payload_len,
+                    ip_length: p.ip_length,
+                });
+            }
             video.push(Arrival {
                 t,
                 seq,
                 timestamp: h.timestamp,
                 marker: h.marker,
+                bytes: p.ip_length,
                 video: (kind == VideoKind::Uncompressed).then(|| rtp::video_header(head)).flatten(),
                 anc: (kind == VideoKind::Ancillary).then(|| rtp::anc_header(head).map(|a| a.field)).flatten(),
                 jxs: (kind == VideoKind::Compressed).then(|| rtp::jxs_header(head)).flatten(),
             });
         }
         if let Some(audio) = &mut self.audio {
-            audio.push(t, seq, h.timestamp, p.payload_len);
+            let offset = self.sdp.as_ref().map_or(0, SdpStream::audio_offset);
+            audio.push(t, seq, h.timestamp.wrapping_sub(offset), p.payload_len);
+        }
+        if let (Some(data), Some(bytes)) = (&mut self.data, bytes) {
+            let end = bytes.len().saturating_sub(h.padding);
+            data.push(&data::Packet {
+                t,
+                seq,
+                header: h,
+                csrcs: bytes[0] & 0x0F,
+                payload: bytes.get(h.length..end).unwrap_or_default(),
+            });
         }
     }
 
-    /// ST 2110-10's limit on UDP datagrams, in octets. ST 2110-30 PCM audio (§6.2.1) and
-    /// ST 2110-40 ancillary data (§5.2.1) keep to the standard limit whatever `MAXUDP` says.
+    /// ST 2110-10's limit on UDP datagrams, in octets. ST 2110-30 PCM audio (§6.2.1),
+    /// ST 2110-40 ancillary data (§5.2.1) and ST 2110-41 fast metadata (§5.4) keep to the
+    /// standard limit whatever `MAXUDP` says.
     fn udp_limit(&self) -> u32 {
         let Some(sdp) = &self.sdp else { return 1460 };
         let standard_only = match sdp.essence {
-            Essence::Ancillary => true,
+            Essence::Ancillary | Essence::FastMetadata => true,
             Essence::Audio => !sdp.encoding.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("AM824")),
             _ => false,
         };
@@ -382,6 +500,14 @@ impl Flow {
             return 1460;
         }
         sdp.maxudp.map_or(1460, |m| m.min(8960))
+    }
+
+    /// The multi-stream group the flow belongs to, with each frame's first arrival and
+    /// timestamp and the frame rate, for comparing it with the group's other streams.
+    pub(crate) fn constituent(&self) -> Option<Constituent> {
+        let group = self.sdp.as_ref()?.multistream.clone()?;
+        let (starts, rate) = self.video.as_ref()?.starts();
+        Some(Constituent { flow: self.index, group, starts: starts.to_vec(), rate: rate? })
     }
 
     pub(crate) fn finish(mut self, timeline: &Timeline) -> (FlowReport, Vec<Finding>) {
@@ -470,6 +596,9 @@ impl Flow {
                 self.oversize.worst.unwrap_or_default()
             ),
         );
+        if let Some(payload) = &self.payload {
+            payload.finish(self.index, timeline, &mut findings);
+        }
         let video = self.video.take().map(|engine| {
             let (report, more) = engine.finish(self.index, timeline);
             findings.extend(more);
@@ -480,6 +609,9 @@ impl Flow {
             findings.extend(more);
             report
         });
+        if let Some(engine) = self.data.take() {
+            findings.extend(engine.finish(self.index, timeline));
+        }
         let first = self.first.unwrap_or_default();
         let seconds = (self.last - first) as f64 / 1e9;
         let kind = self.kind.as_ref().expect("classified above");
@@ -502,9 +634,73 @@ impl Flow {
             duplicates: self.seq.duplicates.count,
             video,
             audio,
+            relative: None,
         };
         (report, findings)
     }
+}
+
+/// A flow of a `MULTI-2SI` or `MULTI-SD` group: each frame's first arrival and
+/// timestamp.
+pub(crate) struct Constituent {
+    pub flow: usize,
+    pub group: String,
+    pub starts: Vec<(i128, u32)>,
+    pub rate: Rational,
+}
+
+/// Compares the timestamps of the flows of each multi-stream group, which RP 2110-23
+/// §5.5 makes the same for each frame: a frame of one flow is matched with the other's
+/// whose first packet arrived nearest, within half a frame.
+pub(crate) fn compare_constituents(flows: &[Constituent], timeline: &Timeline) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for (i, first) in flows.iter().enumerate() {
+        // The first flow of each group is the one the others are compared with.
+        if flows[..i].iter().any(|f| f.group == first.group) {
+            continue;
+        }
+        for other in flows[i + 1..].iter().filter(|f| f.group == first.group) {
+            let half =
+                i128::from(first.rate.denominator()) * crate::stats::NANOS / i128::from(first.rate.numerator()) / 2;
+            let mut differ = Tally::default();
+            let mut worst = (0, 0);
+            for &(t, timestamp) in &other.starts {
+                let at = first.starts.partition_point(|&(s, _)| s < t);
+                let nearest = [at.checked_sub(1), Some(at)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|k| first.starts.get(k))
+                    .min_by_key(|(s, _)| (s - t).abs());
+                if let Some(&(s, theirs)) = nearest
+                    && (s - t).abs() <= half
+                    && theirs != timestamp
+                {
+                    if differ.count == 0 {
+                        worst = (timestamp, theirs);
+                    }
+                    differ.hit(t);
+                }
+            }
+            if differ.count > 0 {
+                findings.push(Finding::new(
+                    &rules::MULTISTREAM_TIMESTAMP,
+                    format!(
+                        "{} carried other RTP timestamps than flow {} of {}, the first {} against {}",
+                        plural(differ.count, "frame"),
+                        first.flow,
+                        first.group,
+                        worst.0,
+                        worst.1
+                    ),
+                    Some(other.flow),
+                    None,
+                    timeline.at(differ.first),
+                    differ.count,
+                ));
+            }
+        }
+    }
+    findings
 }
 
 /// What an SDP stream says the flow carries.

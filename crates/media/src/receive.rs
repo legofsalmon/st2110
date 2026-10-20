@@ -424,8 +424,8 @@ impl Session {
         if let Essence::Audio { extender, .. } = essence {
             extender.take(sequence);
         }
-        let clock_rate = description.media.clock_rate();
-        playout.push(sequence, at, data, |packet| release(essence, latency, octets, clock_rate, packet, sink));
+        let clock = (description.media.clock_rate(), description.rtp_offset);
+        playout.push(sequence, at, data, |packet| release(essence, latency, octets, clock, packet, sink));
     }
 
     fn play_held(&mut self, sink: &mut impl Sink) {
@@ -438,8 +438,8 @@ impl Session {
     /// together: `end` when receiving stopped then, `None` when the stream did.
     fn flush(&mut self, end: Option<i128>, sink: &mut impl Sink) {
         let Self { playout, essence, latency, octets, description, .. } = self;
-        let clock_rate = description.media.clock_rate();
-        playout.finish(|packet| release(essence, latency, octets, clock_rate, packet, sink));
+        let clock = (description.media.clock_rate(), description.rtp_offset);
+        playout.finish(|packet| release(essence, latency, octets, clock, packet, sink));
         if let Essence::Video { depacketiser, frames } = essence {
             let per_frame = depacketiser.packets_per_frame();
             depacketiser.flush(end, |info, pixels| {
@@ -599,8 +599,22 @@ impl Session {
                 ));
             }
             if c.malformed > 0 {
-                problems
-                    .push(format!("{} had payload headers that do not fit the format", count(c.malformed, "packet")));
+                let by = c.malformed_by;
+                let why: Vec<String> = [
+                    (by.lengths, "row segments of no whole number of pixel groups"),
+                    (by.places, "row segments outside the picture or off a pixel group"),
+                    (by.fields, "the second-field bit set in progressive video"),
+                    (by.headers, "more row segments than three, or than the payload holds"),
+                ]
+                .into_iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} with {what}"))
+                .collect();
+                problems.push(format!(
+                    "{} had payload headers that do not fit the format, left out: {} (ST 2110-20 §6.1.4, §6.2)",
+                    count(c.malformed, "packet"),
+                    why.join(", ")
+                ));
             }
             if c.late > 0 {
                 notes.push(format!(
@@ -654,7 +668,7 @@ fn release(
     essence: &mut Essence,
     latency: &mut Accumulator,
     octets: &mut u64,
-    clock_rate: u32,
+    (clock_rate, offset): (u32, u32),
     packet: Released<'_>,
     sink: &mut impl Sink,
 ) {
@@ -669,7 +683,7 @@ fn release(
         }
         Essence::Audio { depacketiser, .. } => {
             if let Some(header) = rtp::read_header(packet.data) {
-                latency.add(since_timestamp(header.timestamp, packet.at, clock_rate) / 1000.0);
+                latency.add(since_timestamp(header.timestamp.wrapping_sub(offset), packet.at, clock_rate) / 1000.0);
             }
             depacketiser.push(packet.at, packet.data, packet.missing, |samples| sink.samples(samples));
         }
@@ -744,6 +758,7 @@ mod tests {
             ],
             clock: Some(Clock::Traceable),
             ttl: 32,
+            rtp_offset: 0,
         }
     }
 
@@ -754,6 +769,27 @@ mod tests {
         let ts = st2110_ptp::epoch::rtp_timestamp(st2110_ptp::PtpTime::from_nanos(T).unwrap(), 90_000);
         assert!((since_timestamp(ts, at, 90_000) - 27_778.0).abs() < 1e-6);
         assert!((since_timestamp(ts.wrapping_add(3), at, 90_000) + 5_555.3).abs() < 0.1);
+    }
+
+    #[test]
+    fn audio_latency_counts_from_the_signalled_offset() {
+        // An AES67 sender's timestamps, 963 214 424 ticks ahead of the media clock.
+        let mut d = two_legs(Media::Audio(AudioFormat::new(2)));
+        d.legs.truncate(1);
+        let mut out = Keep::default();
+        Sender::new(&d, 1000, -18.0, 7, 0).unwrap().run(&mut out, T, T + 5_000_000).unwrap();
+        d.rtp_offset = 963_214_424;
+        let mut session = Session::new(&d).unwrap();
+        let mut sink = Collect::default();
+        for (packet, at) in &out.0 {
+            let mut packet = packet.clone();
+            let timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap()).wrapping_add(d.rtp_offset);
+            packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+            session.push(0, Ipv4Addr::new(10, 0, 0, 1), *at, &packet, &mut sink);
+        }
+        session.finish(T + 5_000_000, &mut sink);
+        let latency = session.report().latency.unwrap();
+        assert!((latency.min - 1000.0).abs() < 0.01 && (latency.max - 1000.0).abs() < 0.01, "{latency:?}");
     }
 
     #[test]

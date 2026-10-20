@@ -3,7 +3,9 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use st2110_sdp::{ClockIdentity, Fmtp, RefClock, Section, parse_connection, parse_media_line, parse_rtpmap};
+use st2110_sdp::{
+    ClockIdentity, Fmtp, MediaClock, RefClock, Section, parse_connection, parse_media_line, parse_rtpmap,
+};
 
 use crate::format::{AudioFormat, VideoFormat, samples_in};
 
@@ -128,6 +130,11 @@ pub struct Description {
     pub clock: Option<Clock>,
     /// The time to live of multicast packets.
     pub ttl: u8,
+    /// The RTP clock offset that `a=mediaclk:direct=` gives: the RTP timestamp of an
+    /// instant is its count of clock ticks since the epoch plus this, modulo 2³². ST 2110
+    /// streams use 0; an AES67 sender may not (ST 2110-30:2025 §6.1 NOTE 1). A receiver
+    /// counts audio latency from it; this crate's senders stamp with 0.
+    pub rtp_offset: u32,
 }
 
 impl Description {
@@ -197,14 +204,21 @@ impl Description {
             match &self.media {
                 Media::Video(v) => text.push_str(&format!("a=fmtp:{pt} {}\r\n", v.fmtp())),
                 Media::Audio(a) => {
-                    text.push_str(&format!("a=fmtp:{pt} channel-order={}\r\n", a.channel_order()));
+                    // Each packet's timestamp is its first sample's sampling instant, and it
+                    // goes as its last sample falls due: a packet time later (ST 2110-10:2022
+                    // §8.7).
+                    let delay = (a.packet_time() * 1e6).round();
+                    text.push_str(&format!(
+                        "a=fmtp:{pt} channel-order={}; TSMODE=SAMP; TSDELAY={delay}\r\n",
+                        a.channel_order()
+                    ));
                     text.push_str(&format!("a=ptime:{}\r\n", a.ptime()));
                 }
             }
             if let Some(clock) = &self.clock {
                 text.push_str(&format!("a=ts-refclk:{}\r\n", clock.sdp_value()));
             }
-            text.push_str("a=mediaclk:direct=0\r\n");
+            text.push_str(&format!("a=mediaclk:direct={}\r\n", self.rtp_offset));
             if self.legs.len() > 1 {
                 text.push_str(&format!("a=mid:{}\r\n", mids[i]));
             }
@@ -264,8 +278,16 @@ impl Description {
             .and_then(|c| c.ttl)
             .unwrap_or(if first.destination.ip().is_multicast() { 64 } else { 1 });
         let name = sdp.session.field('s').map(|s| s.value.trim().to_string()).unwrap_or_default();
-        let description =
-            Self { name, media, payload_type, legs: parsed.iter().map(|&(leg, _)| leg).collect(), clock, ttl };
+        let rtp_offset = match section.attribute("mediaclk").or_else(|| sdp.session.attribute("mediaclk")) {
+            Some(a) => match MediaClock::parse(a.text()) {
+                // RTP timestamps count modulo 2³², and so does the offset.
+                Ok(MediaClock::Direct { offset: Some(offset) }) => offset as u32,
+                _ => 0,
+            },
+            None => 0,
+        };
+        let legs = parsed.iter().map(|&(leg, _)| leg).collect();
+        let description = Self { name, media, payload_type, legs, clock, ttl, rtp_offset };
         description.check()?;
         Ok((description, notes))
     }
@@ -359,6 +381,7 @@ mod tests {
             legs: vec![leg("239.10.1.1:5004", Some("192.168.1.10")), leg("239.20.1.1:5004", Some("192.168.2.10"))],
             clock: Some(Clock::parse("08-00-11-FF-FE-21-E1-B0:127").unwrap()),
             ttl: 32,
+            rtp_offset: 0,
         }
     }
 
@@ -384,15 +407,28 @@ mod tests {
             legs: vec![leg("10.0.0.2:5006", None)],
             clock: Some(Clock::Traceable),
             ttl: 64,
+            rtp_offset: 0,
         };
         let text = audio.sdp(7);
-        assert!(
-            text.contains("a=rtpmap:97 L24/48000/8\r\na=fmtp:97 channel-order=SMPTE2110.(U08)\r\na=ptime:0.125\r\n")
-        );
-        assert!(!st2110_sdp::lint(&text).has_errors(), "{text}");
+        assert!(text.contains(
+            "a=rtpmap:97 L24/48000/8\r\na=fmtp:97 channel-order=SMPTE2110.(U08); TSMODE=SAMP; TSDELAY=125\r\na=ptime:0.125\r\n"
+        ));
+        // Stamped at sampling instants, as TSMODE says: the linter has nothing to note.
+        assert_eq!(st2110_sdp::lint(&text).diagnostics, [], "{text}");
         let (back, _) = Description::parse(&text).unwrap();
         assert_eq!(back.media, audio.media);
         assert_eq!(back.legs, audio.legs);
+    }
+
+    #[test]
+    fn reads_an_aes67_offset() {
+        let text = include_str!("../../sdp/tests/fixtures/aes67-offset.sdp");
+        let (stream, _) = Description::parse(text).unwrap();
+        assert_eq!(stream.rtp_offset, 963_214_424);
+        assert!(stream.sdp(1).contains("a=mediaclk:direct=963214424\r\n"));
+        // Taken modulo 2³², as RTP timestamps are.
+        let (stream, _) = Description::parse(&text.replace("963214424", "4294967297")).unwrap();
+        assert_eq!(stream.rtp_offset, 1);
     }
 
     #[test]

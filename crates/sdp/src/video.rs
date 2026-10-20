@@ -200,6 +200,18 @@ pub fn tro_default_progressive(height: u32, frame_rate: Rational) -> f64 {
     if height >= 1080 { 43.0 / 1125.0 * frame } else { 28.0 / 750.0 * frame }
 }
 
+/// The ST 2110-21 default read offset for interlaced and PsF video of the 1125-line
+/// systems, in seconds: Int((1125 − height) ÷ 2) ÷ 1125 of a frame (§6.3.3 Table 1),
+/// 22/1125 at 1080 lines. `None` at 608 lines and fewer, the 525- and 625-line systems,
+/// whose Table 1 entries are misprinted in ST 2110-21:2022.
+pub fn tro_default_interlaced(height: u32, frame_rate: Rational) -> Option<f64> {
+    if height <= 608 || height >= 1125 {
+        return None;
+    }
+    let lines = (1125 - height) / 2;
+    Some(f64::from(lines) / 1125.0 / frame_rate.to_f64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +245,9 @@ mod tests {
         assert!((tro - 637.7).abs() < 0.05, "{tro}");
         let tro = tro_default_progressive(720, r5994) * 1e6;
         assert!((tro - 622.8).abs() < 0.05, "{tro}");
+        // 1080i59.94: 22/1125 of 33.367 ms.
+        let tro = tro_default_interlaced(1080, Rational::new(30000, 1001).unwrap()).unwrap() * 1e6;
+        assert!((tro - 652.5).abs() < 0.05, "{tro}");
+        assert_eq!(tro_default_interlaced(486, Rational::new(30000, 1001).unwrap()), None);
     }
 }
