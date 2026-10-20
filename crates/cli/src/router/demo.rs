@@ -20,12 +20,13 @@
 //!
 //! Its Query API takes subscriptions, and pushes each change to them over a WebSocket,
 //! as a registry does. With `--demo-auth` it asks for IS-10 tokens too, and serves the
-//! Authorization Server to get them from: one client, [`CLIENT_ID`] with
-//! [`CLIENT_SECRET`], whose tokens last a minute. Its tokens are opaque strings it keeps
-//! a list of, where a real Authorization Server issues signed JWTs for each Resource
-//! Server to check for itself.
+//! Authorization Server to get them from, whose tokens last a minute: to [`CLIENT_ID`]
+//! with [`CLIENT_SECRET`], and to any client that registers by RFC 7591 with the initial
+//! access token [`INITIAL_TOKEN`], for a secret or for `private_key_jwt`, as the router
+//! itself does. Its tokens are opaque strings it keeps a list of, where a real
+//! Authorization Server issues signed JWTs for each Resource Server to check for itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -180,6 +181,21 @@ pub(crate) const CLIENT_ID: &str = "st2110-demo";
 /// Its secret: this is a demo, on this machine.
 pub(crate) const CLIENT_SECRET: &str = "demo-secret";
 
+/// The initial access token the demo Authorization Server asks for to register a client
+/// (RFC 7591 §3), as IS-10 has a server authenticate registrations for the Client
+/// Credentials grant.
+pub(crate) const INITIAL_TOKEN: &str = "demo-registration";
+
+/// Where the demo Authorization Server registers clients.
+const REGISTER_PATH: &str = "/x-nmos/auth/v1.0/register";
+
+/// A client registered with the demo Authorization Server, and how it authenticates.
+enum Client {
+    Secret(String),
+    /// `private_key_jwt`, with the keys at its `jwks_uri`.
+    Key(String),
+}
+
 /// How long a demo token lasts, short enough to see one renewed.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -221,6 +237,10 @@ pub(crate) struct Facility {
     changes: Vec<(&'static str, Value, Value)>,
     /// The tokens issued, with `--demo-auth`.
     tokens: Option<HashMap<String, Issued>>,
+    /// The clients registered with the Authorization Server, by id.
+    clients: HashMap<String, Client>,
+    /// The `jti` of each client assertion taken, so that none is taken twice.
+    assertions: HashSet<String>,
     /// Whether a Receiver changed since the facility was last kept.
     dirty: bool,
 }
@@ -281,6 +301,8 @@ impl Facility {
             subscriptions: BTreeMap::new(),
             changes: Vec::new(),
             tokens: None,
+            clients: HashMap::from([(CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string()))]),
+            assertions: HashSet::new(),
             dirty: false,
         };
         for kind in ["nodes", "devices", "sources", "flows", "senders", "receivers"] {
@@ -588,7 +610,7 @@ impl Facility {
     /// Answers a request for the registry, a Connection API or the Authorization Server.
     pub(crate) fn answer(&mut self, request: &Request) -> Response {
         self.settle();
-        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH {
+        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH || request.path == REGISTER_PATH {
             return self.authorization_server(request);
         }
         if let Err(refused) = self.authorized(request) {
@@ -1028,24 +1050,124 @@ impl Facility {
         }
     }
 
-    /// The demo Authorization Server: its metadata, and its token endpoint.
+    /// Registers a client (RFC 7591 §2 and §3.2.1), for the demo Authorization Server's
+    /// registration endpoint and for the router itself, which needs no HTTP for it.
+    pub(crate) fn register_client(&mut self, asked: &Value) -> Result<Value, (u16, Value)> {
+        let refuse = |error: &str, description: &str| (400, json!({"error": error, "error_description": description}));
+        let text = |name: &str| asked.get(name).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+        let name =
+            text("client_name").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a client_name"))?;
+        let scope = text("scope").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a scope"))?;
+        if scope.split_whitespace().any(|s| s != "query" && s != "connection") {
+            return Err(refuse("invalid_client_metadata", "this demo's scopes are query and connection"));
+        }
+        let grants = asked.get("grant_types").and_then(Value::as_array);
+        if grants.is_some_and(|g| g.iter().any(|g| g.as_str() != Some("client_credentials"))) {
+            return Err(refuse("invalid_client_metadata", "this demo registers clients for client_credentials only"));
+        }
+        let method = text("token_endpoint_auth_method").unwrap_or("client_secret_basic");
+        let client = match method {
+            "client_secret_basic" => Client::Secret(random_token()),
+            "private_key_jwt" => match text("jwks_uri") {
+                Some(uri) => Client::Key(uri.to_string()),
+                None => {
+                    return Err(refuse("invalid_client_metadata", "private_key_jwt needs a jwks_uri, as IS-10 asks"));
+                }
+            },
+            other => return Err(refuse("invalid_client_metadata", &format!("this demo does not take {other}"))),
+        };
+        // IS-10: at least 20 characters, unique to each client.
+        let client_id = format!("demo-{}", random_token());
+        let mut issued = json!({
+            "client_id": client_id, "client_id_issued_at": 0, "client_name": name, "scope": scope,
+            "grant_types": ["client_credentials"], "token_endpoint_auth_method": method,
+        });
+        match &client {
+            Client::Secret(secret) => {
+                issued["client_secret"] = json!(secret);
+                issued["client_secret_expires_at"] = json!(0);
+            }
+            Client::Key(uri) => issued["jwks_uri"] = json!(uri),
+        }
+        self.clients.insert(client_id, client);
+        Ok(issued)
+    }
+
+    /// The client a token request comes from, by its Basic credentials or its signed
+    /// assertion (RFC 7523 §2.2).
+    fn client_of(&mut self, request: &Request, form: &HashMap<String, String>) -> Result<String, &'static str> {
+        if let Some((id, secret)) = request.header("Authorization").and_then(auth::basic_credentials) {
+            return match self.clients.get(&id) {
+                Some(Client::Secret(kept)) if *kept == secret => Ok(id),
+                _ => Err("the client id or secret is not one this demo issued"),
+            };
+        }
+        let (Some(id), Some(assertion)) = (form.get("client_id"), form.get("client_assertion")) else {
+            return Err("give the client's id and secret, or a signed client_assertion");
+        };
+        if form.get("client_assertion_type").map(String::as_str) != Some(auth::ASSERTION_TYPE) {
+            return Err("the client_assertion_type is not a JWT bearer assertion");
+        }
+        let Some(Client::Key(jwks_uri)) = self.clients.get(id) else {
+            return Err("the client is not registered here for private_key_jwt");
+        };
+        // The client's keys, fetched as a real server would; the router serves its own.
+        let jwks =
+            auth::get_jwks(jwks_uri, Duration::from_secs(2)).map_err(|_| "the client's jwks_uri does not answer")?;
+        let audience = format!("{}{TOKEN_PATH}", self.base);
+        let jti = auth::verify_assertion(assertion, &jwks, id, &audience)
+            .map_err(|_| "the client_assertion does not verify")?;
+        if !self.assertions.insert(jti) {
+            return Err("the client_assertion was used before");
+        }
+        Ok(id.clone())
+    }
+
+    /// The demo Authorization Server: its metadata, its registration endpoint and its
+    /// token endpoint.
     fn authorization_server(&mut self, request: &Request) -> Response {
         let base = self.base.clone();
-        let Some(tokens) = &mut self.tokens else {
+        if self.tokens.is_none() {
             return Response::error(404, "this demo asks for no tokens: run the router with --demo-auth for them");
-        };
+        }
         if request.path.starts_with(METADATA_PATH) {
             return Response::json(
                 200,
                 &json!({
                     "issuer": format!("{base}/"),
                     "token_endpoint": format!("{base}{TOKEN_PATH}"),
+                    "registration_endpoint": format!("{base}{REGISTER_PATH}"),
                     "grant_types_supported": ["client_credentials"],
-                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
+                    "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
                     "response_types_supported": ["none"],
                     "scopes_supported": ["query", "connection"],
                 }),
             );
+        }
+        if request.path == REGISTER_PATH {
+            if request.method != "POST" {
+                return Response::json(
+                    405,
+                    &json!({"error": "invalid_request", "error_description": "register with POST"}),
+                );
+            }
+            let token = request.header("Authorization").and_then(auth::bearer_token);
+            if token != Some(INITIAL_TOKEN) {
+                let mut response = Response::json(
+                    401,
+                    &json!({"error": "invalid_token", "error_description": format!("register with the initial access token {INITIAL_TOKEN}")}),
+                );
+                response
+                    .headers
+                    .push(("WWW-Authenticate", "Bearer realm=\"st2110 demo\", error=\"invalid_token\"".into()));
+                return response;
+            }
+            let asked: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            return match self.register_client(&asked) {
+                Ok(issued) => Response::json(201, &issued),
+                Err((status, body)) => Response::json(status, &body),
+            };
         }
         let oauth_error = |status: u16, error: &str, description: &str| {
             let mut response = Response::json(status, &json!({"error": error, "error_description": description}));
@@ -1057,15 +1179,17 @@ impl Facility {
         if request.method != "POST" {
             return oauth_error(405, "invalid_request", "ask for a token with POST");
         }
-        let credentials = request.header("Authorization").and_then(auth::basic_credentials);
-        if credentials.as_ref().is_none_or(|(id, secret)| id != CLIENT_ID || secret != CLIENT_SECRET) {
-            return oauth_error(401, "invalid_client", "the client id or secret is not this demo's");
-        }
         let form: HashMap<String, String> = String::from_utf8_lossy(&request.body)
             .split('&')
             .filter_map(|pair| pair.split_once('='))
             .map(|(name, value)| (auth::form_decode(name), auth::form_decode(value)))
             .collect();
+        if let Err(why) = self.client_of(request, &form) {
+            return oauth_error(401, "invalid_client", why);
+        }
+        let Some(tokens) = &mut self.tokens else {
+            return oauth_error(404, "invalid_request", "this demo asks for no tokens");
+        };
         if form.get("grant_type").map(String::as_str) != Some("client_credentials") {
             return oauth_error(400, "unsupported_grant_type", "this demo issues tokens by client_credentials only");
         }

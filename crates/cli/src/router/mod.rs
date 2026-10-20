@@ -20,6 +20,7 @@
 //! itself, so another web site cannot make them through a visitor's browser.
 
 mod demo;
+mod dnssd;
 mod events;
 mod http;
 mod keep;
@@ -28,7 +29,7 @@ mod signal;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +41,7 @@ use serde_json::{Value, json};
 use st2110_connect::client::{self, ConnectionClient};
 use st2110_connect::controller::{self, Route, SenderControl, Settings, Take};
 use st2110_connect::{Destination, SenderChange};
-use st2110_nmos::auth::{ClientCredentials, Token};
+use st2110_nmos::auth::{ClientCredentials, SigningKey, Token};
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::{Kind, Manifest, Snapshot, routing};
 
@@ -76,6 +77,8 @@ pub(crate) struct Args {
     pub interface: Option<Ipv4Addr>,
     pub auth: crate::auth::Auth,
     pub demo_auth: bool,
+    /// With --register: register for `private_key_jwt`, publishing the key here.
+    pub private_key_jwt: bool,
     /// The state file, or `None` to keep nothing.
     pub state: Option<PathBuf>,
 }
@@ -121,7 +124,13 @@ struct Router {
     keeper: Keeper,
     /// The demo registry's subscriptions' WebSockets, each with its subscription's id.
     demo_sockets: Hub,
+    /// The public key it signs `private_key_jwt` assertions with, as a JSON Web Key
+    /// Set, for the Authorization Server to read at `/.well-known/jwks.json`.
+    jwks: Option<Value>,
 }
+
+/// Where the router publishes the key it signs IS-10 client assertions with.
+const JWKS_PATH: &str = "/.well-known/jwks.json";
 
 pub(crate) fn run(args: &Args) -> io::Result<ExitCode> {
     match serve(args) {
@@ -172,7 +181,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         _ => address.to_string(),
     };
     let page = format!("http://{local}/");
-    let (registry, demo) = match (&args.target, args.demo) {
+    let (registry, mut demo) = match (&args.target, args.demo) {
         (Some(target), false) => {
             let lower = target.to_ascii_lowercase();
             if !lower.starts_with("http://") && !lower.starts_with("https://") {
@@ -188,17 +197,44 @@ fn serve(args: &Args) -> Result<(), Failure> {
         }
         _ => return Err(Failure::Usage("give a registry's Query API URL, or --demo".into())),
     };
-    let token = match demo.as_ref().and_then(Facility::auth_server) {
-        Some(server) => Some(Token::client_credentials(
-            ClientCredentials {
-                server,
-                client_id: demo::CLIENT_ID.into(),
-                client_secret: demo::CLIENT_SECRET.into(),
-                scope: st2110_nmos::auth::SCOPES.into(),
-            },
-            timeout,
-            false,
-        )),
+    let mut jwks = None;
+    let token = match demo.as_mut().and_then(|f| f.auth_server().map(|server| (server, f))) {
+        // The router registers with the demo's Authorization Server for private_key_jwt,
+        // as IS-10 recommends a confidential client do, and publishes its key.
+        Some((server, facility)) => {
+            let key = SigningKey::generate().map_err(|e| e.message)?;
+            let asked = json!({
+                "client_name": format!("st2110 router at {page}"), "scope": st2110_nmos::auth::SCOPES,
+                "grant_types": ["client_credentials"], "token_endpoint_auth_method": "private_key_jwt",
+                "jwks_uri": format!("http://{local}{JWKS_PATH}"),
+            });
+            let issued = facility.register_client(&asked).map_err(|(_, e)| e.to_string())?;
+            jwks = Some(key.jwks());
+            Some(Token::client_credentials(
+                ClientCredentials {
+                    server,
+                    client_id: issued["client_id"].as_str().unwrap_or_default().into(),
+                    client_secret: String::new(),
+                    scope: st2110_nmos::auth::SCOPES.into(),
+                    key: Some(key),
+                },
+                timeout,
+                false,
+            ))
+        }
+        None if args.private_key_jwt => {
+            // The Authorization Server reads the key from this server, so at an address
+            // it can reach.
+            if address.ip().is_unspecified() {
+                return Err(Failure::Usage(
+                    "--private-key-jwt publishes the key at --listen, so give it the address the Authorization Server reaches this machine at".into(),
+                ));
+            }
+            let key = args.auth.kept_key()?;
+            jwks = Some(key.jwks());
+            let uri = format!("http://{address}{JWKS_PATH}");
+            args.auth.token_with(timeout, true, &crate::auth::Proof::Key(&key, uri))?
+        }
         None => args.auth.token(timeout, demo.is_none())?,
     };
     let keeper = Keeper::new(args.state.clone(), if demo.is_some() { "demo" } else { registry.as_str() });
@@ -227,6 +263,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         entries: AtomicU64::new(entries),
         keeper,
         demo_sockets: Hub::default(),
+        jwks,
         // The demo's streams come over the loopback interface.
         previews: Previews::new(
             if args.demo { Some(Ipv4Addr::LOCALHOST) } else { args.interface },
@@ -234,6 +271,14 @@ fn serve(args: &Args) -> Result<(), Failure> {
             // The demo's streams are small, and all of them fit.
             if args.demo && args.previews > 0 { args.previews.max(DEMO_PREVIEWS) } else { args.previews },
         ),
+    });
+    // The demo's DNS-SD, on the same address and port over UDP.
+    let dns_sd = router.demo.as_ref().map(|demo| {
+        let auth = demo.lock().is_ok_and(|f| f.auth_server().is_some());
+        UdpSocket::bind(address).map(|socket| {
+            let advertised = dnssd::Advertised { address, auth };
+            std::thread::spawn(move || dnssd::serve(socket, &advertised));
+        })
     });
     // Without previews nothing would show the demo's streams, so they are not sent.
     if let Some(demo) = router.demo.as_ref().filter(|_| args.previews > 0) {
@@ -249,13 +294,25 @@ fn serve(args: &Args) -> Result<(), Failure> {
             Some(_) => writeln!(out, "Registry: the demo facility, at {}", router.registry)?,
             None => writeln!(out, "Registry: {}", router.registry)?,
         }
+        match dns_sd {
+            Some(Ok(())) => writeln!(
+                out,
+                "DNS-SD: {local} answers for the demo in any domain, as in st2110 nmos --dns-server {local} --domain demo.test"
+            )?,
+            Some(Err(e)) => writeln!(out, "DNS-SD: none for the demo, as UDP {local} cannot be had: {e}")?,
+            None => {}
+        }
         if let Some(server) = router.demo.as_ref().and_then(|d| d.lock().ok()?.auth_server()) {
             writeln!(
                 out,
-                "IS-10: the demo asks for tokens, from {server} (client {}, secret {})",
+                "IS-10: the demo asks for tokens, from {server} (client {}, secret {}, or register with the initial access token {})",
                 demo::CLIENT_ID,
-                demo::CLIENT_SECRET
+                demo::CLIENT_SECRET,
+                demo::INITIAL_TOKEN
             )?;
+            if let Some(token) = &router.token {
+                writeln!(out, "IS-10: the router gets {}", token.describe())?;
+            }
         } else if let Some(token) = &router.token {
             writeln!(out, "IS-10: {}", token.describe())?;
         }
@@ -466,6 +523,10 @@ fn answer(router: &Router, request: &Request) -> Response {
                 ("Referrer-Policy", "no-referrer".into()),
             ],
             body: PAGE.as_bytes().to_vec(),
+        },
+        ("GET", JWKS_PATH) => match &router.jwks {
+            Some(jwks) => Response::json(200, jwks),
+            None => Response::error(404, "this router signs no IS-10 assertions"),
         },
         ("GET", "/api/state") => state(router),
         ("GET", "/api/why") => why(router, request),

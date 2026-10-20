@@ -12,8 +12,11 @@
 //! - **NMOS by DNS-SD** (IS-04 §3): it browses for registries' Query APIs
 //!   (`_nmos-query._tcp`) and Nodes' Node APIs (`_nmos-node._tcp`) by multicast DNS on
 //!   each port, and for Query APIs by unicast DNS in the system's search domains. It
-//!   reads the registry a controller would choose: one that asks for no authorization,
-//!   in use rather than for development, of the highest priority.
+//!   reads the registry a controller would choose: one that asks for no authorization
+//!   unless it has an IS-10 token to give ([`Options::token`]), in use rather than for
+//!   development, of the highest priority. [`find`] looks once for one kind of API,
+//!   for a command that has not been told where its registry or Authorization Server
+//!   is.
 //! - **NMOS peer to peer**: where no registry answers, it reads each Node it found, and
 //!   reads it again when the version counters it advertises change.
 //!
@@ -36,6 +39,7 @@
 
 pub mod dns;
 pub mod dnssd;
+pub mod find;
 pub mod net;
 pub mod nmos;
 pub mod resolv;
@@ -49,6 +53,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use st2110_nmos::auth::Token;
 use st2110_nmos::client;
 use st2110_sdp::Stream;
 
@@ -103,6 +108,9 @@ pub struct Options {
     /// How long a request to a DNS server, a registry or a Node may take: an hour at
     /// most.
     pub timeout: Duration,
+    /// The IS-10 access token to give a registry or a Node that asks for one; without
+    /// one, those that ask are read last.
+    pub token: Option<Token>,
 }
 
 impl Default for Options {
@@ -118,6 +126,7 @@ impl Default for Options {
             domains: None,
             refresh: Duration::from_secs(15),
             timeout: Duration::from_secs(5),
+            token: None,
         }
     }
 }
@@ -661,7 +670,11 @@ fn ask(servers: &[SocketAddr], question: &Question, timeout: Duration) -> Result
 
 /// Browses DNS servers for the instances of `service`, a service type in a domain, and
 /// resolves each one (RFC 6763 §4).
-fn browse_unicast(servers: &[SocketAddr], service: &Name, timeout: Duration) -> Result<Vec<Service>, String> {
+pub(crate) fn browse_unicast(
+    servers: &[SocketAddr],
+    service: &Name,
+    timeout: Duration,
+) -> Result<Vec<Service>, String> {
     let now = Instant::now();
     let mut cache = Cache::default();
     // A DNS server may give a record no time to live, to be used once and not kept.
@@ -763,6 +776,7 @@ fn read_nmos(shared: &Shared, options: &Options) {
         timeout: options.timeout,
         // A proxy for the web is no way to the devices on this network.
         env_proxy: false,
+        token: options.token.clone(),
         ..client::Options::default()
     };
     let mut readers: HashMap<String, Reader> = HashMap::new();
@@ -790,7 +804,7 @@ fn read_nmos(shared: &Shared, options: &Options) {
         let timed = due(last) || afresh;
         let mut notes: BTreeMap<String, String> = BTreeMap::new();
         let mut read: Option<(String, Vec<Sender>)> = None;
-        for api in nmos::by_preference(&apis) {
+        for api in nmos::by_preference_given(&apis, options.token.is_some()) {
             let (reader, result) = read_api(readers.remove(&api.url), api, &http, afresh);
             match result {
                 Ok(senders) => {

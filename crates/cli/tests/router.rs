@@ -445,7 +445,10 @@ fn asks_for_is_10_tokens_with_demo_auth() {
     assert_eq!(taking(&router.routes(), "MON 1 video").as_deref(), Some("CAM 1 video"));
     let one = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
     assert_eq!(one["succeeded"], true, "{one:#}");
-    assert!(router.get("/api/state")["auth"].as_str().unwrap().contains("st2110-demo"));
+    // It registered itself for private_key_jwt, and publishes its key.
+    let auth = router.get("/api/state")["auth"].as_str().unwrap().to_string();
+    assert!(auth.contains("signing with its key"), "{auth}");
+    assert_eq!(router.get("/.well-known/jwks.json")["keys"][0]["alg"], "ES256");
     let mut socket = router.events();
     next(&mut socket, "state");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -480,6 +483,47 @@ fn asks_for_is_10_tokens_with_demo_auth() {
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
     );
+}
+
+/// `st2110 connect` with no registry named finds the demo's by unicast DNS-SD, and
+/// with --register finds its Authorization Server the same way, registers by RFC 7591
+/// with the initial access token, and keeps the registration for the next run.
+#[test]
+fn finds_the_demo_by_dns_sd_and_registers_with_its_authorization_server() {
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth"]);
+    let file = StateFile::new("clients");
+    let clients = file.0.with_file_name("clients.json");
+    let run = |more: &[&str], registration: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_st2110"))
+            .args(["connect", "--dns-server", &router.address, "--domain", "demo.test"])
+            .args(more)
+            .env("ST2110_REGISTRATION_TOKEN", registration)
+            .env("NO_COLOR", "1")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .output()
+            .expect("runs");
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (output.status.code(), text)
+    };
+    let register = ["--register", "--client-file", clients.to_str().unwrap()];
+    let (code, text) = run(&register, "demo-registration");
+    assert_eq!(code, Some(0), "{text}");
+    let base = format!("http://{}", router.address);
+    assert!(text.contains(&format!("Registry: {base} (st2110 demo registry, found by DNS in demo.test)")), "{text}");
+    assert!(text.contains(&format!("Authorization Server: {base}/ (")), "{text}");
+    assert!(text.contains("Registered with"), "{text}");
+    assert!(text.contains("receiver \"MON 4 video\""), "{text}");
+    let kept = std::fs::read_to_string(&clients).unwrap();
+    assert!(kept.contains("client_secret"), "{kept}");
+    // Kept, so not registered again.
+    let (code, text) = run(&register, "");
+    assert_eq!(code, Some(0), "{text}");
+    assert!(!text.contains("Registered with"), "{text}");
+    // Without the initial access token, the demo registers no one.
+    let (code, text) = run(&["--register", "--client-file", file.0.with_file_name("other.json").to_str().unwrap()], "");
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("invalid_token"), "{text}");
 }
 
 /// A state file of its own, removed when dropped.

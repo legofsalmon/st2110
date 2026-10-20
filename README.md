@@ -99,7 +99,20 @@ registry: 1 error, 3 warnings, 0 notes
 - `--format json`, `--quiet` and `--deny-warnings` work as they do for `lint`.
 - It exits with 0 when nothing is an error, 1 when something is, and 2 when the registry or file cannot be read.
 
-It only reads; `st2110 connect` makes connections. Give it a Node's address, or its Node API URL such as `http://camera.example/x-nmos/node/`, to check that Node alone where there is no registry. It reads the registry it is given, and `st2110 discover` finds registries and Nodes by DNS-SD. Where the registry asks for IS-10 access tokens, see [IS-10 access tokens](#is-10-access-tokens).
+It only reads; `st2110 connect` makes connections. Give it a Node's address, or its Node API URL such as `http://camera.example/x-nmos/node/`, to check that Node alone where there is no registry. Where the registry asks for IS-10 access tokens, see [IS-10 access tokens](#is-10-access-tokens).
+
+### Finding the registry
+
+Given no URL, `st2110 nmos`, `st2110 connect` and `st2110 router` find the registry by DNS-SD, as IS-04 has a controller do, and say on standard error which one they chose and how it was found:
+
+```console
+$ st2110 nmos --quiet
+Registry: http://192.168.10.5:80 (Registry, found by DNS in studio.example)
+```
+
+- They ask the system's DNS servers for `_nmos-query._tcp` in its search domains first (`--dns-server` and `--domain` to choose), and only when that finds none do they ask by multicast DNS, for up to three seconds (`--mdns` to ask a responder's own address instead).
+- Of the registries found, they take the one IS-04's procedure prefers: those found by unicast DNS, then one that asks for no authorization unless a token can be given, then one in use before one for development, the lowest `pri` first, going on to the next when one does not answer.
+- `st2110 router --demo` answers DNS-SD questions on its own address and port over UDP, for its registry and, with `--demo-auth`, its Authorization Server, in any domain: `st2110 nmos --dns-server 127.0.0.1:8110 --domain demo.test` finds it with no network.
 
 ## Connect Receivers to Senders
 
@@ -154,7 +167,7 @@ sender "CAM 1 audio" (5e0d0002) off: done at 2026-10-20 12:00:04.832702143 UTC
 - TARGET may also be a snapshot saved with `st2110 nmos --save`, when the registry is out of reach; the registry check is then skipped.
 - It exits with 0 when every connection was made, scheduled or planned, 1 when one was refused, failed or differs, and 2 when the registry or a file cannot be read, or a name finds no Sender or Receiver or more than one.
 
-Like `st2110 nmos` it does not browse DNS-SD, and it takes the same [IS-10 options](#is-10-access-tokens).
+Like `st2110 nmos` it [finds the registry by DNS-SD](#finding-the-registry) when given none, and it takes the same [IS-10 options](#is-10-access-tokens).
 
 ## Route from a browser
 
@@ -181,18 +194,21 @@ Anyone who can reach the page can make connections. It listens on `127.0.0.1:811
 
 ### IS-10 access tokens
 
-Where a registry or the Devices ask for IS-10 access tokens, `st2110 nmos`, `st2110 connect` and `st2110 router` send one with every request, including the router's subscriptions:
+Where a registry or the Devices ask for IS-10 access tokens, `st2110 nmos`, `st2110 connect`, `st2110 router` and `st2110 discover` send one with every request, including the router's subscriptions:
 
 ```console
 $ ST2110_CLIENT_SECRET=… st2110 router https://registry.example --auth https://auth.example/ --client-id st2110-router
 ```
 
 - `--auth URL --client-id ID` gets tokens from the Authorization Server whose issuer is URL, found from its RFC 8414 metadata, with the OAuth 2.0 Client Credentials grant (`client_secret_basic`) and the scopes `query connection` (`--scope` to change them). The secret comes from `--client-secret-file` or `ST2110_CLIENT_SECRET`, never the command line. A token is renewed half way to expiring, and at once when a server refuses it.
+- Without `--auth`, the Authorization Server is found by DNS-SD (`_nmos-auth._tcp`), unicast first, as IS-10 Discovery has clients do, the lowest `pri` first, its issuer from its address and `api_selector`.
+- `--register`, instead of `--client-id`, registers with the Authorization Server by OAuth 2.0 Dynamic Client Registration (RFC 7591), with a `client_name` unique to this run of this machine, for the Client Credentials grant and the scopes asked for. An initial access token the server gave for registering goes in `--registration-token-file` or `ST2110_REGISTRATION_TOKEN`. What the server issues is kept in a file only this user can read (`--client-file`; `clients.json` beside the router's state file by default), so the next run uses it rather than registering again, as IS-10 asks, and registers again only when the server no longer knows it.
+- `st2110 router --register --private-key-jwt` registers for `private_key_jwt` instead (RFC 7523), as IS-10 recommends a confidential client do: it signs an ES256 assertion for each token request with a key kept with the registrations, and publishes the public key at `http://<--listen>/.well-known/jwks.json`, its `jwks_uri`, so `--listen` has to be an address the Authorization Server can reach. `st2110 nmos` and `st2110 connect` cannot publish a key while they run so briefly, so they register for a secret.
 - `--token-file FILE` sends the token a file holds instead, read again whenever it changes, for a token another program keeps fresh.
 - A token is sent only over `https://` (and `wss://`), or to this machine, as IS-10 expects TLS.
-- `st2110 router --demo --demo-auth` tries it with no equipment: the demo asks for tokens and serves an Authorization Server, for client `st2110-demo` with secret `demo-secret`, whose tokens last a minute. The router gets its own; `st2110 connect http://127.0.0.1:8110 --auth http://127.0.0.1:8110/ --client-id st2110-demo` works too, with the secret in `ST2110_CLIENT_SECRET`. Its tokens are opaque strings where a real server issues signed JWTs.
+- `st2110 router --demo --demo-auth` tries it with no equipment: the demo asks for tokens and serves an Authorization Server whose tokens last a minute, to client `st2110-demo` with secret `demo-secret`, and to any client that registers with the initial access token `demo-registration`, for a secret or for `private_key_jwt`. The router registers itself for `private_key_jwt` and signs with a key of its own. `st2110 connect http://127.0.0.1:8110 --auth http://127.0.0.1:8110/ --client-id st2110-demo` works too, with the secret in `ST2110_CLIENT_SECRET`, and so does `ST2110_REGISTRATION_TOKEN=demo-registration st2110 connect --dns-server 127.0.0.1:8110 --domain demo.test --register`, which finds the registry and the Authorization Server by DNS-SD and registers. Its tokens are opaque strings where a real server issues signed JWTs.
 
-Not yet: finding the Authorization Server by DNS-SD (`_nmos-auth._tcp`), which IS-10 asks clients to do, dynamic client registration (RFC 7591), and `private_key_jwt` client authentication.
+Not yet: the Authorization Code grant with PKCE, by which a person signs in to the router in their browser. The router acts for whoever can reach its page and keeps one log of every take, so a token tied to one person would need the page to sign each person in and the router to hold a token for each, which it does not have; the Client Credentials grant fits a router that is one controller, as the NMOS controllers on a broadcast network usually are.
 
 ## Decode PTP messages
 
@@ -303,12 +319,12 @@ Looked for 10 s for SAP announcements to 239.255.255.255:9875 and 224.2.127.254:
 
 - `st2110 discover` listens for SAP announcements (RFC 2974) to 239.255.255.255 and 224.2.127.254 on port 9875, as AES67 devices make them and `st2110 send --sap` does. Each carries a stream's SDP file. A deletion takes its stream off the list at once; one not heard for three times the interval between its announcements, or 90 s when heard once, is marked as maybe stopped, and one not heard for an hour goes.
 - It browses by multicast DNS for registries' Query APIs (`_nmos-query._tcp`) and Nodes' Node APIs (`_nmos-node._tcp`), and asks the system's DNS servers for Query APIs in its search domains, as IS-04 has controllers do. It shares port 5353 with the system's responder to hear every answer, or asks from a port of its own where it cannot. `--dns-server` and `--domain` choose where to ask by unicast DNS, and `--no-dns` asks nowhere.
-- It reads the Senders from the registry a controller would choose: only those found by unicast DNS when there are any, then one that asks for no authorization first, then one in use before one for development (`pri` of 100 or more), the lowest `pri` first and one picked at random among equals, going on to the next when one does not answer. `--registry URL` names one instead. Where no registry answers, it reads each Node it found, peer to peer through its Node API, and again whenever the version counters the Node advertises change.
+- It reads the Senders from the registry a controller would choose: only those found by unicast DNS when there are any, then one that asks for no authorization first (unless it has a token to give, with the [IS-10 options](#is-10-access-tokens)), then one in use before one for development (`pri` of 100 or more), the lowest `pri` first and one picked at random among equals, going on to the next when one does not answer. `--registry URL` names one instead. Where no registry answers, it reads each Node it found, peer to peer through its Node API, and again whenever the version counters the Node advertises change.
 - It fetches each RTP Sender's SDP file from its `manifest_href`, as `st2110 nmos` does, but never through a proxy, and reads the registry or the Nodes again every 15 s. A stream that SAP announces and NMOS lists, going to the same addresses from the same sources (where both SDP files name them), is listed once, with both.
 - It looks on every port that is up, and on each one that comes up while it looks, or on those `--interface` names, for `--duration` seconds, 10 by default. Senders announce by SAP every 30 s or so, so give `--duration 35` to hear every one, or `--watch` to keep looking and print each stream as it comes, changes and goes. `--save DIR` writes each stream's SDP file there, named after the stream, to receive, view or check. `--sap`, `--no-sap`, `--no-nmos`, `--mdns` and `--timeout` change where and how it looks, and `--format json` gives everything it found, SDP files included.
 - It exits with 0 when it found a stream, 1 when it found none, and 2 when it could not look, as when another program holds a port alone.
 
-It only looks: it answers no queries and registers nothing. It reads IPv4, as ST 2110 networks are, and cannot read a registry or Node that asks for IS-10 authorization, nor encrypted SAP.
+It only looks: it answers no queries and registers nothing. It reads IPv4, as ST 2110 networks are, and cannot read encrypted SAP. A registry or Node that asks for IS-10 authorization is read with a token from the [IS-10 options](#is-10-access-tokens).
 
 To try it on one machine with no ST 2110 equipment, run `python3 scripts/try-discovery.py`. It serves the test facility's Camera 1 as an NMOS Node, advertises it with the system's multicast DNS responder (`dns-sd` on macOS, `avahi-publish` on Linux), sends a tone announced by SAP, and runs `st2110 discover`, which finds Camera 1's two streams and the tone. CI runs it on macOS.
 
