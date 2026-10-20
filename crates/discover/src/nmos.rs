@@ -196,6 +196,35 @@ pub fn by_preference_of<'a>(kind: ApiKind, apis: impl IntoIterator<Item = &'a Ap
     registries
 }
 
+/// The version counters a Node advertises in its TXT record while it advertises itself
+/// peer to peer (IS-04 v1.3 Discovery: Peer to Peer): one for each type of resource,
+/// each going up by one, from 255 round to 0, when a resource of that type is added,
+/// changed or removed, so that a controller reads the Node again only then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters([u8; 6]);
+
+impl Counters {
+    /// Notes a change to a resource of `kind`.
+    pub fn bump(&mut self, kind: Kind) {
+        let i = Kind::ALL.iter().position(|k| *k == kind).unwrap_or_default();
+        self.0[i] = self.0[i].wrapping_add(1);
+    }
+
+    /// The Node's TXT pairs: `api_proto`, `api_ver` (the IS-04 versions it serves),
+    /// `api_auth`, and the counters, `ver_slf` for the Node itself and `ver_dvc`,
+    /// `ver_src`, `ver_flw`, `ver_snd` and `ver_rcv` for the rest.
+    pub fn txt(&self, proto: &str, versions: &[&str], auth: bool) -> Vec<(String, String)> {
+        let mut txt = vec![
+            ("api_proto".to_string(), proto.to_string()),
+            ("api_ver".to_string(), versions.join(",")),
+            ("api_auth".to_string(), auth.to_string()),
+        ];
+        let keys = ["ver_slf", "ver_dvc", "ver_src", "ver_flw", "ver_snd", "ver_rcv"];
+        txt.extend(keys.iter().zip(self.0).map(|(k, v)| (k.to_string(), v.to_string())));
+        txt
+    }
+}
+
 /// A Sender read from an NMOS API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sender {
@@ -387,6 +416,19 @@ mod tests {
         let node = Api::from_service(&service(&node), ApiKind::Node, "mDNS").unwrap();
         assert_eq!(node.counters.len(), 2);
         assert!(!node.readable());
+    }
+
+    #[test]
+    fn counts_changes_to_each_type_round_from_255() {
+        let mut counters = Counters::default();
+        counters.bump(Kind::Receiver);
+        for _ in 0..256 {
+            counters.bump(Kind::Node);
+        }
+        counters.bump(Kind::Node);
+        let txt: BTreeMap<String, String> = counters.txt("http", &["v1.3"], false).into_iter().collect();
+        assert_eq!((txt["ver_rcv"].as_str(), txt["ver_slf"].as_str(), txt["ver_snd"].as_str()), ("1", "1", "0"));
+        assert_eq!((txt["api_ver"].as_str(), txt["api_auth"].as_str(), txt.len()), ("v1.3", "false", 9));
     }
 
     #[test]
