@@ -1797,7 +1797,8 @@ fn audio_latency_counts_from_the_signalled_offset() {
     audio.send(&mut scene, NOON * 1000, 1000);
     send_ptp(&mut scene, GM, 1, |_, _| false);
     let report = scene.analyse(&[fixture("aes67-offset.sdp")]);
-    assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    // The Dante fixture names its own grandmaster in domain 0, not this capture's.
+    assert_eq!(rules(&report), ["ptp-refclk"], "{:#?}", report.findings);
     assert_eq!(report.timescale.clock, Clock::Ptp);
     let latency = report.flows[0].audio.as_ref().unwrap().latency.unwrap();
     assert!(close(latency.min, 1150.0) && close(latency.max, 1150.0), "{latency:?}");

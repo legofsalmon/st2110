@@ -3,7 +3,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::audio::{AudioCounts, AudioDepacketiser};
+use crate::audio::{Aes3Counts, AudioCounts, AudioDepacketiser, describe_status};
 use crate::describe::{Description, Media};
 use crate::merge::{Extender, LegCounts, Merger, Pace, Playout, Released, Skew, Verdict, receiver_class};
 use crate::rtp;
@@ -161,6 +161,10 @@ pub struct AudioReport {
     pub counts: AudioCounts,
     /// The loudest sample on each channel, in dB below full scale; `None` for silence.
     pub peaks: Vec<Option<f64>>,
+    /// For ST 2110-31, what the AES3 bits showed.
+    pub aes3: Option<Aes3Counts>,
+    /// For ST 2110-31, the first signal's last whole block of channel status, in words.
+    pub channel_status: Option<String>,
 }
 
 /// What a receiver found.
@@ -556,7 +560,12 @@ impl Session {
                 });
             }
             Essence::Audio { depacketiser, .. } => {
-                report.audio = Some(AudioReport { counts: depacketiser.counts(), peaks: depacketiser.peaks() });
+                report.audio = Some(AudioReport {
+                    counts: depacketiser.counts(),
+                    peaks: depacketiser.peaks(),
+                    aes3: depacketiser.aes3(),
+                    channel_status: depacketiser.channel_status().map(|status| describe_status(&status)),
+                });
             }
         }
         self.judge(&mut report);
@@ -756,6 +765,28 @@ impl Session {
             if c.odd_sized > 0 {
                 let differ = if c.odd_sized == 1 { "differs" } else { "differ" };
                 notes.push(format!("{} {differ} from the packet time", count(c.odd_sized, "packet")));
+            }
+            if let Some(a) = audio.aes3 {
+                if a.parity_errors > 0 {
+                    problems.push(format!("{} failed the AES3 parity check", count(a.parity_errors, "subframe")));
+                }
+                if a.crc_errors > 0 {
+                    problems.push(format!("{} of channel status failed the CRC", count(a.crc_errors, "block")));
+                }
+                if a.framing_errors > 0 {
+                    problems.push(format!(
+                        "the B and F bits misplaced {} or block starts: F marks subframe 1 of each frame, and B \
+                         every 192nd frame",
+                        count(a.framing_errors, "frame")
+                    ));
+                }
+                // Two blocks' time with no block whole: the B bits never came.
+                if a.blocks + a.crc_errors == 0 && c.samples >= 2 * 192 && c.missing == 0 {
+                    problems.push("no whole block of channel status: no B bit marked a block's start".into());
+                }
+                if a.invalid > 0 {
+                    notes.push(format!("{} had the V bit set: not fit to use", count(a.invalid, "subframe")));
+                }
             }
         }
     }

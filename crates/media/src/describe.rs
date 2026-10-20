@@ -349,13 +349,30 @@ fn media(section: &Section) -> Result<(Media, u8), String> {
                 sample_rate: rtpmap.clock_rate,
                 bits: if encoding == "L16" { 16 } else { 24 },
                 samples_per_packet: samples_in(rtpmap.clock_rate, ms),
+                aes3: false,
+            };
+            format.check()?;
+            Media::Audio(format)
+        }
+        ("audio", "AM824") => {
+            let channels = rtpmap.params.as_deref().ok_or("AM824 gives no count of subframes")?;
+            let channels = channels.trim().parse().map_err(|_| format!("{channels} is not a count of subframes"))?;
+            // ST 2110-31 writes its packet times as Table 1 does, 0.12 for 125 µs.
+            let ptime = section.attribute("ptime").map(|a| a.text()).unwrap_or("1");
+            let samples = st2110_sdp::audio::aes3_samples(rtpmap.clock_rate, ptime)
+                .ok_or_else(|| format!("a=ptime:{ptime} is not an ST 2110-31 packet time"))?;
+            let format = AudioFormat {
+                channels,
+                sample_rate: rtpmap.clock_rate,
+                samples_per_packet: samples,
+                ..AudioFormat::new(2).am824()
             };
             format.check()?;
             Media::Audio(format)
         }
         (kind, _) => {
             return Err(format!(
-                "{kind} {}: only ST 2110-20 video (raw) and ST 2110-30 audio (L24, L16) can be received",
+                "{kind} {}: only ST 2110-20 video (raw), ST 2110-30 audio (L24, L16) and ST 2110-31 AES3 (AM824) can be received",
                 rtpmap.encoding
             ));
         }
@@ -418,6 +435,23 @@ mod tests {
         let (back, _) = Description::parse(&text).unwrap();
         assert_eq!(back.media, audio.media);
         assert_eq!(back.legs, audio.legs);
+
+        // ST 2110-31: AES3 groups, and the packet time as Table 1 writes it.
+        let aes3 =
+            Description { media: Media::Audio(AudioFormat::new(4).am824().with_packet_time(0.125).unwrap()), ..audio };
+        let text = aes3.sdp(7);
+        assert!(
+            text.contains(
+                "a=rtpmap:97 AM824/48000/4\r\na=fmtp:97 channel-order=SMPTE2110.(AES3,AES3); TSMODE=SAMP; TSDELAY=125\r\na=ptime:0.12\r\n"
+            ),
+            "{text}"
+        );
+        let report = st2110_sdp::lint(&text);
+        let findings: Vec<_> =
+            report.diagnostics.iter().filter(|d| d.severity != Severity::Info).map(|d| d.message.clone()).collect();
+        assert!(findings.is_empty(), "{findings:?}\n{text}");
+        let (back, _) = Description::parse(&text).unwrap();
+        assert_eq!(back.media, aes3.media);
     }
 
     #[test]

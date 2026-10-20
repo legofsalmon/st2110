@@ -37,12 +37,7 @@ enum Event {
     },
     /// `to` is the destination address, or `None` when the message came over Ethernet
     /// rather than UDP.
-    Ptp {
-        t: i128,
-        from: String,
-        to: Option<IpAddr>,
-        message: Box<Message>,
-    },
+    Ptp { t: i128, from: String, to: Option<IpAddr>, message: Box<Message> },
 }
 
 impl Event {

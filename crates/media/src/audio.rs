@@ -2,24 +2,103 @@
 //!
 //! Samples are signed integers at the format's depth, interleaved: every channel's
 //! sample for one instant, then the next instant's.
+//!
+//! ST 2110-31 carries them as AES3 signals instead: each pair of channels is one signal,
+//! each sample one AM824 subframe of 32 bits, the AES3 B, F, P, C, U and V bits and then
+//! the 24-bit sample (ST 2110-31:2022 §5.4).
 
 use crate::format::AudioFormat;
 use crate::rtp;
 
-/// Cuts samples into ST 2110-30 packets, one packet time each.
+/// AES3 frames in a block, over which the channel status runs, one bit a frame.
+const BLOCK_FRAMES: usize = 192;
+
+/// The AM824 flag bits: block start, frame start, parity, channel status, user data and
+/// validity.
+const B: u8 = 0x20;
+const F: u8 = 0x10;
+const P: u8 = 0x08;
+const C: u8 = 0x04;
+const V: u8 = 0x01;
+
+/// The 24 octets of AES3 channel status a sender gives every signal: professional use,
+/// linear PCM, no emphasis, the sampling frequency where byte 0 can name it, and 24-bit
+/// samples, ending with the CRC (AES3-2-2009 §5).
+pub fn channel_status(sample_rate: u32) -> [u8; 24] {
+    let mut status = [0; 24];
+    // Bit 0 professional, bits 2 to 4 no emphasis, bits 6 and 7 the frequency.
+    status[0] = 0x05
+        | match sample_rate {
+            48_000 => 0x80,
+            44_100 => 0x40,
+            _ => 0,
+        };
+    // Byte 2, bits 0 to 2: up to 24 bits of audio.
+    status[2] = 0x01;
+    status[23] = status_crc(&status[..23]);
+    status
+}
+
+/// The channel status CRC: x⁸ + x⁴ + x³ + x² + 1 from all ones, over the bits in the
+/// order they are sent, least significant first.
+fn status_crc(bytes: &[u8]) -> u8 {
+    let mut crc = 0xFFu8;
+    for &byte in bytes {
+        crc ^= byte;
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xB8 } else { crc >> 1 };
+        }
+    }
+    crc
+}
+
+/// Words a block of channel status: who it is for, what it carries and the frequency.
+pub fn describe_status(status: &[u8; 24]) -> String {
+    if status[0] & 1 == 0 {
+        return "consumer use".into();
+    }
+    let carries = if status[0] & 2 == 0 { "linear PCM" } else { "not linear PCM" };
+    // Bit 6 is sent first: 0 then 1 is 48 kHz, 1 then 0 is 44.1 kHz.
+    let rate = match status[0] >> 6 {
+        2 => "48 kHz",
+        1 => "44.1 kHz",
+        3 => "32 kHz",
+        _ => "frequency not indicated",
+    };
+    format!("professional use, {carries}, {rate}")
+}
+
+/// Whether the parity bit evens out the 28 bits it covers.
+fn parity_holds(subframe: [u8; 4]) -> bool {
+    (u32::from_be_bytes(subframe) & 0x0FFF_FFFF).count_ones().is_multiple_of(2)
+}
+
+/// Cuts samples into ST 2110-30 packets, one packet time each, or ST 2110-31 packets of
+/// AM824 subframes.
 #[derive(Clone, Debug)]
 pub struct AudioPacketiser {
     format: AudioFormat,
     payload_type: u8,
     ssrc: u32,
     sequence: u16,
+    /// For AM824, the channel status every signal sends, and the next frame's place in
+    /// its block.
+    status: [u8; 24],
+    frame: usize,
 }
 
 impl AudioPacketiser {
     /// A packetiser for one stream.
     pub fn new(format: &AudioFormat, payload_type: u8, ssrc: u32, first_sequence: u16) -> Result<Self, String> {
         format.check()?;
-        Ok(Self { format: format.clone(), payload_type, ssrc, sequence: first_sequence })
+        Ok(Self {
+            format: format.clone(),
+            payload_type,
+            ssrc,
+            sequence: first_sequence,
+            status: channel_status(format.sample_rate),
+            frame: 0,
+        })
     }
 
     /// The sequence number the next packet will carry.
@@ -33,7 +112,23 @@ impl AudioPacketiser {
         debug_assert_eq!(samples.len(), self.format.samples_per_packet as usize * usize::from(self.format.channels));
         out.clear();
         rtp::write_header(out, false, self.payload_type, self.sequence, timestamp, self.ssrc);
-        if self.format.bits == 16 {
+        if self.format.aes3 {
+            for instant in samples.chunks(usize::from(self.format.channels)) {
+                let k = self.frame;
+                let c = if (self.status[k / 8] >> (k % 8)) & 1 == 1 { C } else { 0 };
+                for (j, &s) in instant.iter().enumerate() {
+                    // Subframe 1 starts the frame, and frame 0 the block; U and V stay 0.
+                    let first = j % 2 == 0;
+                    let mut flags = c | if first { F } else { 0 } | if first && k == 0 { B } else { 0 };
+                    let [_, a, b, d] = s.to_be_bytes();
+                    if !parity_holds([flags, a, b, d]) {
+                        flags |= P;
+                    }
+                    out.extend_from_slice(&[flags, a, b, d]);
+                }
+                self.frame = (k + 1) % BLOCK_FRAMES;
+            }
+        } else if self.format.bits == 16 {
             for &s in samples {
                 out.extend_from_slice(&(s as i16).to_be_bytes());
             }
@@ -72,6 +167,31 @@ pub struct AudioCounts {
     pub malformed: u64,
 }
 
+/// What the depacketiser found in AM824 subframes, counted over every AES3 signal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Aes3Counts {
+    /// Blocks of channel status that came whole with the right CRC.
+    pub blocks: u64,
+    /// Blocks whose CRC did not match.
+    pub crc_errors: u64,
+    /// Subframes whose parity bit did not even out the bits it covers.
+    pub parity_errors: u64,
+    /// Frames whose F bits did not mark subframe 1 alone, or whose B bit came other than
+    /// 192 frames after the last.
+    pub framing_errors: u64,
+    /// Subframes whose V bit said the sample is not fit to use.
+    pub invalid: u64,
+}
+
+/// Where one AES3 signal's frames are in its block, once a B bit has said, and the
+/// channel status they have brought so far.
+#[derive(Clone, Debug, Default)]
+struct Signal {
+    frame: Option<usize>,
+    status: [u8; 24],
+}
+
 /// The longest gap filled with silence, and the furthest the run may get ahead of the
 /// time since the first packet came, in seconds.
 const MOST_SILENCE: u64 = 10;
@@ -97,6 +217,11 @@ pub struct AudioDepacketiser {
     /// since, silence and all.
     first: Option<i128>,
     played: u64,
+    /// For AM824, each signal's place in its block, what was found, and the last whole
+    /// block of channel status.
+    signals: Vec<Signal>,
+    aes3: Aes3Counts,
+    status: Option<[u8; 24]>,
 }
 
 impl AudioDepacketiser {
@@ -111,12 +236,25 @@ impl AudioDepacketiser {
             samples: Vec::new(),
             first: None,
             played: 0,
+            signals: vec![Signal::default(); usize::from(format.channels / 2)],
+            aes3: Aes3Counts::default(),
+            status: None,
         })
     }
 
     /// What it has counted.
     pub fn counts(&self) -> AudioCounts {
         self.counts
+    }
+
+    /// For AM824, what it found in the AES3 bits.
+    pub fn aes3(&self) -> Option<Aes3Counts> {
+        self.format.aes3.then_some(self.aes3)
+    }
+
+    /// For AM824, the last whole block of channel status of the first signal.
+    pub fn channel_status(&self) -> Option<[u8; 24]> {
+        self.status
     }
 
     /// The loudest sample on each channel so far, in dB below full scale; `None` for a
@@ -129,6 +267,14 @@ impl AudioDepacketiser {
     /// Forgets where the stream was, for one that starts again. The run goes on.
     pub fn reset(&mut self) {
         self.next = None;
+        self.lose_blocks();
+    }
+
+    /// Forgets where each AES3 signal is in its block, until its next B bit.
+    fn lose_blocks(&mut self) {
+        for signal in &mut self.signals {
+            signal.frame = None;
+        }
     }
 
     /// Takes one RTP packet that arrived at `at` nanoseconds, with `missing` packets lost
@@ -151,6 +297,9 @@ impl AudioDepacketiser {
         let per_packet = self.format.samples_per_packet;
         if count != per_packet {
             self.counts.odd_sized += 1;
+        }
+        if missing > 0 {
+            self.lose_blocks();
         }
         if let Some(next) = self.next {
             let ahead = i64::from(header.timestamp.wrapping_sub(next) as i32);
@@ -176,7 +325,13 @@ impl AudioDepacketiser {
             self.silence(lost.saturating_add(unsent).min(MOST_SILENCE * rate).min(room), &mut play);
         }
         self.samples.clear();
-        if self.format.bits == 16 {
+        if self.format.aes3 {
+            for instant in payload.as_chunks::<4>().0.chunks(channels) {
+                self.frames(instant);
+            }
+            self.samples
+                .extend(payload.as_chunks::<4>().0.iter().map(|&[_, a, b, c]| i32::from_be_bytes([a, b, c, 0]) >> 8));
+        } else if self.format.bits == 16 {
             self.samples.extend(payload.as_chunks::<2>().0.iter().map(|&b| i32::from(i16::from_be_bytes(b))));
         } else {
             // Into the top three octets, then back down with the sign.
@@ -192,6 +347,53 @@ impl AudioDepacketiser {
         self.counts.packets += 1;
         self.counts.samples += u64::from(count);
         self.next = Some(header.timestamp.wrapping_add(count));
+    }
+
+    /// Checks one instant's AM824 subframes, a pair for each AES3 signal, and gathers
+    /// each signal's channel status.
+    fn frames(&mut self, instant: &[[u8; 4]]) {
+        for (signal, pair) in self.signals.iter_mut().zip(instant.as_chunks::<2>().0.iter()) {
+            let (one, two) = (pair[0][0], pair[1][0]);
+            for subframe in pair {
+                self.aes3.parity_errors += u64::from(!parity_holds(*subframe));
+                self.aes3.invalid += u64::from(subframe[0] & V != 0);
+            }
+            // A B bit on subframe 2, as AES10 can send, is let be (ST 2110-31:2022 Annex A).
+            if one & F == 0 || two & F != 0 {
+                self.aes3.framing_errors += 1;
+            }
+            match (one & B != 0, signal.frame) {
+                (true, Some(k)) if k != 0 => {
+                    self.aes3.framing_errors += 1;
+                    signal.frame = Some(0);
+                }
+                (true, _) => signal.frame = Some(0),
+                (false, Some(0)) => {
+                    self.aes3.framing_errors += 1;
+                    signal.frame = None;
+                }
+                (false, _) => {}
+            }
+            let Some(k) = signal.frame else { continue };
+            if k == 0 {
+                signal.status = [0; 24];
+            }
+            signal.status[k / 8] |= u8::from(one & C != 0) << (k % 8);
+            if k + 1 == BLOCK_FRAMES {
+                if status_crc(&signal.status[..23]) == signal.status[23] {
+                    self.aes3.blocks += 1;
+                } else {
+                    self.aes3.crc_errors += 1;
+                }
+            }
+            signal.frame = Some((k + 1) % BLOCK_FRAMES);
+        }
+        if let Some(first) = self.signals.first()
+            && first.frame == Some(0)
+            && status_crc(&first.status[..23]) == first.status[23]
+        {
+            self.status = Some(first.status);
+        }
     }
 
     /// Plays `instants` of silence.
@@ -335,6 +537,58 @@ mod tests {
         d.reset();
         d.push(0, &packets[0], 0, |s| assert_eq!(s.len(), 96));
         assert_eq!(d.counts().jumps, 2);
+    }
+
+    #[test]
+    fn am824_carries_aes3_frames_and_channel_status() {
+        // CRC-8/AES, as the CRC catalogue checks it.
+        assert_eq!(status_crc(b"123456789"), 0x97);
+        let status = channel_status(48_000);
+        assert_eq!((status[0], status_crc(&status[..23]) == status[23]), (0x85, true));
+        assert_eq!(describe_status(&status), "professional use, linear PCM, 48 kHz");
+        let format = AudioFormat::new(4).am824().with_packet_time(0.125).unwrap();
+        // 600 instants: three blocks and some.
+        let (samples, packets) = packets(&format, 100, 0);
+        let p = &packets[0];
+        assert_eq!(p.len(), 12 + 6 * 4 * 4);
+        // Signal 1's subframe 1 starts the block, with B and F; subframe 2 has neither.
+        assert_eq!((p[12] & (B | F), p[16] & (B | F), p[20] & (B | F)), (B | F, 0, B | F));
+        // The first sample is at negative full scale, and its C bit is byte 0's bit 0.
+        assert_eq!(p[12..16], [B | F | C, 0x80, 0, 0]);
+        assert!(p[12..].as_chunks::<4>().0.iter().all(|s| parity_holds(*s)));
+        // Frame 192 starts the next block.
+        assert_eq!(packets[32][12] & B, B);
+        assert_eq!(packets[31][12] & B, 0);
+        let mut d = AudioDepacketiser::new(&format).unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            d.push(0, p, 0, |s| out.extend_from_slice(s));
+        }
+        assert_eq!(out, samples);
+        assert_eq!(d.aes3(), Some(Aes3Counts { blocks: 6, ..Default::default() }));
+        assert_eq!(d.channel_status(), Some(status));
+        // A flipped bit breaks the parity, and the block's CRC if it is a C bit; a lost
+        // packet loses the block it falls in until the next B bit.
+        let mut d = AudioDepacketiser::new(&format).unwrap();
+        let mut bad = packets.clone();
+        bad[1][12 + 16] ^= C;
+        bad[40][13] ^= 0x10;
+        for (i, p) in bad.iter().enumerate().filter(|(i, _)| *i != 70) {
+            d.push(0, p, u64::from(i == 71), |_| {});
+        }
+        let c = d.aes3().unwrap();
+        assert_eq!((c.blocks, c.crc_errors, c.parity_errors, c.framing_errors), (3, 1, 2, 0));
+        // Subframe 2 marked as a frame start, and a B bit out of place.
+        let mut d = AudioDepacketiser::new(&format).unwrap();
+        let mut bad = packets.clone();
+        bad[2][12 + 4] |= F;
+        bad[5][12] |= B;
+        for p in &bad {
+            d.push(0, p, 0, |_| {});
+        }
+        let c = d.aes3().unwrap();
+        assert_eq!((c.framing_errors, c.parity_errors), (3, 0));
+        assert!(AudioDepacketiser::new(&AudioFormat::new(2)).unwrap().aes3().is_none());
     }
 
     #[test]
