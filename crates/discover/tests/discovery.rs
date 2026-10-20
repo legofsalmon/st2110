@@ -455,3 +455,26 @@ fn finds_one_kind_of_api_by_unicast_dns_sd_first() {
     assert_eq!((server.issuer().as_str(), server.by.as_str()), ("http://127.0.0.1:4001/", "mDNS"));
     assert!(seen.problems.is_empty(), "{seen:?}");
 }
+
+/// An IS-09 System API is found as registries are: by unicast DNS-SD, lowest priority
+/// first.
+#[test]
+fn finds_a_system_api() {
+    use st2110_discover::find::{Look, by_priority, find};
+    let txt = vec!["api_proto=http", "api_ver=v1.0", "pri=20"];
+    let advertised = Advertised::new("System", "_nmos-system._tcp.studio.test", "system.studio.test", 4100, txt);
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dns_server = server.local_addr().unwrap();
+    answer(server, advertised, Answers::Dns, Arc::new(AtomicBool::new(false)));
+    let look = Look {
+        dns_servers: vec![dns_server],
+        domains: Some(vec!["studio.test".into()]),
+        mdns: None,
+        listen: Duration::from_secs(5),
+        ..Look::default()
+    };
+    let seen = find(ApiKind::System, &look);
+    let [api] = &by_priority(&seen.apis)[..] else { panic!("{seen:?}") };
+    assert_eq!((api.kind, api.url.as_str(), api.priority), (ApiKind::System, "http://127.0.0.1:4100", Some(20)));
+    assert_eq!(api.versions, ["v1.0"]);
+}

@@ -43,7 +43,7 @@ use st2110_ptp::{PtpTime, TAI_UTC_2017};
 use st2110_sdp::Rational;
 
 use crate::client::{ConnectionClient, Reply, bulk, single};
-use crate::{Activation, Constraints, Destination, Plan, SenderChange, SenderPlan, tai};
+use crate::{Activation, Constraints, Destination, EVENT_TRANSPORTS, Plan, SenderChange, SenderPlan, tai};
 
 /// Receivers to read at once while connections are prepared.
 const AT_ONCE: usize = 16;
@@ -889,10 +889,18 @@ fn prepare(snapshot: &Snapshot, client: &ConnectionClient, job: &Job) -> Result<
     let receiver = &job.report.receiver;
     let api = connection_api(receiver)?;
     let previous = read_json(client, &single(&api, Kind::Receiver, &receiver.id, "active"))?;
+    let events = receiver.transport.as_deref().filter(|t| EVENT_TRANSPORTS.contains(t));
     let (sdp, from) = match &job.take {
         Take::Nothing => {
             let plan = Plan::disconnect(Activation::Immediate);
             return Ok(Prepared { api, previous, plan, unicast: None, sdp: None, unfit: None });
+        }
+        Take::Sdp { .. } if events.is_some() => {
+            return Err("it is an IS-07 event Receiver, which takes a Sender's events, not an SDP file".into());
+        }
+        Take::Sender(_) if events.is_some() => {
+            let sender = job.report.sender.as_ref().expect("a Sender route found its Sender");
+            return prepare_events(snapshot, client, receiver, sender, api, previous);
         }
         Take::Sender(_) => {
             let sender = job.report.sender.as_ref().expect("a Sender route found its Sender");
@@ -920,6 +928,38 @@ fn prepare(snapshot: &Snapshot, client: &ConnectionClient, job: &Job) -> Result<
     let plan =
         Plan::connect(&sdp, sender_id, &constraints, Activation::Immediate).map_err(|e| format!("{from}: {e}"))?;
     Ok(Prepared { api, previous, plan, unicast, sdp: Some(from), unfit })
+}
+
+/// Plans connecting an IS-07 event Receiver: from the Sender's `/active`, which says
+/// where its events are, rather than an SDP file, which it has none of.
+fn prepare_events(
+    snapshot: &Snapshot,
+    client: &ConnectionClient,
+    receiver: &Endpoint,
+    sender: &Endpoint,
+    api: String,
+    previous: Value,
+) -> Result<Prepared, String> {
+    let transport = receiver.transport.as_deref().unwrap_or_default();
+    if sender.transport.as_deref() != Some(transport) {
+        let short =
+            |t: Option<&str>| t.map_or("an unknown transport", |t| t.rsplit(':').next().unwrap_or(t)).to_string();
+        return Err(format!(
+            "it takes events over {}, but {} sends over {}",
+            short(Some(transport)),
+            sender.describe(),
+            short(sender.transport.as_deref())
+        ));
+    }
+    let sender_api = connection_api(sender).map_err(|e| format!("{}: {e}", sender.describe()))?;
+    let sender_active = read_json(client, &single(&sender_api, Kind::Sender, &sender.id, "active"))?;
+    let constraints = read_json(client, &single(&api, Kind::Receiver, &receiver.id, "constraints"))?;
+    let constraints = Constraints::from_json(&constraints).map_err(|e| format!("its /constraints are {e}"))?;
+    let unfit = routing::route(snapshot, &sender.id, &receiver.id, None).err();
+    let plan = Plan::connect_events(&sender_active, transport, Some(&sender.id), &constraints, Activation::Immediate)
+        .map_err(|e| format!("{}: {e}", sender.describe()))?;
+    let from = single(&sender_api, Kind::Sender, &sender.id, "active");
+    Ok(Prepared { api, previous, plan, unicast: None, sdp: Some(from), unfit })
 }
 
 /// A Sender's SDP file, and where it came from: its `manifest_href`, or else its
@@ -953,7 +993,7 @@ fn sender_sdp(client: &ConnectionClient, sender: &Endpoint) -> Result<(String, S
 }
 
 /// Reads a JSON resource that must be there.
-fn read_json(client: &ConnectionClient, url: &str) -> Result<Value, String> {
+pub(crate) fn read_json(client: &ConnectionClient, url: &str) -> Result<Value, String> {
     let reply = client.get(url).map_err(|e| e.to_string())?;
     match reply {
         Reply { status: 200, body: body @ (Value::Object(_) | Value::Array(_)), .. } => Ok(body),
@@ -1306,7 +1346,7 @@ fn aligned(activation: Activation, rate: Option<Rational>) -> Activation {
 }
 
 /// The system clock's time as PTP time, when TAI − UTC is `tai_utc` seconds.
-fn now(tai_utc: i32) -> PtpTime {
+pub(crate) fn now(tai_utc: i32) -> PtpTime {
     let unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
     PtpTime::from_utc(unix, tai_utc).unwrap_or_default()
 }

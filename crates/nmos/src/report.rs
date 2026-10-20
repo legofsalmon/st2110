@@ -72,6 +72,18 @@ impl Findings {
         });
     }
 
+    /// Adds a finding about the system as a whole, such as its System API.
+    pub fn system(&mut self, rule: &'static Rule, message: impl Into<String>) {
+        self.0.push(Finding {
+            rule: rule.id,
+            severity: rule.severity,
+            message: message.into(),
+            reference: rule.reference,
+            resource: None,
+            line: None,
+        });
+    }
+
     /// Adds what the SDP linter found in a Sender's transport file.
     pub fn sdp(&mut self, sender: &Core<'_>, diagnostics: Vec<st2110_sdp::Diagnostic>) {
         for d in diagnostics {
@@ -123,6 +135,12 @@ pub struct SenderView {
     pub streams: Vec<Stream>,
     /// The Receivers that are taking its stream.
     pub receivers: Vec<String>,
+    /// Its IS-11 `status` `state`, such as `constrained`, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat: Option<String>,
+    /// How many IS-11 active constraint sets it has, when they were read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_constraints: Option<usize>,
 }
 
 /// A Receiver, as a controller would list it.
@@ -146,6 +164,79 @@ pub struct ReceiverView {
     pub sender_id: Option<String>,
     /// That Sender's label, when it is registered.
     pub sender_label: Option<String>,
+    /// Its IS-11 `status` `state`, such as `compliant_stream`, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat: Option<String>,
+}
+
+/// A Node's network interface, with what LLDP says of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InterfaceView {
+    /// Its name, such as `eth0`.
+    pub name: String,
+    /// The LLDP chassis ID the Node sends; `None` where it sends none.
+    pub chassis_id: Option<String>,
+    /// The LLDP port ID: the interface's MAC address.
+    pub port_id: Option<String>,
+    /// The switch it is plugged into, by the chassis ID the switch sends in LLDP.
+    pub switch: Option<String>,
+    /// The switch port it is plugged into, by the port ID the switch sends in LLDP.
+    pub switch_port: Option<String>,
+}
+
+/// A Node, with its network interfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NodeView {
+    /// Its `id`.
+    pub id: Option<String>,
+    /// Its `label`.
+    pub label: String,
+    /// Its interfaces; empty where it lists none.
+    pub interfaces: Vec<InterfaceView>,
+}
+
+/// One channel of an IS-08 Output, and what is routed to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChannelRoute {
+    /// The Input routed to it; `None` for silence.
+    pub input: Option<String>,
+    /// The channel of that Input, counting from 0.
+    pub channel_index: Option<u64>,
+}
+
+/// An IS-08 Output and what each of its channels takes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OutputMap {
+    /// The Output's identifier.
+    pub id: String,
+    /// Its name, from its `properties`.
+    pub name: Option<String>,
+    /// Each channel, in order.
+    pub channels: Vec<ChannelRoute>,
+}
+
+/// A Device's IS-08 active channel map.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChannelMapView {
+    /// The Device's `id`.
+    pub device_id: String,
+    /// The Device's `label`.
+    pub device: String,
+    /// Each Output, in identifier order.
+    pub outputs: Vec<OutputMap>,
+}
+
+/// What the IS-09 System API gives the system.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SystemView {
+    /// Its `/global` URL.
+    pub url: String,
+    /// The PTP domain every Node is to use.
+    pub ptp_domain: Option<u64>,
+    /// Announce intervals before a PTP timeout.
+    pub announce_receipt_timeout: Option<u64>,
+    /// Seconds between each Node's IS-04 heartbeats.
+    pub heartbeat_interval: Option<u64>,
 }
 
 /// A grandmaster and the number of locked PTP clocks that follow it.
@@ -195,6 +286,14 @@ pub struct Report {
     pub senders: Vec<SenderView>,
     /// Every Receiver, in label order.
     pub receivers: Vec<ReceiverView>,
+    /// Every Node, in label order, with its interfaces.
+    pub nodes: Vec<NodeView>,
+    /// Each IS-08 channel map read, in Device label order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub channel_maps: Vec<ChannelMapView>,
+    /// What the IS-09 System API gives, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemView>,
     /// Every finding, grouped by resource.
     pub findings: Vec<Finding>,
 }

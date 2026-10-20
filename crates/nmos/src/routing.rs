@@ -56,6 +56,31 @@ pub struct Endpoint {
     pub subscription: Option<String>,
     /// The Connection API that controls it: its Device's newest IS-05 v1 control.
     pub connection_api: Option<ConnectionApi>,
+    /// The IS-11 Stream Compatibility Management API of its Device, when it advertises
+    /// one (`urn:x-nmos:control:stream-compat/v1.0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_compat: Option<ConnectionApi>,
+}
+
+/// A Device, as a controller finds it in the registry to reach its control APIs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeviceEndpoint {
+    /// Its `id`.
+    pub id: String,
+    /// Its `label`, which may be empty.
+    pub label: String,
+    /// The label of its Node.
+    pub node: Option<String>,
+    /// Its IS-08 Channel Mapping API (`urn:x-nmos:control:cm-ctrl/v1.0`), when it
+    /// advertises one.
+    pub channel_mapping: Option<ConnectionApi>,
+}
+
+impl DeviceEndpoint {
+    /// A short name for messages, such as `device "Monitor 1" (de710002)`.
+    pub fn describe(&self) -> String {
+        ResourceRef { kind: Kind::Device, id: Some(self.id.clone()), label: self.label.clone(), index: 0 }.describe()
+    }
 }
 
 impl Endpoint {
@@ -69,12 +94,27 @@ impl Endpoint {
 /// versions with an HTTP(S) URL are listed: every v1 minor version takes the requests
 /// v1.0 defines.
 fn connection_apis(device: &Device<'_>) -> Vec<ConnectionApi> {
+    control_apis(device, SR_CTRL, "/x-nmos/connection")
+}
+
+/// The control type an IS-11 Stream Compatibility Management API is advertised under,
+/// before its version.
+pub(crate) const STREAM_COMPAT: &str = "urn:x-nmos:control:stream-compat/";
+
+/// The control type an IS-08 Channel Mapping API is advertised under, before its version.
+pub(crate) const CM_CTRL: &str = "urn:x-nmos:control:cm-ctrl/";
+
+/// The APIs of one control type, `prefix` such as `urn:x-nmos:control:sr-ctrl/`, that a
+/// Device advertises, newest v1 version first, each with its versioned base URL: the
+/// `href`, with the version added where it stops short at `path`, such as
+/// `/x-nmos/connection`.
+pub(crate) fn control_apis(device: &Device<'_>, prefix: &str, path: &str) -> Vec<ConnectionApi> {
     let mut apis: Vec<((u32, u32), ConnectionApi)> = device
         .controls
         .iter()
         .flatten()
         .filter_map(|control| {
-            let version = control.kind.strip_prefix(SR_CTRL)?;
+            let version = control.kind.strip_prefix(prefix)?;
             let (major, minor) = version.strip_prefix('v')?.split_once('.')?;
             let number = (major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?);
             if number.0 != 1 || !is_http(control.href) {
@@ -82,11 +122,7 @@ fn connection_apis(device: &Device<'_>) -> Vec<ConnectionApi> {
             }
             // The href names the versioned base; add the version where it stops short.
             let trimmed = control.href.trim().trim_end_matches('/');
-            let href = if trimmed.ends_with("/x-nmos/connection") {
-                format!("{trimmed}/{version}/")
-            } else {
-                format!("{trimmed}/")
-            };
+            let href = if trimmed.ends_with(path) { format!("{trimmed}/{version}/") } else { format!("{trimmed}/") };
             Some((number, ConnectionApi { version: version.to_string(), href }))
         })
         .collect();
@@ -146,7 +182,90 @@ fn endpoint(model: &Model<'_>, core: &Core<'_>, device_id: Option<&str>) -> Endp
         active: None,
         subscription: None,
         connection_api: device.and_then(|d| connection_apis(d).into_iter().next()),
+        stream_compat: device
+            .and_then(|d| control_apis(d, STREAM_COMPAT, "/x-nmos/streamcompatibility").into_iter().next()),
     }
+}
+
+/// Finds the Device that `selector` names: by its `id`, its `label` (ignoring case), or
+/// the start of its `id`, in that order; or else the Device of the Sender or Receiver
+/// it names that way. Fails when nothing matches, or more than one Device does.
+pub fn find_device(snapshot: &Snapshot, selector: &str) -> Result<DeviceEndpoint, String> {
+    let model = Model::read(snapshot);
+    let wanted = selector.trim();
+    if wanted.is_empty() {
+        return Err("no device was named".into());
+    }
+    let lower = wanted.to_ascii_lowercase();
+    let devices: Vec<&Device<'_>> = model.devices.iter().filter(|d| d.core.id.is_some()).collect();
+    let pick = |test: &dyn Fn(&Device<'_>) -> bool| -> Vec<&Device<'_>> {
+        devices.iter().copied().filter(|d| test(d)).collect()
+    };
+    let by_id = pick(&|d| d.core.id.is_some_and(|id| id.eq_ignore_ascii_case(wanted)));
+    let by_label = pick(&|d| d.core.label.trim().eq_ignore_ascii_case(wanted));
+    let by_prefix = pick(&|d| d.core.id.is_some_and(|id| id.to_ascii_lowercase().starts_with(&lower)));
+    let found = [by_id, by_label, by_prefix].into_iter().find(|found| !found.is_empty());
+    let device = match found.as_deref() {
+        Some([device]) => *device,
+        Some(several) => {
+            let names: Vec<String> = several.iter().map(|d| name(&d.core)).collect();
+            return Err(format!(
+                "{} devices match {wanted}: {}; name one by its id",
+                several.len(),
+                list(names.iter().map(String::as_str))
+            ));
+        }
+        None => {
+            // A Sender or Receiver of the Device will do.
+            let endpoint = find(snapshot, Kind::Receiver, wanted)
+                .or_else(|_| find(snapshot, Kind::Sender, wanted))
+                .map_err(|_| format!("no device, sender or receiver has the id or label {wanted}"))?;
+            let device_id = match endpoint.kind {
+                Kind::Sender => model.sender(&endpoint.id).and_then(|s| s.device_id),
+                _ => model.receiver(&endpoint.id).and_then(|r| r.device_id),
+            };
+            device_id
+                .and_then(|id| model.device(id))
+                .ok_or_else(|| format!("the device of {} is not registered", endpoint.describe()))?
+        }
+    };
+    Ok(DeviceEndpoint {
+        id: device.core.id.unwrap_or_default().to_string(),
+        label: device.core.label.to_string(),
+        node: model.node(device.node_id.unwrap_or_default()).map(|n| n.core.label.to_string()),
+        channel_mapping: control_apis(device, CM_CTRL, "/x-nmos/channelmapping").into_iter().next(),
+    })
+}
+
+/// A Sender's or Receiver's IS-11 resources: what it is, its `id`, and its own base.
+#[cfg(feature = "client")]
+pub(crate) type ControlUrl = (Kind, String, String);
+
+/// Where each Sender's and Receiver's IS-11 resources are, and each Device's IS-08 ones,
+/// for a snapshot to read: `(kind, id, base)` with `base` the Sender's or Receiver's own path
+/// on its Device's Stream Compatibility Management API, such as
+/// `…/x-nmos/streamcompatibility/v1.0/senders/{id}/`, and `(device id, base)` with the
+/// Channel Mapping API's versioned base.
+#[cfg(feature = "client")]
+pub(crate) fn control_urls(snapshot: &Snapshot) -> (Vec<ControlUrl>, Vec<(String, String)>) {
+    let model = Model::read(snapshot);
+    let compat = |core: &Core<'_>, device_id: Option<&str>| {
+        let id = core.id?;
+        let device = model.device(device_id?)?;
+        let api = control_apis(device, STREAM_COMPAT, "/x-nmos/streamcompatibility").into_iter().next()?;
+        Some((core.kind, id.to_string(), format!("{}{}/{id}/", api.href, core.kind.plural())))
+    };
+    let senders = model.senders.iter().filter_map(|s| compat(&s.core, s.device_id));
+    let receivers = model.receivers.iter().filter_map(|r| compat(&r.core, r.device_id));
+    let mapping = model
+        .devices
+        .iter()
+        .filter_map(|d| {
+            let api = control_apis(d, CM_CTRL, "/x-nmos/channelmapping").into_iter().next()?;
+            Some((d.core.id?.to_string(), api.href))
+        })
+        .collect();
+    (senders.chain(receivers).collect(), mapping)
 }
 
 pub(crate) fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {

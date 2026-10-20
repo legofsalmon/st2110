@@ -19,6 +19,8 @@ pub(crate) struct Fetch {
     pub timeout: f64,
     /// Whether to fetch the Senders' SDP files.
     pub sdp: bool,
+    /// The IS-09 System API to read: its URL, or empty to find it by DNS-SD.
+    pub system: Option<String>,
     /// Where an IS-10 token comes from.
     pub auth: crate::auth::Auth,
 }
@@ -30,7 +32,7 @@ pub(crate) fn run(
     quiet: bool,
     deny_warnings: bool,
 ) -> io::Result<ExitCode> {
-    let snapshot = match load(target, fetch) {
+    let snapshot = match load(target, fetch).and_then(|snapshot| with_system(snapshot, fetch)) {
         Ok(snapshot) => snapshot,
         Err(message) => {
             eprintln!("st2110: {message}");
@@ -56,6 +58,18 @@ pub(crate) fn run(
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
+/// Adds what the IS-09 System API gives, when it was asked for. One that cannot be
+/// read is a finding, not a failure.
+fn with_system(mut snapshot: Snapshot, fetch: &Fetch) -> Result<Snapshot, String> {
+    let Some(url) = &fetch.system else { return Ok(snapshot) };
+    let timeout = seconds("--timeout", fetch.timeout)?;
+    let url = if url.trim().is_empty() { crate::find::system(&fetch.auth.look, timeout)? } else { url.clone() };
+    let token = fetch.auth.token(timeout, true)?;
+    let options = Options { timeout, token, ..Options::default() };
+    snapshot.system = Some(st2110_nmos::client::system(&url, &options));
+    Ok(snapshot)
+}
+
 /// Reads a snapshot from a registry's or a Node's URL, or a saved file.
 fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
     let lower = target.to_ascii_lowercase();
@@ -65,8 +79,15 @@ fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
             return Err(format!("--timeout {} is not a number of seconds above 0", fetch.timeout));
         }
         let token = fetch.auth.token(timeout, true)?;
-        let options =
-            Options { timeout, fetch_sdp: fetch.sdp, fetch_active: true, token, versions: true, ..Options::default() };
+        let options = Options {
+            timeout,
+            fetch_sdp: fetch.sdp,
+            fetch_active: true,
+            fetch_controls: true,
+            token,
+            versions: true,
+            ..Options::default()
+        };
         if lower.contains("/x-nmos/node") {
             let node = NodeClient::connect(target, &options).map_err(|e| e.to_string())?;
             return node.snapshot().map_err(|e| e.to_string());
@@ -182,6 +203,46 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
     if !ptp.is_empty() {
         writeln!(out, "  PTP: {}", ptp.join("; "))?;
     }
+    if let Some(system) = &report.system {
+        let mut given = Vec::new();
+        if let Some(domain) = system.ptp_domain {
+            given.push(format!("PTP domain {domain}"));
+        }
+        if let Some(timeout) = system.announce_receipt_timeout {
+            given.push(format!("announce timeout {timeout}"));
+        }
+        if let Some(interval) = system.heartbeat_interval {
+            given.push(format!("heartbeat every {interval} s"));
+        }
+        let given = if given.is_empty() { "nothing read".to_string() } else { given.join(", ") };
+        writeln!(out, "  System API: {given} ({})", system.url)?;
+    }
+    let nodes: Vec<_> = report.nodes.iter().filter(|n| !n.interfaces.is_empty()).collect();
+    if !nodes.is_empty() {
+        writeln!(out, "nodes:")?;
+    }
+    for node in nodes {
+        let interfaces: Vec<String> = node
+            .interfaces
+            .iter()
+            .map(|i| {
+                let mut text = i.name.clone();
+                if let Some(port) = &i.port_id {
+                    text.push_str(&format!(" {port}"));
+                }
+                match (&i.switch, &i.switch_port) {
+                    (Some(switch), Some(port)) => text.push_str(&format!(" → switch {switch} port {port}")),
+                    (Some(switch), None) => text.push_str(&format!(" → switch {switch}")),
+                    _ => {}
+                }
+                text
+            })
+            .collect();
+        writeln!(out, "  {}", quoted(&node.label, node.id.as_deref()))?;
+        for interface in interfaces {
+            writeln!(out, "    {interface}")?;
+        }
+    }
     if !report.senders.is_empty() {
         writeln!(out, "senders:")?;
     }
@@ -201,6 +262,12 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
         }
         if !sender.receivers.is_empty() {
             line.push_str(&format!(", {}", plural(sender.receivers.len(), "receiver")));
+        }
+        if let Some(state) = &sender.compat {
+            line.push_str(&format!(", IS-11 {}", state.replace('_', " ")));
+            if let Some(sets) = sender.active_constraints.filter(|sets| *sets > 0) {
+                line.push_str(&format!(" to {}", plural(sets, "constraint set")));
+            }
         }
         writeln!(out, "{line}")?;
         for stream in &sender.streams {
@@ -226,7 +293,34 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
             (None, Some(id)) => line.push_str(&format!(", from unregistered sender {}", short(Some(id)))),
             (None, None) => {}
         }
+        if let Some(state) = &receiver.compat {
+            line.push_str(&format!(", IS-11 {}", state.replace('_', " ")));
+        }
         writeln!(out, "{line}")?;
+    }
+    if !report.channel_maps.is_empty() {
+        writeln!(out, "channel maps:")?;
+    }
+    for map in &report.channel_maps {
+        writeln!(out, "  {}", quoted(&map.device, Some(&map.device_id)))?;
+        for output in &map.outputs {
+            let name = match output.name.as_deref().filter(|n| !n.is_empty() && *n != output.id) {
+                Some(name) => format!("{name} ({})", output.id),
+                None => output.id.clone(),
+            };
+            // Channels counted from 1, as `st2110 connect --map` takes them.
+            let channels: Vec<String> = output
+                .channels
+                .iter()
+                .enumerate()
+                .map(|(i, route)| match (&route.input, route.channel_index) {
+                    (Some(input), Some(channel)) => format!("{} ← {input}:{}", i + 1, channel + 1),
+                    (Some(input), None) => format!("{} ← {input}", i + 1),
+                    (None, _) => format!("{} silent", i + 1),
+                })
+                .collect();
+            writeln!(out, "    {name}: {}", channels.join(", "))?;
+        }
     }
     Ok(())
 }

@@ -69,8 +69,26 @@ rules! {
         "An active Receiver's Sender is active too, so the stream it expects is on the network.";
     CONSTRAINT_SETS = "constraint-sets", Warning, "BCP-004-01 v1.0: Receiver Capabilities",
         "A Receiver with `caps.constraint_sets` also gives `caps.version`, and each constraint set holds at least one parameter constraint besides the `urn:x-nmos:cap:meta:` attributes.";
-    RECEIVER_CAPS = "receiver-caps", Warning, "BCP-004-01 v1.0 · IS-04 v1.3 schemas",
-        "A Receiver takes a stream its `caps` accept: its format and media type, and at least one enabled constraint set.";
+    RECEIVER_CAPS = "receiver-caps", Warning, "BCP-004-01 v1.0 · IS-04 v1.3 schemas · IS-07 v1.0.1 Event types",
+        "A Receiver takes a stream its `caps` accept: its format, media type and IS-07 event type, and at least one enabled constraint set.";
+    SENDER_CAPS = "sender-caps", Warning, "BCP-004-02 v1.0: Sender Capabilities",
+        "A Sender with `caps.constraint_sets` also gives `caps.version`, each constraint set holds at least one parameter constraint, and the stream it sends satisfies at least one enabled set.";
+
+    // Stream compatibility (IS-11).
+    STREAM_COMPAT = "stream-compat", Warning, "IS-11 v1.0 Behaviour: Client Side",
+        "No Sender's IS-11 `status` is `active_constraints_violation` or `no_essence`, and no active Receiver's is `non_compliant_stream`: a controller reports each of these to its user.";
+    ACTIVE_CONSTRAINTS = "active-constraints", Warning, "IS-11 v1.0 Behaviour: Server Side · BCP-004-02 v1.0",
+        "A Sender's IS-11 active constraints use only the parameter constraints its `/constraints/supported` lists, and while it sends, its stream satisfies at least one of them; a Sender that violates them stops sending.";
+
+    // Channel mapping (IS-08).
+    CHANNEL_MAP = "channel-map", Warning, "IS-08 v1.0.1 Behaviour",
+        "A Device's IS-08 active map names only its Outputs and their channels, routes only Input channels that exist, and routes an Input to an Output only where the Output's `routable_inputs` allow it.";
+
+    // System parameters (IS-09).
+    SYSTEM_GLOBAL = "system-global", Warning, "IS-09 v1.0 System API: global.json · JT-NM TR-1001-1:2020",
+        "The System API's `/global` can be read, and gives `is04.heartbeat_interval` (1 to 1000 s), the PTP `domain_number` (0 to 127) and `announce_receipt_timeout` (2 to 10) that every Node in the system uses.";
+    SYSTEM_PTP_DOMAIN = "system-ptp-domain", Warning, "IS-09 v1.0 · ST 2110-10:2022 §8.2",
+        "The PTP domain in each Sender's `a=ts-refclk` is the `domain_number` the System API gives the system.";
 
     // Transport files.
     MANIFEST_HREF = "manifest-href", Error, "IS-04 v1.3 APIs: Server Side Implementation Notes",

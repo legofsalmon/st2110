@@ -48,6 +48,35 @@ pub struct Snapshot {
     /// where its Device advertises a Connection API and the read succeeded.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub active: BTreeMap<String, Value>,
+    /// What each Sender's and Receiver's IS-11 Stream Compatibility Management API
+    /// returned, keyed by `id`, where its Device advertises one: an object with the
+    /// `status` of each and, for a Sender, its `/constraints/active` as `active` and
+    /// its `/constraints/supported` as `supported`, each left out when it could not be
+    /// read.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub stream_compat: BTreeMap<String, Value>,
+    /// What each Device's IS-08 Channel Mapping API returned, keyed by Device `id`,
+    /// where it advertises one: an object with its `io` and its `map/active` as
+    /// `active`, each left out when it could not be read.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_mapping: BTreeMap<String, Value>,
+    /// What the IS-09 System API returned, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<System>,
+}
+
+/// The result of reading the IS-09 System API's global configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct System {
+    /// The URL of its `/global` resource.
+    pub url: String,
+    /// What `/global` returned, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<Value>,
+    /// Why it could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The result of fetching one Sender's transport file.

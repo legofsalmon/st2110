@@ -112,7 +112,63 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("sender-sdp", with(|v| v["senders"][0]["st2110_21_sender_type"] = json!("2110TPW"))),
         ("group-hint", with(|v| v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Video:system"]}))),
         ("asset-tags", with(|v| v["nodes"][0]["tags"] = json!({MANUFACTURER: ["Acme"]}))),
+        (
+            "sender-caps",
+            with(|v| {
+                v["senders"][1]["caps"] = json!({
+                    "constraint_sets": [{"urn:x-nmos:cap:format:sample_depth": {"enum": [16]}}],
+                    "version": "1790510437:0",
+                })
+            }),
+        ),
+        ("stream-compat", with(|v| v["stream_compat"] = json!({AUDIO_SENDER: {"status": {"state": "no_essence"}}}))),
+        (
+            "active-constraints",
+            with(|v| {
+                v["stream_compat"] = json!({AUDIO_SENDER: {
+                    "status": {"state": "constrained"},
+                    "active": {"constraint_sets": [{"urn:x-nmos:cap:format:sample_rate": {"enum": [{"numerator": 48000}]}}]},
+                    "supported": {"parameter_constraints": ["urn:x-nmos:cap:format:sample_depth"]},
+                }})
+            }),
+        ),
+        ("channel-map", with(|v| v["channel_mapping"] = json!({MONITOR: channel_mapping("in9")}))),
+        ("system-global", with(|v| v["system"] = system(json!({"heartbeat_interval": 0}), 127))),
+        ("system-ptp-domain", with(|v| v["system"] = system(json!({"heartbeat_interval": 5}), 0))),
     ]
+}
+
+const MONITOR: &str = "de710002-0000-4000-8000-000000000002";
+
+/// The IS-08 resources of a Device with two stereo Inputs and an Output whose first
+/// channel takes `input`'s first channel, and which can take only `in1`.
+fn channel_mapping(input: &str) -> Value {
+    let channels = json!([{"label": "L"}, {"label": "R"}]);
+    let input_io = |name: &str| {
+        json!({"properties": {"name": name, "description": ""}, "parent": {"id": null, "type": null},
+               "channels": channels, "caps": {"reordering": true, "block_size": 1}})
+    };
+    json!({
+        "io": {
+            "inputs": {"in1": input_io("Input 1"), "in2": input_io("Input 2")},
+            "outputs": {"out1": {"properties": {"name": "Speakers", "description": ""}, "source_id": null,
+                                 "channels": channels, "caps": {"routable_inputs": ["in1", null]}}},
+        },
+        "active": {
+            "activation": {"mode": null, "requested_time": null, "activation_time": null},
+            "map": {"out1": {"0": {"input": input, "channel_index": 0}, "1": {"input": null, "channel_index": null}}},
+        },
+    })
+}
+
+/// What an IS-09 System API gives: its `is04` object, and a PTP domain.
+fn system(is04: Value, domain: u64) -> Value {
+    json!({
+        "url": "http://system.studio.example/x-nmos/system/v1.0/global",
+        "global": {"id": "5c7e0001-0000-4000-8000-000000000001", "version": "1790510437:0", "label": "Studio",
+                   "description": "", "tags": {}, "is04": is04,
+                   "ptp": {"announce_receipt_timeout": 3, "domain_number": domain}},
+    })
 }
 
 const GROUPHINT: &str = "urn:x-nmos:tag:grouphint/v1.0";
@@ -222,7 +278,9 @@ fn findings_carry_their_rule_and_resource() {
             assert_eq!(finding.severity, rule.severity, "{}", finding.rule);
             assert_eq!(finding.reference, rule.reference, "{}", finding.rule);
             assert!(!finding.message.is_empty(), "{}", finding.rule);
-            assert!(finding.resource.is_some(), "{} names no resource", finding.rule);
+            // The System API is the system's, not a resource's.
+            let system = finding.rule == "system-global";
+            assert_eq!(finding.resource.is_none(), system, "{} names no resource", finding.rule);
         }
     }
 }
@@ -700,6 +758,178 @@ fn valid_variations_are_clean() {
             v["senders"][1]["bit_rate"] = json!(2301);
             replace_in(audio_sdp(v), "/32\n", "/32\nb=AS:2300\n");
         }),
+    );
+    // A Sender whose capabilities hold what it sends, kept to active constraints it
+    // supports, with a monitor whose Output takes a routable Input, in the system's
+    // PTP domain.
+    clean(
+        "sender caps, IS-11, IS-08 and IS-09",
+        with(|v| {
+            v["senders"][1]["caps"] = json!({
+                "constraint_sets": [
+                    {"urn:x-nmos:cap:meta:label": "AES67", "urn:x-nmos:cap:format:sample_depth": {"enum": [16, 24]}},
+                ],
+                "version": "1790510437:0",
+            });
+            v["stream_compat"] = json!({
+                AUDIO_SENDER: {
+                    "status": {"state": "constrained"},
+                    "active": {"constraint_sets": [{"urn:x-nmos:cap:format:sample_depth": {"enum": [24]}}]},
+                    "supported": {"parameter_constraints": ["urn:x-nmos:cap:format:sample_depth"]},
+                },
+                VIDEO_SENDER: {"status": {"state": "unconstrained"}, "active": {"constraint_sets": []}},
+                VIDEO_RECEIVER: {"status": {"state": "compliant_stream"}},
+            });
+            v["channel_mapping"] = json!({MONITOR: channel_mapping("in1")});
+            v["system"] = system(json!({"heartbeat_interval": 5}), 127);
+        }),
+    );
+    // A Receiver that is not taking a stream may say its last one did not comply.
+    clean(
+        "an inactive receiver's status",
+        with(|v| {
+            v["receivers"][1]["subscription"] = json!({"sender_id": null, "active": false});
+            v["stream_compat"] =
+                json!({"7ecf0002-0000-4000-8000-000000000002": {"status": {"state": "non_compliant_stream"}}});
+        }),
+    );
+}
+
+#[test]
+fn control_apis_are_listed_and_explained() {
+    let messages = |snapshot: &Snapshot| -> Vec<String> {
+        check(snapshot).findings.iter().map(|f| format!("{}: {}", f.rule, f.message)).collect()
+    };
+    // The System API's own values are listed, and Senders checked against its domain.
+    let report = check(&with(|v| v["system"] = system(json!({"heartbeat_interval": 2}), 127)));
+    let given = report.system.unwrap();
+    assert_eq!(
+        (given.ptp_domain, given.heartbeat_interval, given.announce_receipt_timeout),
+        (Some(127), Some(2), Some(3))
+    );
+    assert_eq!(
+        messages(&with(|v| v["system"] = json!({"url": "http://sys/global", "error": "HTTP 404"}))),
+        ["system-global: the System API at http://sys/global could not be read: HTTP 404"]
+    );
+    let domain = messages(&with(|v| v["system"] = system(json!({"heartbeat_interval": 5}), 0)));
+    assert_eq!(domain.len(), 2, "both Senders: {domain:?}");
+    assert!(domain[0].contains("names PTP domain 127, but the System API gives the system domain 0"), "{domain:?}");
+
+    // IS-11: a violation while sending, and a Receiver taking a stream it cannot use.
+    let violation = with(|v| {
+        v["stream_compat"] = json!({
+            AUDIO_SENDER: {"status": {"state": "active_constraints_violation", "debug": "48 kHz asked, 96 kHz in"}},
+            "7ecf0002-0000-4000-8000-000000000002": {"status": {"state": "non_compliant_stream"}},
+        })
+    });
+    assert_eq!(
+        messages(&violation),
+        [
+            "stream-compat: its IS-11 status is active_constraints_violation: what it would send breaks the \
+             constraints a controller set (48 kHz asked, 96 kHz in)",
+            "active-constraints: it is still sending while it violates its active constraints; it must stop until \
+             they are met or changed",
+            "stream-compat: its IS-11 status is non_compliant_stream: the stream it takes is not one it can use",
+        ]
+    );
+    let report = check(&violation);
+    let audio = report.senders.iter().find(|s| s.label == "CAM 1 audio").unwrap();
+    assert_eq!(audio.compat.as_deref(), Some("active_constraints_violation"));
+    // Active constraints the stream does not meet, though the status says nothing.
+    let unmet = with(|v| {
+        v["stream_compat"] = json!({AUDIO_SENDER: {
+            "status": {"state": "constrained"},
+            "active": {"constraint_sets": [{"urn:x-nmos:cap:format:sample_depth": {"enum": [16]}}]},
+        }})
+    });
+    assert_eq!(
+        messages(&unmet),
+        ["active-constraints: it sends a stream none of its active constraint sets allows, without saying so in its \
+          status: set 1: sample_depth 24 is not one of 16"]
+    );
+    // BCP-004-02: what a Sender's capabilities must hold.
+    let empty = with(|v| v["senders"][1]["caps"] = json!({"constraint_sets": [{"urn:x-nmos:cap:meta:label": "x"}]}));
+    assert_eq!(
+        messages(&empty),
+        [
+            "sender-caps: it has caps.constraint_sets but no caps.version, so a controller cannot tell when they change",
+            "sender-caps: constraint set 0 holds no parameter constraint, so it says nothing about what the Sender sends",
+        ]
+    );
+
+    // IS-08: the map, listed with each Output's name, and what it may not route.
+    let report = check(&with(|v| v["channel_mapping"] = json!({MONITOR: channel_mapping("in1")})));
+    let [map] = &report.channel_maps[..] else { panic!("{:?}", report.channel_maps) };
+    assert_eq!((map.device.as_str(), map.outputs[0].id.as_str()), ("Monitor 1", "out1"));
+    assert_eq!(map.outputs[0].name.as_deref(), Some("Speakers"));
+    assert_eq!(map.outputs[0].channels[0].input.as_deref(), Some("in1"));
+    assert_eq!(map.outputs[0].channels[1].input, None);
+    let mut broken = channel_mapping("in2");
+    broken["active"]["map"]["out1"]["1"] = json!({"input": "in1", "channel_index": 5});
+    broken["active"]["map"]["out1"]["7"] = json!({"input": null, "channel_index": null});
+    broken["active"]["map"]["out2"] = json!({});
+    assert_eq!(
+        messages(&with(|v| v["channel_mapping"] = json!({MONITOR: broken}))),
+        [
+            "channel-map: Output out1 channel 0 takes Input in2, which is not one of the Output's routable_inputs",
+            "channel-map: Output out1 channel 1 takes channel 5 of Input in1, which has 2",
+            "channel-map: Output out1 has a channel 7 in the map, but only 2 channels",
+            "channel-map: its active map has Output out2, which its io does not list",
+        ]
+    );
+
+    // TR-1001-1: each Node's interfaces, with the switch port LLDP found.
+    let report = check(&with(|_| {}));
+    let camera = &report.nodes[0];
+    assert_eq!(camera.label, "Camera 1");
+    let eth0 = &camera.interfaces[0];
+    assert_eq!(
+        (eth0.name.as_str(), eth0.port_id.as_deref(), eth0.switch.as_deref(), eth0.switch_port.as_deref()),
+        ("eth0", Some("c8-00-84-10-00-01"), Some("a4-6c-2a-00-0a-00"), Some("Ethernet1/1"))
+    );
+}
+
+#[test]
+fn event_receivers_take_the_event_types_they_list() {
+    // An IS-07 boolean Sender, and a Receiver that takes numbers only.
+    let events = |types: Value, constraint: Option<Value>| {
+        with(|v| {
+            v["flows"][1] = json!({
+                "id": "f10e0002-0000-4000-8000-000000000002", "version": "1790510437:0", "label": "tally",
+                "description": "", "tags": {}, "source_id": "50c00002-0000-4000-8000-000000000002",
+                "device_id": "de710001-0000-4000-8000-000000000001", "parents": [],
+                "format": "urn:x-nmos:format:data", "media_type": "application/json", "event_type": "boolean",
+            });
+            v["sources"][1]["format"] = json!("urn:x-nmos:format:data");
+            v["sources"][1].as_object_mut().unwrap().remove("channels");
+            v["senders"][1]["transport"] = json!("urn:x-nmos:transport:websocket");
+            v["senders"][1]["manifest_href"] = Value::Null;
+            v["manifests"].as_object_mut().unwrap().remove(AUDIO_SENDER);
+            let receiver = &mut v["receivers"][1];
+            receiver["format"] = json!("urn:x-nmos:format:data");
+            receiver["transport"] = json!("urn:x-nmos:transport:websocket");
+            receiver["caps"] = json!({"media_types": ["application/json"], "event_types": types});
+            if let Some(constraint) = constraint {
+                receiver["caps"]["constraint_sets"] = json!([{"urn:x-nmos:cap:format:event_type": constraint}]);
+                receiver["caps"]["version"] = json!("1790510437:0");
+            }
+        })
+    };
+    let caps = |snapshot: &Snapshot| -> Vec<String> {
+        check(snapshot).findings.iter().filter(|f| f.rule == "receiver-caps").map(|f| f.message.clone()).collect()
+    };
+    assert_eq!(caps(&events(json!(["boolean"]), None)), Vec::<String>::new());
+    assert_eq!(caps(&events(json!(["*"]), Some(json!({"enum": ["boolean"]})))), Vec::<String>::new());
+    assert_eq!(
+        caps(&events(json!(["number/*"]), None)),
+        ["its caps.event_types (number/*) leave out boolean, which sender \"CAM 1 audio\" (5e0d0002) sends"]
+    );
+    assert_eq!(
+        caps(&events(json!(["*"]), Some(json!({"enum": ["string/*"]})))),
+        [
+            "none of its constraint sets accepts what sender \"CAM 1 audio\" (5e0d0002) sends: set 1: event_type boolean \
+          is not one of string/*"
+        ]
     );
 }
 
