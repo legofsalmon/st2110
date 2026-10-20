@@ -621,3 +621,84 @@ fn keeps_its_log_and_the_demo_connections_across_a_restart() {
     assert_eq!(taking(&third.routes(), "MON 3 video"), None);
     assert_eq!(third.get("/api/log")["log"], json!([]));
 }
+
+/// `st2110 send --nmos` and `st2110 receive --nmos` are NMOS Nodes: each registers with
+/// the demo registry, `st2110 connect` routes the Receiver, and the demo's own, to the
+/// Sender, the stream arrives, and both withdraw when they finish.
+#[test]
+fn send_and_receive_register_with_the_demo_and_connect_routes_them() {
+    let router = Router::start();
+    let registry = format!("http://{}", router.address);
+    let nmos = format!("--nmos={registry}");
+    let st2110 = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2110"));
+        command.args(args).env("NO_COLOR", "1").env("NO_PROXY", "127.0.0.1").env("no_proxy", "127.0.0.1");
+        command
+    };
+    let sender = st2110(&["send", "audio", "--to", "239.10.60.1:5004", "--interface", "127.0.0.1"])
+        .args(["--clock", "traceable", "--duration", "9", "--label", "Test tone", &nmos])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    let receiver = st2110(&["receive", &nmos, "--media", "audio", "--interface", "127.0.0.1"])
+        .args(["--duration", "6", "--label", "Test monitor"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    let labels = |kind: &str| -> Vec<String> {
+        let found = router.get(&format!("/x-nmos/query/v1.3/{kind}/"));
+        found.as_array().expect("a list").iter().filter_map(|r| r["label"].as_str().map(String::from)).collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(labels("senders").contains(&"Test tone".into()) && labels("receivers").contains(&"Test monitor".into())) {
+        assert!(Instant::now() < deadline, "not registered: {:?} {:?}", labels("senders"), labels("receivers"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tone = router
+        .get("/x-nmos/query/v1.3/senders/")
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["label"] == "Test tone")
+        .cloned()
+        .unwrap();
+    assert_eq!(tone["transport"], "urn:x-nmos:transport:rtp.mcast", "{tone:#}");
+    let flow = router.get(&format!("/x-nmos/query/v1.3/flows/{}", tone["flow_id"].as_str().unwrap()));
+    assert_eq!(flow["format"], "urn:x-nmos:format:audio", "{flow:#}");
+
+    for monitor in ["Test monitor", "MON 4 audio"] {
+        let output =
+            st2110(&["connect", &registry, "--receiver", monitor, "--sender", "Test tone"]).output().expect("runs");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{text}{}", String::from_utf8_lossy(&output.stderr));
+    }
+    assert_eq!(taking(&router.routes(), "MON 4 audio").as_deref(), Some("Test tone"));
+
+    // A registry that forgot the Node hears it again at its next heartbeat.
+    let node = tone["device_id"].as_str().map(|d| router.get(&format!("/x-nmos/query/v1.3/devices/{d}"))).unwrap();
+    let path = format!("/x-nmos/registration/v1.3/resource/nodes/{}", node["node_id"].as_str().unwrap());
+    assert_eq!(router.request("DELETE", &path, &[], "").0, 204);
+    assert!(!labels("senders").contains(&"Test tone".into()));
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !labels("senders").contains(&"Test tone".into()) {
+        assert!(Instant::now() < deadline, "not registered again: {:?}", labels("senders"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let sent = sender.wait_with_output().expect("finishes");
+    let said = String::from_utf8_lossy(&sent.stderr);
+    assert_eq!(sent.status.code(), Some(0), "{said}");
+    assert!(said.contains("NMOS: Sender "), "{said}");
+    assert!(
+        said.contains(&format!("registered it with {registry}/x-nmos/registration/v1.3/, and withdrew it")),
+        "{said}"
+    );
+    let received = receiver.wait_with_output().expect("finishes");
+    let (report, said) = (String::from_utf8_lossy(&received.stdout), String::from_utf8_lossy(&received.stderr));
+    assert_eq!(received.status.code(), Some(0), "{report}{said}");
+    assert!(said.contains("and withdrew it"), "{said}");
+    assert!(!labels("senders").contains(&"Test tone".into()), "{:?}", labels("senders"));
+    assert!(!labels("receivers").contains(&"Test monitor".into()), "{:?}", labels("receivers"));
+}

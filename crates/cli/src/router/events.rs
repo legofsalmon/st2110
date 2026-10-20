@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use st2110_nmos::ws::{self, Frame};
 
-use super::http::Request;
 use super::{Router, live_json, state_json};
+use crate::http::Request;
 
 /// The resources the router subscribes to: everything the page shows.
 const RESOURCES: [&str; 6] = ["/nodes", "/devices", "/sources", "/flows", "/senders", "/receivers"];
@@ -204,7 +204,7 @@ pub(crate) struct Sent {
 /// A page's `/api/events`: sends it what is known, then holds it open.
 pub(crate) fn page(router: &Arc<Router>, stream: &TcpStream, request: &Request) {
     if let Err((status, message)) = accept(stream, request) {
-        let _ = super::http::write(stream, &super::http::Response::error(status, message));
+        let _ = crate::http::write(stream, &crate::http::Response::error(status, message));
         return;
     }
     let Some(client) = router.pages.add("page", stream, MOST_PAGES) else {

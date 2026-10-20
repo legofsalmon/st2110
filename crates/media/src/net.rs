@@ -91,12 +91,30 @@ impl Transmitter {
     /// routing table picks; multicast packets go out with time to live `ttl`, and all
     /// with DSCP `dscp`.
     pub fn new(legs: &[Leg], interfaces: &[Option<Ipv4Addr>], ttl: u8, dscp: u8, tai_utc: i32) -> io::Result<Self> {
+        Self::from_ports(legs, interfaces, &[], ttl, dscp, tai_utc)
+    }
+
+    /// Sockets as [`Transmitter::new`] opens them, each leg's sending from `ports[i]`
+    /// when it is given and free, as when a stream moves and keeps its source port, and
+    /// from one the system picks otherwise.
+    pub fn from_ports(
+        legs: &[Leg],
+        interfaces: &[Option<Ipv4Addr>],
+        ports: &[u16],
+        ttl: u8,
+        dscp: u8,
+        tai_utc: i32,
+    ) -> io::Result<Self> {
         let mut sockets = Vec::new();
         let mut sources = Vec::new();
         for (i, leg) in legs.iter().enumerate() {
             let interface = interfaces.get(i).copied().flatten();
             let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.bind(&SocketAddrV4::new(interface.unwrap_or(Ipv4Addr::UNSPECIFIED), 0).into())?;
+            let at = |port| SocketAddrV4::new(interface.unwrap_or(Ipv4Addr::UNSPECIFIED), port).into();
+            match ports.get(i).copied().filter(|&p| p != 0) {
+                Some(port) if socket.bind(&at(port)).is_ok() => {}
+                _ => socket.bind(&at(0))?,
+            }
             if leg.destination.ip().is_multicast() {
                 if let Some(interface) = interface {
                     socket.set_multicast_if_v4(&interface)?;
@@ -121,6 +139,11 @@ impl Transmitter {
     /// The address each leg's packets go from.
     pub fn sources(&self) -> &[Ipv4Addr] {
         &self.sources
+    }
+
+    /// The port each leg's packets go from.
+    pub fn ports(&self) -> Vec<u16> {
+        self.sockets.iter().map(|(socket, _)| socket.local_addr().map_or(0, |a| a.port())).collect()
     }
 
     /// How it kept time so far.
@@ -342,6 +365,19 @@ pub fn receive_until_stopped(
     sink: &mut impl Sink,
 ) -> io::Result<()> {
     run(session, sockets, i128::MAX, stop, tai_utc, sink)
+}
+
+/// Receives as [`receive`] does until `until`, or until another thread sets `stop`,
+/// whichever comes first, such as one that hears the stream is to change.
+pub fn receive_until_or_stopped(
+    session: &mut Session,
+    sockets: Vec<UdpSocket>,
+    until: i128,
+    stop: &AtomicBool,
+    tai_utc: i32,
+    sink: &mut impl Sink,
+) -> io::Result<()> {
+    run(session, sockets, until, stop, tai_utc, sink)
 }
 
 /// Receives until `until` or until `stop` is set, whichever comes first.

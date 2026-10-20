@@ -1,5 +1,6 @@
-//! Just enough HTTP/1.1 to serve the router page, its API and the demo facility: one
-//! request per connection, with limits on what a request may hold.
+//! Just enough HTTP/1.1 to serve the router page, its API and the demo facility, and
+//! the Node API and Connection API of `st2110 send --nmos` and `st2110 receive --nmos`:
+//! one request per connection, with limits on what a request may hold.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -86,6 +87,7 @@ impl Response {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         202 => "Accepted",
         204 => "No Content",
         301 => "Moved Permanently",

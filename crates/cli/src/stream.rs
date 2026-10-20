@@ -1,17 +1,20 @@
 //! `st2110 send` and `st2110 receive`: send colour bars or a tone as an ST 2110 stream,
-//! and receive a stream and report what arrived.
+//! and receive a stream and report what arrived. With `--nmos`, each is an NMOS Node
+//! ([`crate::node`]) whose stream a controller can change through IS-05.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::json;
 use st2110_discover::Announcer;
 use st2110_media::describe::{Clock, Description, Leg, Media};
 use st2110_media::files::{Capture, UNKNOWN_SOURCE, WavWriter, write_png};
@@ -22,6 +25,8 @@ use st2110_media::replay;
 use st2110_media::send::{SendCounts, Sender, default_sender_type};
 use st2110_media::video::FrameInfo;
 
+use crate::node::connection::Endpoint;
+use crate::node::{self, Node, NodeArgs, Offer, Receiving, Sending, Switch, Switched, Tuning};
 use crate::{Format, Style, read, seconds};
 
 const NANOS: i128 = 1_000_000_000;
@@ -191,6 +196,8 @@ pub(crate) struct SendArgs {
         value_parser = crate::offset()
     )]
     tai_utc: i32,
+    #[command(flatten)]
+    node: NodeArgs,
 }
 
 /// A number that differs from run to run, for SSRCs and sequence numbers: RFC 3550
@@ -273,33 +280,47 @@ struct Ready<'a> {
     description: Description,
     sender: Sender,
     transmitter: Option<Transmitter>,
+    /// The interface to send each leg from, when one was given.
+    interfaces: Vec<Option<Ipv4Addr>>,
+    /// The SDP file, and its session id.
+    sdp: String,
+    session: u64,
     /// What announces it by SAP, having announced it once.
     announcer: Option<Announcer>,
 }
 
-/// Announces a stream by SAP every 30 seconds on a thread of its own, until dropped,
-/// which withdraws the announcement.
+/// Announces a stream by SAP every 30 seconds on a thread of its own, and a changed SDP
+/// file at once, until dropped, which withdraws the announcement.
 struct Announcing {
-    stop: mpsc::Sender<()>,
+    /// A new SDP file to announce, or `None` to stop.
+    tell: mpsc::Sender<Option<String>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Announcing {
-    fn start(announcer: Announcer) -> Self {
-        let (stop, stopped) = mpsc::channel();
+    fn start(mut announcer: Announcer) -> Self {
+        let (tell, told) = mpsc::channel::<Option<String>>();
         let thread = thread::spawn(move || {
-            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(SAP_EVERY) {
-                let _ = announcer.announce();
+            loop {
+                match told.recv_timeout(SAP_EVERY) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = announcer.announce();
+                    }
+                    Ok(Some(sdp)) => {
+                        let _ = announcer.change(&sdp);
+                    }
+                    Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
             let _ = announcer.delete();
         });
-        Self { stop, thread: Some(thread) }
+        Self { tell, thread: Some(thread) }
     }
 }
 
 impl Drop for Announcing {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.tell.send(None);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -357,7 +378,8 @@ fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
     description.check()?;
     let ssrc = scramble(1) as u32;
     let sender = Sender::new(&description, tone, level, ssrc, scramble(2) as u32)?;
-    let sdp = description.sdp(u64::try_from(net::tai_now(0) / NANOS).unwrap_or(0));
+    let session = u64::try_from(net::tai_now(0) / NANOS).unwrap_or(0);
+    let sdp = description.sdp(session);
     let announcer = match args.sap {
         Some(to) => Some(
             Announcer::new(&sdp, to, interfaces[0], args.ttl)
@@ -373,7 +395,7 @@ fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
             out.write_all(sdp.as_bytes()).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
         }
     }
-    Ok(Ready { args, description, sender, transmitter, announcer })
+    Ok(Ready { args, description, sender, transmitter, interfaces, sdp, session, announcer })
 }
 
 impl Ready<'_> {
@@ -421,8 +443,24 @@ impl Ready<'_> {
                 eprintln!("st2110: {} into {}", summary(counts), path.display());
             }
             (None, Some(mut transmitter)) => {
-                let counts = self.sender.run(&mut transmitter, start, start + duration)?;
-                let t = transmitter.counts();
+                let (counts, t, nmos) = if args.node.nmos.is_some() {
+                    let switch = Switch::new(transmitter, args.tai_utc);
+                    let mut node = match self.node(&switch, announcing.as_ref()) {
+                        Ok(node) => node,
+                        Err(e) => {
+                            eprintln!("st2110: {e}");
+                            return Ok(ExitCode::from(2));
+                        }
+                    };
+                    // The grace again, after the time the Node took to start.
+                    let start = net::tai_now(args.tai_utc) + NANOS / 10;
+                    let counts = self.sender.run(&mut Switched(switch.clone()), start, start + duration)?;
+                    let withdrawn = node.finish();
+                    (counts, switch.counts(), Some((switch.held(), withdrawn)))
+                } else {
+                    let counts = self.sender.run(&mut transmitter, start, start + duration)?;
+                    (counts, transmitter.counts(), None)
+                };
                 let mut line = summary(counts);
                 if t.late > 0 {
                     let went = if t.late == 1 { "packet went" } else { "packets went" };
@@ -435,6 +473,14 @@ impl Ready<'_> {
                 if t.refused > 0 {
                     line.push_str(&format!("; the system's buffers had no room for {}", plural(t.refused, "packet")));
                 }
+                if let Some((held, withdrawn)) = nmos {
+                    if held > 0 {
+                        line.push_str(&format!("; held back {} while IS-05 had it off", plural(held, "packet")));
+                    }
+                    if let Some(registry) = withdrawn {
+                        line.push_str(&format!("; registered it with {registry}, and withdrew it"));
+                    }
+                }
                 if let Some(to) = args.sap {
                     drop(announcing);
                     line.push_str(&format!("; announced it by SAP to {to}, and withdrew it"));
@@ -445,6 +491,47 @@ impl Ready<'_> {
         }
         Ok(ExitCode::SUCCESS)
     }
+
+    /// Starts the NMOS Node of `st2110 send --nmos`, its Sender sending through
+    /// `switch`. A new SDP file, after an IS-05 activation, is written to --sdp and
+    /// announced by SAP, where those were asked for.
+    fn node(&self, switch: &Arc<Switch>, announcing: Option<&Announcing>) -> Result<Node, String> {
+        let args = self.args;
+        let path = args.sdp.clone();
+        let sap = announcing.map(|a| a.tell.clone());
+        let on_change = Box::new(move |sdp: &str| {
+            if let Some(path) = &path
+                && let Err(e) = fs::write(path, sdp)
+            {
+                eprintln!("st2110: {}: {e}", path.display());
+            }
+            if let Some(sap) = &sap {
+                let _ = sap.send(Some(sdp.to_string()));
+            }
+        });
+        let sending = Sending::new(
+            self.description.clone(),
+            self.interfaces.clone(),
+            args.ttl,
+            args.dscp,
+            args.tai_utc,
+            switch.clone(),
+            self.session,
+            self.sdp.clone(),
+            on_change,
+        );
+        let endpoint = sending.endpoint();
+        let addresses: Vec<Ipv4Addr> =
+            self.description.legs.iter().map(|l| l.source.unwrap_or(Ipv4Addr::LOCALHOST)).collect();
+        Node::start(
+            &args.node,
+            &Offer::Sender(&self.description),
+            &addresses,
+            endpoint,
+            Box::new(sending),
+            args.tai_utc,
+        )
+    }
 }
 
 fn plural(count: u64, noun: &str) -> String {
@@ -453,16 +540,19 @@ fn plural(count: u64, noun: &str) -> String {
 
 #[derive(Args)]
 pub(crate) struct ReceiveArgs {
-    /// The stream's SDP file; `-` reads standard input.
-    sdp: PathBuf,
+    /// The stream's SDP file; `-` reads standard input. With --nmos, what the Receiver
+    /// takes until a controller connects it to another Sender, and nothing when
+    /// omitted.
+    #[arg(required_unless_present = "nmos")]
+    sdp: Option<PathBuf>,
     /// The address of the network interface to receive on; the one the system picks
     /// when omitted. Give it once for every leg, or twice to receive each leg on its
     /// own.
     #[arg(long, value_name = "ADDRESS")]
     interface: Vec<Ipv4Addr>,
-    /// Seconds to receive for.
-    #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
-    duration: f64,
+    /// Seconds to receive for: 5, or with --nmos until stopped, when omitted.
+    #[arg(long, value_name = "SECONDS")]
+    duration: Option<f64>,
     /// Read the packets from a capture file instead of the network; `-` reads standard
     /// input.
     #[arg(long, value_name = "FILE")]
@@ -490,6 +580,17 @@ pub(crate) struct ReceiveArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
+    /// With --nmos and no SDP file: whether the Receiver takes video or audio.
+    #[arg(long, value_enum, requires = "nmos", help_heading = "NMOS")]
+    media: Option<MediaArg>,
+    #[command(flatten)]
+    node: NodeArgs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MediaArg {
+    Video,
+    Audio,
 }
 
 /// Where received audio goes, when it is saved.
@@ -584,7 +685,14 @@ pub(crate) fn sockets(description: &Description, interfaces: &[Ipv4Addr]) -> Res
 }
 
 pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
-    let Opened { file, description, sdp_notes, mut session } = match open(&args.sdp, args.max_skew, &args.interface) {
+    if args.node.nmos.is_some() {
+        return receive_nmos(args);
+    }
+    let Some(sdp) = &args.sdp else {
+        eprintln!("st2110: give the stream's SDP file");
+        return Ok(ExitCode::from(2));
+    };
+    let Opened { file, description, sdp_notes, mut session } = match open(sdp, args.max_skew, &args.interface) {
         Ok(opened) => opened,
         Err(code) => return Ok(code),
     };
@@ -614,7 +722,7 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
             format!("capture {}", path.display())
         }
         None => {
-            let duration = match seconds("--duration", args.duration) {
+            let duration = match seconds("--duration", args.duration.unwrap_or(5.0)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("st2110: {e}");
@@ -668,6 +776,157 @@ pub(crate) fn receive(args: &ReceiveArgs) -> io::Result<ExitCode> {
         }
     }
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// How many legs the Receiver of `st2110 receive --nmos` has: two, for an ST 2022-7
+/// pair, whose second is turned off for a stream of one.
+const NMOS_LEGS: usize = 2;
+
+/// `st2110 receive --nmos`: an NMOS Node whose Receiver receives what a controller
+/// connects it to, reporting each stream when it changes and at the end.
+fn receive_nmos(args: &ReceiveArgs) -> io::Result<ExitCode> {
+    let usage = |message: &str| {
+        eprintln!("st2110: {message}");
+        Ok(ExitCode::from(2))
+    };
+    if args.pcap.is_some() || args.png.is_some() || args.wav.is_some() {
+        return usage("--pcap, --png and --wav are for one stream, and with --nmos the stream can change");
+    }
+    if !(0.0..=1000.0).contains(&args.max_skew) {
+        return usage(&format!("--max-skew {} is not 0 to 1000 ms", args.max_skew));
+    }
+    if args.interface.len() > NMOS_LEGS {
+        return usage("give --interface once, or twice to receive each leg on its own");
+    }
+    let duration = match args.duration.map(|d| seconds("--duration", d)).transpose() {
+        Ok(duration) => duration,
+        Err(e) => return usage(&e),
+    };
+    let initial = match &args.sdp {
+        Some(path) => {
+            let text = read(path)?;
+            match Description::parse(&text) {
+                Ok((description, _)) => Some((text, description)),
+                Err(e) => return usage(&format!("{}: {e}", path.display())),
+            }
+        }
+        None => None,
+    };
+    let video = match (&initial, args.media) {
+        (Some((_, description)), media) => {
+            let video = matches!(description.media, Media::Video(_));
+            if media.is_some_and(|m| (m == MediaArg::Video) != video) {
+                return usage("--media says otherwise than the SDP file");
+            }
+            video
+        }
+        (None, Some(media)) => media == MediaArg::Video,
+        (None, None) => return usage("give the SDP file of a stream to take, or --media video or audio"),
+    };
+    let fallback = node::default_address(&args.node);
+    let addresses: Vec<Ipv4Addr> =
+        (0..NMOS_LEGS).map(|i| args.interface.get(i).or(args.interface.last()).copied().unwrap_or(fallback)).collect();
+    let constraints = addresses
+        .iter()
+        .map(|a| {
+            json!({"source_ip": {}, "multicast_ip": {}, "interface_ip": {"enum": ["auto", a.to_string()]},
+                   "destination_port": {"minimum": 1, "maximum": 65535}, "rtp_enabled": {}})
+        })
+        .collect();
+    let named: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+    let mut endpoint = Endpoint::idle_receiver(&named, constraints);
+    let tuning = Arc::new(Tuning::default());
+    let mut receiving = Receiving::new(tuning.clone(), !args.interface.is_empty());
+    if let Some((text, description)) = &initial {
+        // Taken from the start, as if a controller had connected it.
+        let mut active = endpoint.active.clone();
+        active["master_enable"] = json!(true);
+        active["transport_file"] = json!({"data": text, "type": "application/sdp"});
+        for (i, params) in active["transport_params"].as_array_mut().into_iter().flatten().enumerate() {
+            match description.legs.get(i) {
+                Some(leg) => {
+                    let group = leg.destination.ip().is_multicast().then(|| leg.destination.ip().to_string());
+                    params["multicast_ip"] = json!(group);
+                    params["source_ip"] = json!(leg.source.map(|s| s.to_string()));
+                    params["destination_port"] = json!(leg.destination.port());
+                }
+                None => params["rtp_enabled"] = json!(false),
+            }
+        }
+        if let Err(e) = node::Role::check(&receiving, &active) {
+            return usage(&e);
+        }
+        node::Role::activate(&mut receiving, &mut active);
+        endpoint.staged = active.clone();
+        endpoint.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
+        endpoint.active = active;
+    }
+    let offer = Offer::Receiver { video, legs: NMOS_LEGS };
+    let mut node = match Node::start(&args.node, &offer, &addresses, endpoint, Box::new(receiving), args.tai_utc) {
+        Ok(node) => node,
+        Err(e) => return usage(&e),
+    };
+    let until = duration.map_or(i128::MAX / 4, |d| net::tai_now(args.tai_utc) + d.as_nanos() as i128);
+    let mut received: Vec<Received> = Vec::new();
+    let mut failed = false;
+    let style = Style::detect();
+    while net::tai_now(args.tai_utc) < until {
+        let Some(tuned) = tuning.take() else {
+            // Nothing to receive: wait for a controller.
+            while !tuning.changed.load(Ordering::SeqCst) && net::tai_now(args.tai_utc) < until {
+                thread::sleep(Duration::from_millis(20));
+            }
+            continue;
+        };
+        let file = match (&tuned.sender_id, &args.sdp) {
+            (Some(id), _) => format!("Sender {id}"),
+            (None, Some(path)) => path.display().to_string(),
+            (None, None) => "the stream IS-05 named".into(),
+        };
+        let description = tuned.description;
+        let started = Session::with_max_skew(&description, (args.max_skew * 1e6).round() as i64).and_then(|session| {
+            let mut sockets = Vec::new();
+            for (leg, interface) in description.legs.iter().zip(&tuned.interfaces) {
+                let (socket, _) = net::listen(leg, *interface).map_err(|e| format!("cannot receive {leg}: {e}"))?;
+                sockets.push(socket);
+            }
+            Ok((session, sockets))
+        });
+        let (mut session, sockets) = match started {
+            Ok(started) => started,
+            Err(e) => {
+                eprintln!("st2110: {file}: {e}; waiting for another connection");
+                while !tuning.changed.load(Ordering::SeqCst) && net::tai_now(args.tai_utc) < until {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                continue;
+            }
+        };
+        let mut saver = Saver { wav: None, error: None };
+        net::receive_until_or_stopped(&mut session, sockets, until, &tuning.changed, args.tai_utc, &mut saver)?;
+        let report = session.report();
+        failed |= !report.problems.is_empty();
+        let one = Received { file, sdp_notes: tuned.notes, input: "network".into(), capture_shift: None, report };
+        if let Format::Text = args.format {
+            let mut out = io::stdout().lock();
+            write_text(&mut out, &one, &description, style)?;
+            out.flush()?;
+        }
+        received.push(one);
+    }
+    let withdrawn = node.finish();
+    if let Format::Json = args.format {
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &received)?;
+        writeln!(out)?;
+        out.flush()?;
+    }
+    let mut line = format!("st2110: received {}", plural(received.len() as u64, "stream"));
+    if let Some(registry) = withdrawn {
+        line.push_str(&format!("; registered the Receiver with {registry}, and withdrew it"));
+    }
+    eprintln!("{line}");
+    Ok(if failed || received.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 /// A capture being read.

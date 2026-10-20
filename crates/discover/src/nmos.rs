@@ -14,6 +14,9 @@ use crate::dnssd::Service;
 /// The service type registries advertise their Query API under.
 pub const QUERY: &str = "_nmos-query._tcp";
 
+/// The service type registries advertise their IS-04 v1.3 Registration API under.
+pub const REGISTER: &str = "_nmos-register._tcp";
+
 /// The service type Nodes advertise their Node API under.
 pub const NODE: &str = "_nmos-node._tcp";
 
@@ -34,6 +37,8 @@ pub enum ApiKind {
     Query,
     /// A Node's Node API.
     Node,
+    /// A registry's Registration API, which Nodes register with.
+    Registration,
     /// An IS-10 Authorization Server.
     Auth,
     /// An IS-09 System API, which gives the settings every Node in the system shares.
@@ -46,6 +51,7 @@ impl ApiKind {
         match self {
             Self::Query => QUERY,
             Self::Node => NODE,
+            Self::Registration => REGISTER,
             Self::Auth => AUTH,
             Self::System => SYSTEM,
         }
@@ -166,10 +172,18 @@ pub fn by_preference<'a>(apis: impl IntoIterator<Item = &'a Api>) -> Vec<&'a Api
 /// that can give an IS-10 token when `authorized`: then one that asks for authorization
 /// is as good as one that does not.
 pub fn by_preference_given<'a>(apis: impl IntoIterator<Item = &'a Api>, authorized: bool) -> Vec<&'a Api> {
+    by_preference_of(ApiKind::Query, apis, authorized)
+}
+
+/// The registries' APIs of one kind, their Query APIs or their Registration APIs, in
+/// the order to try them, as [`by_preference_given`] has it: a Node chooses the
+/// registry to register with the same way (IS-04 v1.3 Discovery: Registered
+/// Operation).
+pub fn by_preference_of<'a>(kind: ApiKind, apis: impl IntoIterator<Item = &'a Api>, authorized: bool) -> Vec<&'a Api> {
     use std::hash::BuildHasher;
     static SHUFFLE: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
     let shuffle = SHUFFLE.get_or_init(std::hash::RandomState::new);
-    let mut registries: Vec<&Api> = apis.into_iter().filter(|a| a.kind == ApiKind::Query && a.readable()).collect();
+    let mut registries: Vec<&Api> = apis.into_iter().filter(|a| a.kind == kind && a.readable()).collect();
     if registries.iter().any(|a| a.by != MDNS) {
         registries.retain(|a| a.by != MDNS);
     }
@@ -246,9 +260,11 @@ impl Reader {
         let client = match api.kind {
             ApiKind::Query => Client::Query(QueryClient::connect(&api.url, options)?),
             ApiKind::Node => Client::Node(NodeClient::connect(&api.url, options)?),
-            ApiKind::Auth | ApiKind::System => {
-                let what = if api.kind == ApiKind::Auth { "an Authorization Server" } else { "a System API" };
-                return Err(client::Error { url: api.url.clone(), message: format!("{what} lists no Senders") });
+            ApiKind::Registration | ApiKind::Auth | ApiKind::System => {
+                return Err(client::Error {
+                    url: api.url.clone(),
+                    message: "only a Query API or a Node API lists Senders".into(),
+                });
             }
         };
         Ok(Self { client, fetched: HashMap::new() })

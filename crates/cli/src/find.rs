@@ -90,6 +90,19 @@ pub(crate) fn registry(args: &LookArgs, timeout: Duration, authorized: bool) -> 
     Err(format!("no registry found by DNS-SD answers: {}", problems.join("; ")))
 }
 
+/// The registries' Registration APIs found, in the order a Node tries them: as a
+/// controller chooses a Query API (IS-04 v1.3 Discovery: Registered Operation).
+/// `authorized` says whether a token can be given.
+pub(crate) fn registration_apis(args: &LookArgs, timeout: Duration, authorized: bool) -> Result<Vec<Api>, String> {
+    let seen = find::find(ApiKind::Registration, &args.look(timeout));
+    let order: Vec<Api> =
+        nmos::by_preference_of(ApiKind::Registration, &seen.apis, authorized).into_iter().cloned().collect();
+    if order.is_empty() {
+        return Err(nothing("registry", &seen));
+    }
+    Ok(order)
+}
+
 /// The IS-10 Authorization Servers found, in the order to try them.
 pub(crate) fn auth_servers(args: &LookArgs, timeout: Duration) -> Result<Vec<Api>, String> {
     let seen = find::find(ApiKind::Auth, &args.look(timeout));
