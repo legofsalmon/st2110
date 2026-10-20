@@ -237,13 +237,17 @@ pub fn find_device(snapshot: &Snapshot, selector: &str) -> Result<DeviceEndpoint
     })
 }
 
+/// A Sender's or Receiver's IS-11 resources: what it is, its `id`, and its own base.
+#[cfg(feature = "client")]
+pub(crate) type ControlUrl = (Kind, String, String);
+
 /// Where each Sender's and Receiver's IS-11 resources are, and each Device's IS-08 ones,
-/// for a snapshot to read: `(id, base)` with `base` the Sender's or Receiver's own path
+/// for a snapshot to read: `(kind, id, base)` with `base` the Sender's or Receiver's own path
 /// on its Device's Stream Compatibility Management API, such as
 /// `…/x-nmos/streamcompatibility/v1.0/senders/{id}/`, and `(device id, base)` with the
 /// Channel Mapping API's versioned base.
 #[cfg(feature = "client")]
-pub(crate) fn control_urls(snapshot: &Snapshot) -> (Vec<(Kind, String, String)>, Vec<(String, String)>) {
+pub(crate) fn control_urls(snapshot: &Snapshot) -> (Vec<ControlUrl>, Vec<(String, String)>) {
     let model = Model::read(snapshot);
     let compat = |core: &Core<'_>, device_id: Option<&str>| {
         let id = core.id?;

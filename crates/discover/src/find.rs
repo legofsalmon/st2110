@@ -145,11 +145,13 @@ fn ask_mdns(kind: ApiKind, to: SocketAddrV4, listen: Duration) -> std::io::Resul
     Ok(found)
 }
 
-/// Authorization Servers in the order to try them (IS-10 Discovery, `pri`): those in
-/// use before those for development, the lowest priority first. As for registries,
-/// those found by multicast DNS are left out where unicast DNS-SD found any.
+/// Authorization Servers or System APIs in the order to try them (IS-10 Discovery and
+/// IS-09 Discovery, `pri`): those in use before those for development, the lowest
+/// priority first. As for registries, those found by multicast DNS are left out where
+/// unicast DNS-SD found any. Registries and Nodes are left out.
 pub fn by_priority<'a>(apis: impl IntoIterator<Item = &'a Api>) -> Vec<&'a Api> {
-    let mut servers: Vec<&Api> = apis.into_iter().filter(|a| a.kind == ApiKind::Auth).collect();
+    let mut servers: Vec<&Api> =
+        apis.into_iter().filter(|a| matches!(a.kind, ApiKind::Auth | ApiKind::System)).collect();
     if servers.iter().any(|a| a.by != BY_MDNS) {
         servers.retain(|a| a.by != BY_MDNS);
     }

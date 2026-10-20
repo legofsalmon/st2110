@@ -20,6 +20,9 @@ pub const NODE: &str = "_nmos-node._tcp";
 /// The service type IS-10 Authorization Servers advertise themselves under.
 pub const AUTH: &str = "_nmos-auth._tcp";
 
+/// The service type IS-09 System APIs advertise themselves under.
+pub const SYSTEM: &str = "_nmos-system._tcp";
+
 /// Registries with a priority of 100 or more are for development (IS-04 §3).
 const DEVELOPMENT: u32 = 100;
 
@@ -33,6 +36,8 @@ pub enum ApiKind {
     Node,
     /// An IS-10 Authorization Server.
     Auth,
+    /// An IS-09 System API, which gives the settings every Node in the system shares.
+    System,
 }
 
 impl ApiKind {
@@ -42,6 +47,7 @@ impl ApiKind {
             Self::Query => QUERY,
             Self::Node => NODE,
             Self::Auth => AUTH,
+            Self::System => SYSTEM,
         }
     }
 }
@@ -240,11 +246,9 @@ impl Reader {
         let client = match api.kind {
             ApiKind::Query => Client::Query(QueryClient::connect(&api.url, options)?),
             ApiKind::Node => Client::Node(NodeClient::connect(&api.url, options)?),
-            ApiKind::Auth => {
-                return Err(client::Error {
-                    url: api.url.clone(),
-                    message: "an Authorization Server lists no Senders".into(),
-                });
+            ApiKind::Auth | ApiKind::System => {
+                let what = if api.kind == ApiKind::Auth { "an Authorization Server" } else { "a System API" };
+                return Err(client::Error { url: api.url.clone(), message: format!("{what} lists no Senders") });
             }
         };
         Ok(Self { client, fetched: HashMap::new() })
