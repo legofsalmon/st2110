@@ -24,10 +24,26 @@ const RATE_MIN_INTERVALS: u64 = 4;
 /// Grandmasters, and ports announcing at once, named in a domain's findings, at most.
 const NAMES: usize = 16;
 
+/// A PTP domain: its number, its sdoId, and whether it runs over Ethernet. Profiles
+/// that share a number, such as gPTP and AES67 on domain 0, are kept apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct DomainKey {
+    number: u8,
+    sdo_id: u16,
+    layer2: bool,
+}
+
+impl DomainKey {
+    /// Whether the ST 2059-2 profile governs it: sdoId 0, over UDP (§6.9).
+    fn st2059(self) -> bool {
+        self.sdo_id == 0 && !self.layer2
+    }
+}
+
 /// The findings of one rule on one port's messages, kept once.
 struct Checked {
     finding: st2110_ptp::Finding,
-    domain: u8,
+    domain: DomainKey,
     port: PortIdentity,
     first: i128,
     count: u64,
@@ -158,10 +174,10 @@ pub(crate) struct Monitor {
     ports: usize,
     /// Messages from ports past the first [`PORT_LIMIT`].
     untracked: u64,
-    domains: BTreeMap<u8, Domain>,
+    domains: BTreeMap<DomainKey, Domain>,
     syncs: SyncTimes,
     checked: Vec<Checked>,
-    checked_index: HashMap<(&'static str, u8, PortIdentity), usize>,
+    checked_index: HashMap<(&'static str, DomainKey, PortIdentity), usize>,
 }
 
 impl Monitor {
@@ -178,29 +194,33 @@ impl Monitor {
         }
     }
 
-    /// Takes a message that arrived at `t` from `address`.
-    pub(crate) fn push(&mut self, t: i128, address: &str, message: &Message) {
+    /// Takes a message that arrived at `t` from `address`, over Ethernet if `layer2`.
+    pub(crate) fn push(&mut self, t: i128, address: &str, layer2: bool, message: &Message) {
         self.messages += 1;
         let h = &message.header;
-        if !self.domains.get(&h.domain).is_some_and(|d| d.index.contains_key(&h.source)) {
+        let key =
+            DomainKey { number: h.domain, sdo_id: u16::from(h.major_sdo_id) << 8 | u16::from(h.minor_sdo_id), layer2 };
+        if !self.domains.get(&key).is_some_and(|d| d.index.contains_key(&h.source)) {
             if self.ports >= PORT_LIMIT {
                 self.untracked += 1;
                 return;
             }
             self.ports += 1;
         }
-        for finding in st2110_ptp::check(message) {
-            let key = (finding.rule, h.domain, h.source);
-            match self.checked_index.get(&key) {
+        // Other profiles, such as gPTP, keep their own rules.
+        let findings = if key.st2059() { st2110_ptp::check(message) } else { Vec::new() };
+        for finding in findings {
+            let index = (finding.rule, key, h.source);
+            match self.checked_index.get(&index) {
                 Some(&i) => self.checked[i].count += 1,
                 None => {
-                    self.checked_index.insert(key, self.checked.len());
-                    self.checked.push(Checked { finding, domain: h.domain, port: h.source, first: t, count: 1 });
+                    self.checked_index.insert(index, self.checked.len());
+                    self.checked.push(Checked { finding, domain: key, port: h.source, first: t, count: 1 });
                 }
             }
         }
         let synced = self.syncs.push(t, message);
-        let domain = self.domains.entry(h.domain).or_default();
+        let domain = self.domains.entry(key).or_default();
         if let Some((_, arrival, left)) = synced
             && self.absolute
         {
@@ -270,13 +290,14 @@ impl Monitor {
                 message,
                 reference: c.finding.reference,
                 flow: None,
-                domain: Some(c.domain),
+                domain: Some(c.domain.number),
                 at: timeline.at(Some(c.first)),
                 count: c.count,
             });
         }
         let mut domains = Vec::new();
-        for (&number, domain) in &mut self.domains {
+        for (&key, domain) in &mut self.domains {
+            let number = key.number;
             // Requests near the end may have been answered after the capture stopped.
             domain.follow_ups.expire(end);
             domain.delay_responses.expire(end);
@@ -375,6 +396,8 @@ impl Monitor {
             ports.sort_by(|a, b| a.port.cmp(&b.port));
             domains.push(PtpDomainReport {
                 domain: number,
+                sdo_id: key.sdo_id,
+                layer2: key.layer2,
                 grandmasters: domain.grandmasters.iter().map(ToString::to_string).collect(),
                 ports,
                 sync_offset_us: domain.offsets.stats().filter(|_| on_ptp_time),

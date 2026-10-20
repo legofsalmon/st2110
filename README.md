@@ -289,7 +289,7 @@ Looked for 10 s for SAP announcements to 239.255.255.255:9875 and 224.2.127.254:
 
 - `st2110 discover` listens for SAP announcements (RFC 2974) to 239.255.255.255 and 224.2.127.254 on port 9875, as AES67 devices make them and `st2110 send --sap` does. Each carries a stream's SDP file. A deletion takes its stream off the list at once; one not heard for three times the interval between its announcements, or 90 s when heard once, is marked as maybe stopped, and one not heard for an hour goes.
 - It browses by multicast DNS for registries' Query APIs (`_nmos-query._tcp`) and Nodes' Node APIs (`_nmos-node._tcp`), and asks the system's DNS servers for Query APIs in its search domains, as IS-04 has controllers do. It shares port 5353 with the system's responder to hear every answer, or asks from a port of its own where it cannot. `--dns-server` and `--domain` choose where to ask by unicast DNS, and `--no-dns` asks nowhere.
-- It reads the Senders from the registry a controller would choose: one that asks for no authorization first, then one in use before one for development (`pri` of 100 or more), the lowest `pri` first, going on to the next when one does not answer. `--registry URL` names one instead. Where no registry answers, it reads each Node it found, peer to peer through its Node API, and again whenever the version counters the Node advertises change.
+- It reads the Senders from the registry a controller would choose: only those found by unicast DNS when there are any, then one that asks for no authorization first, then one in use before one for development (`pri` of 100 or more), the lowest `pri` first and one picked at random among equals, going on to the next when one does not answer. `--registry URL` names one instead. Where no registry answers, it reads each Node it found, peer to peer through its Node API, and again whenever the version counters the Node advertises change.
 - It fetches each RTP Sender's SDP file from its `manifest_href`, as `st2110 nmos` does, but never through a proxy, and reads the registry or the Nodes again every 15 s. A stream that SAP announces and NMOS lists, going to the same addresses from the same sources (where both SDP files name them), is listed once, with both.
 - It looks on every port that is up, and on each one that comes up while it looks, or on those `--interface` names, for `--duration` seconds, 10 by default. Senders announce by SAP every 30 s or so, so give `--duration 35` to hear every one, or `--watch` to keep looking and print each stream as it comes, changes and goes. `--save DIR` writes each stream's SDP file there, named after the stream, to receive, view or check. `--sap`, `--no-sap`, `--no-nmos`, `--mdns` and `--timeout` change where and how it looks, and `--format json` gives everything it found, SDP files included.
 - It exits with 0 when it found a stream, 1 when it found none, and 2 when it could not look, as when another program holds a port alone.
@@ -417,7 +417,7 @@ Severities follow the standards' own words. An **error** breaks a "shall" (or an
 | ST 2110-20, -21 | Required parameters and their values, the `SSN` edition rule, interlace and PsF, pixel groups, block packing, `TP`, default `TROFF`, RFC 4175 look-alikes |
 | RP 2110-24 | SD width, height and pixel aspect ratio |
 | ST 2110-22 | `b=AS`, `TP`, frame rate, JPEG XS `packetmode` (VSF TR-08) |
-| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels, packet size against `MAXUDP`, `channel-order`, AM824 channel pairs |
+| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels, packet size against the standard UDP limit (-30) or `MAXUDP` (-31), `channel-order`, AM824 channel pairs |
 | ST 2110-40, -41, -43 | ANC `SSN`/`TM`/`exactframerate`, `DID_SDID`, `VPID_Code`; FMX `SSN` and `DIT`; TTML clock and `codecs` |
 
 It follows the editions current on pub.smpte.org in September 2026: ST 2110-10:2022, -20:2022, -21:2022, -22:2022, -30:2025, -31:2022, -40:2023, -41:2024 (whose SSN the 2026 edition keeps), -43:2021, RP 2110-23:2019, RP 2110-24:2023 and ST 2022-7:2019.
@@ -452,12 +452,12 @@ It follows ST 2059-1:2021 and ST 2059-2:2021, with IEEE 1588-2008 and -2019.
 | Area | Checks |
 |---|---|
 | RTP | Lost packets, with 32-bit sequence numbers where ST 2110-20 and -40 extend them; packets out of order or repeated; SSRC changes; the SDP file's payload type |
-| ST 2110-10 | IP fragments, and datagrams over 1460 octets or the `MAXUDP` signalled |
+| ST 2110-10 | IP fragments, and datagrams over 1460 octets or the `MAXUDP` signalled (PCM audio and ancillary data keep to 1460 whatever `MAXUDP` says) |
 | Video and ancillary data | Marker bits on the last packet of each frame or field, timestamps on the frame grid, packets that arrive before the time their timestamp names, and latency over JT-NM's 1 ms (35 ms for ancillary data) as a note |
 | ST 2110-21 | CINST over CMAX for the sender type in `TP`, or the `CMAX` signalled, and the virtual receiver buffer's overflows and underflows |
-| ST 2110-22 | The same number of packets in every frame |
+| ST 2110-22 | The same number of packets in every frame, and the RFC 9134 payload header: T and K held, L with M, fields only in interlaced video, each field with its own timestamp (VSF TR-08) |
 | ST 2110-30, -31 | Packets holding the samples `ptime` gives and the channels `a=rtpmap` gives, and TS-DF within a packet time |
-| PTP | One grandmaster through the capture, one port announcing at a time, Announce and Sync rates to match `logMessageInterval`, and a Follow_Up for every two-step Sync and a Delay_Resp for every Delay_Req |
+| PTP | Each domain kept apart by its number and sdoId (gPTP and AES67 on domain 0 are two), with ST 2059-2's checks only for its own profile over UDP; one grandmaster through the capture, one port announcing at a time, Announce and Sync rates to match `logMessageInterval`, and a Follow_Up for every two-step Sync and a Delay_Resp for every Delay_Req |
 
 It follows RP 2110-25:2023 for what it measures, with ST 2110-21:2022 for the models and EBU Tech 3337 for TS-DF.
 

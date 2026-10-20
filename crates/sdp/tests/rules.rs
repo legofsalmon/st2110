@@ -150,6 +150,7 @@ fn cases() -> Vec<(&'static str, String)> {
         ("audio-level", with(AUDIO, "a=ptime:1", "a=ptime:0.25")),
         ("audio-packet-size", with(with(AUDIO, "L24/48000/8", "L24/48000/16"), "(51,ST)", "(51,51,ST,ST)")),
         ("audio-channel-order", with(AUDIO, "(51,ST)", "(51)")),
+        ("maxudp-standard-only", with(AUDIO, "TSMODE=SAMP", "TSMODE=SAMP; MAXUDP=8960")),
         ("aes3-channels", with(AES3, "AM824/48000/8", "AM824/48000/7")),
         ("aes3-ptime", with(AES3, "a=ptime:0.12", "a=ptime:0.125")),
         // ST 2110-40 and -41.
@@ -312,6 +313,24 @@ fn valid_variations_raise_nothing() {
     for text in valid {
         assert_eq!(lint(&text).diagnostics, [], "in:\n{text}");
     }
+}
+
+#[test]
+fn pcm_audio_and_anc_keep_to_the_standard_udp_limit() {
+    // 16 channels of L24 in 1 ms packets is 2304 bytes: too big even when MAXUDP says 8960.
+    let audio = with(
+        with(with(AUDIO, "L24/48000/8", "L24/48000/16"), "(51,ST)", "(51,51,ST,ST)"),
+        "TSMODE=SAMP",
+        "TSMODE=SAMP; MAXUDP=8960",
+    );
+    let found = ids(&audio);
+    assert!(found.contains("audio-packet-size") && found.contains("maxudp-standard-only"), "{found:?}");
+    let anc = with(ANC, "TSMODE=SAMP", "TSMODE=SAMP;MAXUDP=8960");
+    assert!(ids(&anc).contains("maxudp-standard-only"));
+    // ST 2110-31 may use the extended limit.
+    let aes3 = AES3.lines().map(|l| if l.starts_with("a=fmtp") { format!("{l}; MAXUDP=8960") } else { l.to_string() });
+    let aes3 = aes3.collect::<Vec<_>>().join("\n");
+    assert!(!ids(&aes3).contains("maxudp-standard-only"));
 }
 
 #[test]

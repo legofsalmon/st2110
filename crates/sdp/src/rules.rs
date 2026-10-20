@@ -132,6 +132,8 @@ rules! {
         "`MAXUDP` is a whole number of octets, at most the 8960-octet extended limit.";
     MAXUDP_EXTENDED = "maxudp-extended", Warning, "ST 2110-10:2022",
         "`MAXUDP` above 1460: receivers are only required to handle the standard limit.";
+    MAXUDP_STANDARD_ONLY = "maxudp-standard-only", Error, "ST 2110-30:2025 §6.2.1",
+        "PCM audio (ST 2110-30) and ancillary data (ST 2110-40 §5.2.1) keep to the 1460-octet standard UDP size limit, so their `MAXUDP` is at most 1460.";
     TSMODE = "tsmode", Error, "ST 2110-10:2022 §8.7",
         "`TSMODE` is `SAMP`, `PRES` or `NEW`.";
     TSMODE_ABSENT = "tsmode-absent", Info, "ST 2110-10:2022 §8.7",

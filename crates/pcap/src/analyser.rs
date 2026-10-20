@@ -25,8 +25,18 @@ const DECIDE_EVENTS: usize = 200_000;
 const PTP_PORTS: [u16; 2] = [319, 320];
 
 enum Event {
-    Rtp { t: i128, key: Key, packet: RtpPacket },
-    Ptp { t: i128, from: String, message: Box<Message> },
+    Rtp {
+        t: i128,
+        key: Key,
+        packet: RtpPacket,
+    },
+    /// `layer2` when the message came over Ethernet rather than UDP.
+    Ptp {
+        t: i128,
+        from: String,
+        layer2: bool,
+        message: Box<Message>,
+    },
 }
 
 impl Event {
@@ -76,7 +86,7 @@ impl Running {
                 };
                 self.flows[i].push(t + shift, packet);
             }
-            Event::Ptp { t, from, message } => self.ptp.push(t + shift, &from, &message),
+            Event::Ptp { t, from, layer2, message } => self.ptp.push(t + shift, &from, layer2, &message),
         }
     }
 }
@@ -131,7 +141,9 @@ impl Analyser {
                 if PTP_PORTS.contains(&d.destination.port()) {
                     c.ptp += 1;
                     match st2110_ptp::decode(d.payload) {
-                        Ok(message) => Event::Ptp { t, from: d.source.ip().to_string(), message: Box::new(message) },
+                        Ok(message) => {
+                            Event::Ptp { t, from: d.source.ip().to_string(), layer2: false, message: Box::new(message) }
+                        }
                         Err(_) => {
                             self.undecodable += 1;
                             return;
@@ -147,7 +159,7 @@ impl Analyser {
             Packet::Ptp { source, payload } => {
                 c.ptp += 1;
                 match st2110_ptp::decode(payload) {
-                    Ok(message) => Event::Ptp { t, from: mac(source), message: Box::new(message) },
+                    Ok(message) => Event::Ptp { t, from: mac(source), layer2: true, message: Box::new(message) },
                     Err(_) => {
                         self.undecodable += 1;
                         return;

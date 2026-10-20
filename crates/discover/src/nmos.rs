@@ -108,14 +108,26 @@ impl Api {
     }
 }
 
-/// The registries in the order to try them, as IS-04 §3 has a controller choose: those
-/// that ask for no authorization, which this cannot give, first; then those in use
-/// before those for development; then by priority, the lowest first.
+/// How [`Api::by`] names an API found by multicast DNS.
+pub const MDNS: &str = "mDNS";
+
+/// The registries in the order to try them, as IS-04's discovery procedure has a
+/// controller choose. Where unicast DNS-SD found any, those found by multicast DNS are
+/// left out ("Unicast vs Multicast DNS-SD"). Then those that ask for no authorization,
+/// which this cannot give, come first; then those in use before those for development;
+/// then by priority, the lowest first, and at random among equals (step 4). The random
+/// order holds for the life of the program, so that it stays with one registry.
 pub fn by_preference<'a>(apis: impl IntoIterator<Item = &'a Api>) -> Vec<&'a Api> {
+    use std::hash::BuildHasher;
+    static SHUFFLE: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    let shuffle = SHUFFLE.get_or_init(std::hash::RandomState::new);
     let mut registries: Vec<&Api> = apis.into_iter().filter(|a| a.kind == ApiKind::Query && a.readable()).collect();
+    if registries.iter().any(|a| a.by != MDNS) {
+        registries.retain(|a| a.by != MDNS);
+    }
     registries.sort_by_key(|a| {
         let priority = a.priority.unwrap_or(DEVELOPMENT - 1);
-        (a.auth, priority >= DEVELOPMENT, priority, a.url.clone())
+        (a.auth, priority >= DEVELOPMENT, priority, shuffle.hash_one(&a.url), a.url.clone())
     });
     let mut seen = std::collections::HashSet::new();
     registries.retain(|a| seen.insert(a.url.clone()));
@@ -325,5 +337,28 @@ mod tests {
         ];
         let order: Vec<&str> = by_preference(&apis).iter().map(|a| a.url.trim_start_matches("http://")).collect();
         assert_eq!(order, ["main", "backup", "unsaid", "dev", "locked"]);
+    }
+
+    #[test]
+    fn unicast_registries_outrank_multicast_ones_and_ties_are_shuffled() {
+        let api = |url: &str, pri: u32, by: &str| Api {
+            priority: Some(pri),
+            by: by.into(),
+            ..Api::given(&format!("http://{url}"))
+        };
+        let apis =
+            [api("lab", 0, MDNS), api("site-b", 10, "DNS in example.com"), api("site-a", 10, "DNS in example.com")];
+        let order: Vec<&str> = by_preference(&apis).iter().map(|a| a.url.trim_start_matches("http://")).collect();
+        assert_eq!(order.len(), 2, "the mDNS registry is left out: {order:?}");
+        // The same order every time while the program runs.
+        assert_eq!(by_preference(&apis), by_preference(&apis));
+        // Without unicast ones, mDNS registries are used.
+        assert_eq!(by_preference(&apis[..1]).len(), 1);
+        // Ties are not settled by URL: over many names, some come out of alphabetical order.
+        let many: Vec<Api> = (0..20).map(|n| api(&format!("r{n:02}"), 10, MDNS)).collect();
+        let order: Vec<&str> = by_preference(&many).iter().map(|a| a.url.as_str()).collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_ne!(order, sorted);
     }
 }

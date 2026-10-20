@@ -635,7 +635,7 @@ fn browse_mdns(shared: &Shared, mdns: &mut Mdns, follow: bool) {
             }
         }
         cache.expire(Instant::now());
-        let apis = apis_in(&cache, &types, "mDNS");
+        let apis = apis_in(&cache, &types, nmos::MDNS);
         if apis != found {
             found.clone_from(&apis);
             shared.update(|s| {

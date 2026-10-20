@@ -771,8 +771,9 @@ fn with_uneven_compressed_frames() -> Report {
         // 30 and 31 packets in turn.
         let packets = 30 + n % 2;
         for j in 0..packets {
-            let payload = [0x80; 700];
-            let packet = rtp(112, j == packets - 1, seq, timestamp, 0x4444_0004, &payload);
+            let last = j == packets - 1;
+            let payload = jxs_payload(last, None, n, j);
+            let packet = rtp(112, last, seq, timestamp, 0x4444_0004, &payload);
             seq = seq.wrapping_add(1);
             let t = start + 500_000 + j * 16_683_333 * 9 / 10 / 31;
             scene.udp(t, "192.168.10.30:5010", "239.10.10.4:5010", &packet);
@@ -780,6 +781,59 @@ fn with_uneven_compressed_frames() -> Report {
     }
     send_ptp(&mut scene, GM, 1, |_, _| false);
     scene.analyse(&[fixture("jpeg-xs.sdp")])
+}
+
+/// 700 octets of JPEG XS in codestream mode, sent in order: an RFC 9134 payload header
+/// whose L bit is `last`, for field 2 of interlaced video when `second`.
+fn jxs_payload(last: bool, second: Option<bool>, frame: i128, packet: i128) -> [u8; 700] {
+    let mut payload = [0u8; 700];
+    let scan = match second {
+        None => 0b00,
+        Some(false) => 0b10,
+        Some(true) => 0b11,
+    };
+    let f = (frame % 32) as u8;
+    payload[0] = 0x80 | if last { 0x20 } else { 0 } | (scan << 3) | (f >> 2);
+    payload[1] = (f & 0b11) << 6;
+    payload[2..4].copy_from_slice(&((packet % 2048) as u16).to_be_bytes());
+    payload
+}
+
+/// 1080i59.94 JPEG XS, each field with its own timestamp and its own marker, as VSF
+/// TR-08:2026 §8.1.2.3 and RFC 9134 §4.2 ask.
+fn with_interlaced_jpeg_xs(break_marker: bool) -> Report {
+    let mut scene = Scene::default();
+    let mut seq: u16 = 0;
+    let first = NOON * 60_000 / 1001;
+    for field in first..first + 50 {
+        let start = field * 1001 * NANOS / 60_000;
+        let timestamp = (field * 1001 * 90_000 / 60_000) as u32;
+        let second = field % 2 == 1;
+        for j in 0..20 {
+            let last = j == 19;
+            let payload = jxs_payload(last, Some(second), field / 2, j);
+            let marker = last && !(break_marker && field == first + 10);
+            let packet = rtp(112, marker, seq, timestamp, 0x4444_0005, &payload);
+            seq = seq.wrapping_add(1);
+            let t = start + 500_000 + j * 16_683_333 * 9 / 10 / 20;
+            scene.udp(t, "192.168.10.30:5010", "239.10.10.4:5010", &packet);
+        }
+    }
+    send_ptp(&mut scene, GM, 1, |_, _| false);
+    let mut sdp = fixture("jpeg-xs.sdp");
+    sdp.text = sdp.text.replace("exactframerate=60000/1001", "exactframerate=30000/1001; interlace");
+    scene.analyse(&[sdp])
+}
+
+#[test]
+fn interlaced_jpeg_xs_stamps_each_field() {
+    let report = with_interlaced_jpeg_xs(false);
+    assert_eq!(rules(&report), Vec::<&str>::new());
+    let video = report.flows[0].video.as_ref().unwrap();
+    assert_eq!(video.frame_rate.as_deref(), Some("30000/1001"));
+    let report = with_interlaced_jpeg_xs(true);
+    assert_eq!(rules(&report), ["marker-bit", "jxs-payload-header"]);
+    assert!(finding(&report, "jxs-payload-header").message.contains("L (1) and M (0)"));
 }
 
 #[test]
@@ -833,6 +887,24 @@ fn with_slow_syncs() -> Report {
         scene.udp(t + 30_000, GM_ADDRESS, PTP_GENERAL, &ptp(0x08, 2, -3, 0, seq, GM, &ptp_timestamp(t)));
     }
     scene.analyse(&[])
+}
+
+#[test]
+fn another_profile_on_the_same_domain_number_is_its_own_domain() {
+    let mut scene = Scene::default();
+    send_ptp(&mut scene, GM, 2, |_, _| false);
+    // Another grandmaster on domain 127 with majorSdoId 1 (as gPTP uses), announcing
+    // every 8 s, which ST 2059-2 would not allow.
+    for i in 0..2 {
+        let t = NOON * NANOS + i * NANOS + 200_000_000;
+        let mut message = announce(OTHER_GM, i as u16, t, 3);
+        message[0] |= 0x10;
+        scene.udp(t, "192.168.1.2:320", PTP_GENERAL, &message);
+    }
+    let report = scene.analyse(&[]);
+    assert_eq!(rules(&report), Vec::<&str>::new());
+    let domains: Vec<(u8, u16)> = report.ptp.domains.iter().map(|d| (d.domain, d.sdo_id)).collect();
+    assert_eq!(domains, [(127, 0), (127, 0x100)]);
 }
 
 #[test]
@@ -966,6 +1038,7 @@ fn every_rule_has_a_capture_that_raises_it() {
         with_future_timestamps(),
         with_misaligned_timestamps(),
         with_uneven_compressed_frames(),
+        with_interlaced_jpeg_xs(true),
         with_ptp_faults(),
         with_slow_syncs(),
     ];

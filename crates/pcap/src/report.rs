@@ -302,6 +302,13 @@ pub struct PtpReport {
 pub struct PtpDomainReport {
     /// domainNumber.
     pub domain: u8,
+    /// sdoId, majorSdoId and minorSdoId together: 0 for ST 2059-2 and AES67, 0x100 for
+    /// IEEE 802.1AS. A domain is its number and its sdoId (IEEE 1588-2019 §7.1).
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_zero"))]
+    pub sdo_id: u16,
+    /// Whether its messages came over Ethernet rather than UDP, which ST 2059-2 does not use.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
+    pub layer2: bool,
     /// The grandmasters that Announce messages named, in order, up to 16.
     pub grandmasters: Vec<String>,
     /// Each port that sent messages.
@@ -372,4 +379,9 @@ impl Finding {
     ) -> Self {
         Self { rule: rule.id, severity: rule.severity, message, reference: rule.reference, flow, domain, at, count }
     }
+}
+
+#[cfg(feature = "serde")]
+fn is_zero(n: &u16) -> bool {
+    *n == 0
 }
