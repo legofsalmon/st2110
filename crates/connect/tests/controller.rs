@@ -538,6 +538,26 @@ fn a_salvo_switches_together_in_one_bulk_request() {
 }
 
 #[test]
+fn a_salvo_can_switch_on_a_frame_boundary() {
+    let mock = Mock::start(|_| {});
+    let rate = st2110_sdp::Rational::new(60000, 1001).unwrap();
+    let routes = [route("MON 1 video", sender("CAM 1 video")), route("MON 1 audio", sender("CAM 1 audio"))];
+    let outcome = mock.connect(&routes, &Settings { align: Some(rate), dry_run: true, ..settings() });
+    let requested = PtpTime::parse(outcome.activation["requested_time"].as_str().unwrap()).unwrap();
+    // The start of a 60000/1001 frame, rounded up to the nanosecond: frame n starts at
+    // n × 1001/60000 s.
+    let frame = (requested.nanos() * 60_000).div_euclid(1001 * 1_000_000_000);
+    assert_eq!(st2110_ptp::epoch::period_start(frame, rate), Some(requested), "{requested}");
+    // A time given already on a boundary stays there.
+    let at = st2110_ptp::epoch::period_start(frame + 300, rate).unwrap();
+    let outcome = mock.connect(
+        &routes,
+        &Settings { align: Some(rate), activation: Some(Activation::At(at)), dry_run: true, ..settings() },
+    );
+    assert_eq!(outcome.activation["requested_time"].as_str(), Some(st2110_connect::tai(at).as_str()));
+}
+
+#[test]
 fn without_bulk_it_sends_one_request_each() {
     let mock = Mock::start(|f| f.faults.no_bulk = true);
     let outcome = mock.connect(

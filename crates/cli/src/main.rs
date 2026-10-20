@@ -140,6 +140,10 @@ enum Command {
         /// have its request in time.
         #[arg(long, value_name = "SECONDS", default_value_t = 2.0)]
         lead: f64,
+        /// A frame rate, such as 50 or 60000/1001, to move a PTP activation time on to
+        /// its next frame boundary (ST 2059-1), so that the switch falls between frames.
+        #[arg(long, value_name = "RATE", conflicts_with_all = ["after", "cancel"])]
+        align: Option<String>,
         /// Plan and check the connections, and send nothing.
         #[arg(long)]
         dry_run: bool,
@@ -465,6 +469,7 @@ fn main() -> ExitCode {
             at,
             after,
             lead,
+            align,
             dry_run,
             force,
             timeout,
@@ -484,6 +489,7 @@ fn main() -> ExitCode {
                 at,
                 after,
                 lead,
+                align,
                 dry_run,
                 force,
                 timeout,
