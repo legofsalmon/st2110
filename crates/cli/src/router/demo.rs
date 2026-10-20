@@ -1,7 +1,8 @@
 //! A demo facility for `st2110 router --demo`: an IS-04 Query API and the IS-05
 //! Connection API of each Node, served alongside the router page, so the router can be
 //! tried with no equipment. Its Receivers stage, schedule and activate as IS-05 v1.2
-//! describes, and the registry hears of each activation, as a Node tells its registry.
+//! describes ([`crate::node::connection`]), and the registry hears of each activation,
+//! as a Node tells its registry.
 //!
 //! Four cameras send video on an ST 2022-7 pair and stereo tone; a graphics machine
 //! sends a smaller picture on one leg. Three monitors take the cameras' video on two legs
@@ -19,7 +20,8 @@
 //! camera's unicast stream is not sent, since no Receiver's address is this machine's.
 //!
 //! Its Query API takes subscriptions, and pushes each change to them over a WebSocket,
-//! as a registry does. With `--demo-auth` it asks for IS-10 tokens too, and serves the
+//! as a registry does. Its Registration API takes other Nodes, such as `st2110 send
+//! --nmos`, and forgets one 12 seconds after its last heartbeat. With `--demo-auth` it asks for IS-10 tokens too, and serves the
 //! Authorization Server to get them from, whose tokens last a minute: to [`CLIENT_ID`]
 //! with [`CLIENT_SECRET`], and to any client that registers by RFC 7591 with the initial
 //! access token [`INITIAL_TOKEN`], for a secret or for `private_key_jwt`, as the router
@@ -39,8 +41,9 @@ use st2110_sdp::Rational;
 
 use st2110_nmos::auth;
 
-use super::http::{Request, Response};
 use super::signal::Live;
+use crate::http::{Request, Response};
+use crate::node::connection::{self, Control, Endpoint, Side, error, tai};
 use crate::timing::now;
 
 const VIDEO: &str = "urn:x-nmos:format:video";
@@ -57,10 +60,6 @@ const LEAVES: [&str; 2] = ["c8-00-84-ee-00-0a", "c8-00-84-ee-00-0b"];
 /// A demo resource id: `prefix` names the type and `n` the resource.
 fn id(prefix: &str, n: u32) -> String {
     format!("{prefix}{n:04x}-0000-4000-8000-{n:012x}")
-}
-
-fn tai(time: PtpTime) -> String {
-    format!("{}:{}", time.seconds(), time.subsec_nanos())
 }
 
 /// What every IS-04 resource has.
@@ -95,57 +94,9 @@ fn merge(mut base: Value, more: Value) -> Value {
     base
 }
 
-/// One Sender's or Receiver's IS-05 resources.
-struct Resources {
-    constraints: Value,
-    staged: Value,
-    active: Value,
-    /// When a scheduled activation is due.
-    pending: Option<PtpTime>,
-}
-
-/// Which side of a connection: the Connection API's `senders` or `receivers`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Side {
-    Sender,
-    Receiver,
-}
-
-impl Side {
-    fn plural(self) -> &'static str {
-        match self {
-            Self::Sender => "senders",
-            Self::Receiver => "receivers",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sender => "Sender",
-            Self::Receiver => "Receiver",
-        }
-    }
-
-    /// What a request may change besides the transport parameters.
-    fn fields(self) -> &'static [&'static str] {
-        match self {
-            Self::Sender => &["receiver_id", "master_enable"],
-            Self::Receiver => &["sender_id", "master_enable", "transport_file"],
-        }
-    }
-
-    /// The parameter `auto` stands for an interface's address in.
-    fn interface(self) -> &'static str {
-        match self {
-            Self::Sender => "source_ip",
-            Self::Receiver => "interface_ip",
-        }
-    }
-}
-
 /// A Sender's IS-05 resources, as it sends `legs`: each leg from this machine to a
 /// group or address and port.
-fn sender_resources(legs: &[Leg], enabled: bool) -> Resources {
+fn sender_resources(legs: &[Leg], enabled: bool) -> Endpoint {
     let constraints: Vec<Value> = legs
         .iter()
         .map(|_| {
@@ -160,28 +111,10 @@ fn sender_resources(legs: &[Leg], enabled: bool) -> Resources {
                    "source_port": 5004, "destination_port": leg.destination.port(), "rtp_enabled": true})
         })
         .collect();
-    let active = json!({
-        "receiver_id": null, "master_enable": enabled,
-        "activation": {"mode": null, "requested_time": null, "activation_time": null},
-        "transport_params": params,
-    });
-    Resources { constraints: Value::Array(constraints), staged: active.clone(), active, pending: None }
+    Endpoint::sender(constraints, params, enabled)
 }
 
-fn idle(interfaces: &[String]) -> Value {
-    let legs: Vec<Value> = interfaces
-        .iter()
-        .map(|i| json!({"source_ip": null, "multicast_ip": null, "interface_ip": i, "destination_port": 5004, "rtp_enabled": true}))
-        .collect();
-    json!({
-        "sender_id": null, "master_enable": false,
-        "activation": {"mode": null, "requested_time": null, "activation_time": null},
-        "transport_file": {"data": null, "type": null},
-        "transport_params": legs,
-    })
-}
-
-fn constraints(interfaces: &[String]) -> Value {
+fn constraints(interfaces: &[String]) -> Vec<Value> {
     interfaces
         .iter()
         .map(|i| {
@@ -189,10 +122,6 @@ fn constraints(interfaces: &[String]) -> Value {
                    "destination_port": {"minimum": 5000, "maximum": 5999}, "rtp_enabled": {}})
         })
         .collect()
-}
-
-fn error(code: u16, message: &str, debug: &str) -> (u16, Value) {
-    (code, json!({"code": code, "error": message, "debug": debug}))
 }
 
 /// The demo Authorization Server's one client.
@@ -216,6 +145,9 @@ enum Client {
     Key(String),
 }
 
+/// The scopes the demo Authorization Server issues tokens for.
+const SCOPES: [&str; 3] = ["query", "connection", "registration"];
+
 /// How long a demo token lasts, short enough to see one renewed.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -224,6 +156,10 @@ const TOKEN_PATH: &str = "/x-nmos/auth/v1.0/token";
 
 /// Where its metadata is (RFC 8414).
 const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// How long a Node registered through the Registration API is kept without a
+/// heartbeat: the 12 seconds IS-04 suggests.
+const EXPIRY: Duration = Duration::from_secs(12);
 
 /// Where the Query API's subscriptions are heard.
 pub(crate) const WS_PATH: &str = "/x-nmos/query/v1.3/ws/";
@@ -241,8 +177,8 @@ pub(crate) struct Facility {
     tai_utc: i32,
     /// The registry's resources, by type: `nodes`, `devices` and so on.
     registry: BTreeMap<&'static str, Vec<Value>>,
-    receivers: BTreeMap<String, Resources>,
-    senders: BTreeMap<String, Resources>,
+    receivers: BTreeMap<String, Endpoint>,
+    senders: BTreeMap<String, Endpoint>,
     /// What each Sender's `/transportfile` serves, keyed by Sender `id`.
     sdp: BTreeMap<String, String>,
     /// Each Sender's stream, keyed by Sender `id`: its label and description, as it was
@@ -263,6 +199,9 @@ pub(crate) struct Facility {
     assertions: HashSet<String>,
     /// Whether a Receiver changed since the facility was last kept.
     dirty: bool,
+    /// The Nodes registered through the Registration API, by `id`, and when each was
+    /// last heard from.
+    heard: HashMap<String, Instant>,
 }
 
 /// A Sender to build: its label, Flow facts and SDP file.
@@ -325,6 +264,7 @@ impl Facility {
             clients: HashMap::from([(CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string()))]),
             assertions: HashSet::new(),
             dirty: false,
+            heard: HashMap::new(),
         };
         for kind in ["nodes", "devices", "sources", "flows", "senders", "receivers"] {
             facility.registry.insert(kind, Vec::new());
@@ -391,8 +331,8 @@ impl Facility {
                     "transport_file": {"data": sdp, "type": "application/sdp"},
                     "transport_params": facility.legs(&receiver, &sender),
                 });
-                facility.stage(Side::Receiver, &receiver, &body);
-                facility.activate(Side::Receiver, &receiver, now);
+                connection::stage(&mut facility, Side::Receiver, &receiver, &body);
+                connection::activate(&mut facility, Side::Receiver, &receiver, now);
                 debug_assert_eq!(facility.receivers[&receiver].active["sender_id"], json!(sender), "{kind}");
             }
         }
@@ -415,7 +355,7 @@ impl Facility {
     /// What a Receiver's legs take from an SDP file, for setting up the demo.
     fn legs(&self, receiver: &str, sender: &str) -> Value {
         let legs = &self.streams[sender].1.legs;
-        let count = self.receivers[receiver].constraints.as_array().map_or(0, Vec::len);
+        let count = self.receivers[receiver].legs();
         (0..count)
             .map(|i| match legs.get(i) {
                 Some(leg) => json!({
@@ -579,15 +519,7 @@ impl Facility {
                     "subscription": {"sender_id": null, "active": false}, "format": format, "caps": caps,
                 }),
             ));
-            self.receivers.insert(
-                receiver_id,
-                Resources {
-                    constraints: constraints(&interfaces),
-                    staged: idle(&interfaces),
-                    active: idle(&interfaces),
-                    pending: None,
-                },
-            );
+            self.receivers.insert(receiver_id, Endpoint::idle_receiver(&interfaces, constraints(&interfaces)));
         }
     }
 
@@ -652,17 +584,26 @@ impl Facility {
                 Err(e) => return Response::json(400, &error(400, "Bad Request", &e.to_string()).1),
             }
         };
-        let (status, body) = self.route(&request.method, &request.path, &body);
-        match body {
-            Value::String(sdp) => {
-                Response { status, content_type: "application/sdp", headers: Vec::new(), body: sdp.into_bytes() }
+        let path = request.path.trim_end_matches('/');
+        // `/node/<n>/x-nmos/connection/v1.1/...`: each Node's own Connection API.
+        if let Some(rest) = path
+            .strip_prefix("/node/")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(_, rest)| rest.strip_prefix("x-nmos/connection/v1.1"))
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        {
+            return connection::route(self, &request.method, rest, &body);
+        }
+        match self.route(&request.method, path, &body) {
+            (204, _) => {
+                Response { status: 204, content_type: "application/json", headers: Vec::new(), body: Vec::new() }
             }
-            body => Response::json(status, &body),
+            (status, body) => Response::json(status, &body),
         }
     }
 
+    /// Answers a request for the Query API or the Registration API.
     fn route(&mut self, method: &str, path: &str, body: &Value) -> (u16, Value) {
-        let path = path.trim_end_matches('/');
         if let Some(rest) = path.strip_prefix("/x-nmos/query") {
             if method == "POST" && rest == "/v1.3/subscriptions" {
                 return self.subscribe(body);
@@ -672,76 +613,13 @@ impl Facility {
             }
             return self.query(rest);
         }
-        // `/node/<n>/x-nmos/connection/v1.1/...`: each Node's own Connection API.
-        let Some(rest) = path
-            .strip_prefix("/node/")
-            .and_then(|rest| rest.split_once('/'))
-            .and_then(|(_, rest)| rest.strip_prefix("x-nmos/connection/v1.1/"))
-        else {
-            return error(404, "Not Found", path);
-        };
-        if let Some(id) = rest.strip_prefix("single/senders/").and_then(|r| r.strip_suffix("/transportfile")) {
-            return match self.sdp.get(id) {
-                Some(sdp) if method == "GET" => (200, Value::String(sdp.clone())),
-                Some(_) => error(405, "Method Not Allowed", ""),
-                None => error(404, "Not Found", "no such Sender"),
-            };
-        }
-        for side in [Side::Sender, Side::Receiver] {
-            if rest == format!("bulk/{}", side.plural()) {
-                if method != "POST" {
-                    return error(405, "Method Not Allowed", "");
-                }
-                let Some(items) = body.as_array() else {
-                    return error(400, "Bad Request", "a bulk request is an array");
-                };
-                self.dirty = true;
-                let results = items
-                    .iter()
-                    .map(|item| {
-                        let id = item["id"].as_str().unwrap_or_default();
-                        let (code, response) = if self.side(side).contains_key(id) {
-                            self.stage(side, id, &item["params"])
-                        } else {
-                            error(404, "Not Found", &format!("no such {}", side.name()))
-                        };
-                        let mut result = json!({"id": id, "code": code});
-                        if code >= 400 {
-                            result["error"] = response["error"].clone();
-                            result["debug"] = response["debug"].clone();
-                        }
-                        result
-                    })
-                    .collect();
-                return (200, Value::Array(results));
+        if let Some(rest) = path.strip_prefix("/x-nmos/registration") {
+            if method == "POST" && rest == "/v1.3/resource" {
+                return self.register_resource(body);
             }
-            let Some((id, resource)) =
-                rest.strip_prefix(&format!("single/{}/", side.plural())).and_then(|r| r.split_once('/'))
-            else {
-                continue;
-            };
-            let Some(resources) = self.side(side).get(id) else {
-                return error(404, "Not Found", &format!("no such {}", side.name()));
-            };
-            return match (method, resource) {
-                ("GET", "constraints") => (200, resources.constraints.clone()),
-                ("GET", "staged") => (200, resources.staged.clone()),
-                ("GET", "active") => (200, resources.active.clone()),
-                ("PATCH", "staged") => {
-                    self.dirty = true;
-                    self.stage(side, id, body)
-                }
-                _ => error(405, "Method Not Allowed", ""),
-            };
+            return self.registration(method, rest);
         }
         error(404, "Not Found", path)
-    }
-
-    fn side(&mut self, side: Side) -> &mut BTreeMap<String, Resources> {
-        match side {
-            Side::Sender => &mut self.senders,
-            Side::Receiver => &mut self.receivers,
-        }
     }
 
     /// The Query API: its versions, a collection or one resource. Collections are not
@@ -770,135 +648,133 @@ impl Facility {
         }
     }
 
-    fn now(&self) -> PtpTime {
-        now(self.tai_utc).unwrap_or_else(|_| PtpTime::from_utc(0, 0).expect("the epoch"))
-    }
-
-    /// Carries out the scheduled activations that are due.
+    /// Carries out the scheduled activations that are due, and forgets the Nodes that
+    /// have stopped sending heartbeats.
     pub(crate) fn settle(&mut self) {
-        let now = self.now();
-        for side in [Side::Sender, Side::Receiver] {
-            let due: Vec<(String, PtpTime)> = self
-                .side(side)
-                .iter()
-                .filter_map(|(id, r)| r.pending.filter(|&due| due <= now).map(|due| (id.clone(), due)))
-                .collect();
-            for (id, due) in due {
-                self.activate(side, &id, due);
-            }
+        connection::settle(self);
+        let now = Instant::now();
+        let gone: Vec<String> =
+            self.heard.iter().filter(|(_, at)| now.duration_since(**at) > EXPIRY).map(|(id, _)| id.clone()).collect();
+        for id in gone {
+            self.unregister("nodes", &id);
         }
     }
 
-    /// What a `PATCH` to `/staged` does.
-    fn stage(&mut self, side: Side, id: &str, body: &Value) -> (u16, Value) {
-        let now = self.now();
-        let resources = self.side(side).get_mut(id).expect("a known Sender or Receiver");
-        let mode = body.get("activation").map(|a| &a["mode"]);
-        if resources.pending.is_some() && mode != Some(&Value::Null) {
-            return error(423, "Locked", "an activation is scheduled");
-        }
-        if let Some(params) = body.get("transport_params") {
-            let legs = resources.constraints.as_array().cloned().unwrap_or_default();
-            let Some(params) = params.as_array().filter(|p| p.len() == legs.len()) else {
-                return error(400, "Invalid transport_params", "one entry per leg");
-            };
-            for (leg, (constraints, params)) in legs.iter().zip(params).enumerate() {
-                for (name, value) in params.as_object().into_iter().flatten() {
-                    let Some(constraint) = constraints.get(name) else {
-                        return error(400, "Invalid transport_params", &format!("leg {leg} has no {name}"));
-                    };
-                    let allowed = constraint.get("enum").and_then(Value::as_array).is_none_or(|e| e.contains(value));
-                    let in_range = value.as_f64().is_none_or(|n| {
-                        constraint.get("minimum").and_then(Value::as_f64).is_none_or(|m| n >= m)
-                            && constraint.get("maximum").and_then(Value::as_f64).is_none_or(|m| n <= m)
-                    });
-                    if !allowed || !in_range {
-                        return error(400, "Constraint violation", &format!("leg {leg}: {name} {value}"));
-                    }
-                    // The demo's streams go to IPv4 addresses.
-                    if name == "destination_ip" && value.as_str().and_then(|v| v.parse::<Ipv4Addr>().ok()).is_none() {
-                        return error(
-                            400,
-                            "Constraint violation",
-                            &format!("leg {leg}: the demo sends to IPv4 addresses only, not {value}"),
-                        );
-                    }
+    /// The Registration API, for Nodes beyond the demo's own (IS-04 v1.3 APIs:
+    /// Registration API).
+    fn registration(&mut self, method: &str, rest: &str) -> (u16, Value) {
+        let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+        match (method, parts.as_slice()) {
+            ("GET", []) => (200, json!(["v1.3/"])),
+            ("GET", ["v1.3"]) => (200, json!(["resource/", "health/"])),
+            ("GET", ["v1.3", "resource", kind, id]) => {
+                match self.registry.get(kind).and_then(|l| l.iter().find(|r| r["id"] == *id)) {
+                    Some(resource) => (200, resource.clone()),
+                    None => error(404, "Not Found", "no such resource"),
                 }
             }
-            let staged = resources.staged["transport_params"].as_array_mut().expect("legs");
-            for (staged, params) in staged.iter_mut().zip(params) {
-                for (name, value) in params.as_object().into_iter().flatten() {
-                    staged[name] = value.clone();
+            ("DELETE", ["v1.3", "resource", kind, id]) => {
+                if !self.registry.get(kind).is_some_and(|l| l.iter().any(|r| r["id"] == *id)) {
+                    return error(404, "Not Found", "no such resource");
                 }
+                self.unregister(kind, id);
+                (204, Value::Null)
             }
+            ("GET" | "POST", ["v1.3", "health", "nodes", id]) => match self.heard.get_mut(*id) {
+                Some(heard) => {
+                    if method == "POST" {
+                        *heard = Instant::now();
+                    }
+                    (200, json!({"health": self.now().seconds().to_string()}))
+                }
+                None => error(404, "Not Found", "no such Node: register it"),
+            },
+            (_, ["v1.3", "resource" | "health", ..]) => error(405, "Method Not Allowed", ""),
+            _ => error(404, "Not Found", "this registry serves IS-04 v1.3"),
         }
-        for field in side.fields() {
-            if let Some(value) = body.get(*field) {
-                resources.staged[*field] = value.clone();
-            }
+    }
+
+    /// `POST /resource`: registers a resource, or updates one registered before.
+    fn register_resource(&mut self, body: &Value) -> (u16, Value) {
+        let data = &body["data"];
+        let (kind, parent) = match body["type"].as_str() {
+            Some("node") => ("nodes", None),
+            Some("device") => ("devices", Some(("nodes", "node_id"))),
+            Some("source") => ("sources", Some(("devices", "device_id"))),
+            Some("flow") => ("flows", Some(("devices", "device_id"))),
+            Some("sender") => ("senders", Some(("devices", "device_id"))),
+            Some("receiver") => ("receivers", Some(("devices", "device_id"))),
+            _ => return error(400, "Bad Request", "type is node, device, source, flow, sender or receiver"),
+        };
+        let Some(id) = data["id"].as_str().map(str::to_string) else {
+            return error(400, "Bad Request", "the resource has no id");
+        };
+        if data["version"].as_str().is_none() {
+            return error(400, "Bad Request", "the resource has no version");
         }
-        let requested = body["activation"]["requested_time"].as_str().and_then(PtpTime::parse);
-        match mode.and_then(Value::as_str) {
-            Some("activate_immediate") => {
-                self.activate(side, id, now);
-                let mut response = self.side(side)[id].staged.clone();
-                response["activation"] =
-                    json!({"mode": "activate_immediate", "requested_time": null, "activation_time": tai(now)});
-                (200, response)
+        if let Some((parents, field)) = parent
+            && !self.registry[parents].iter().any(|r| r["id"] == data[field])
+        {
+            return error(400, "Bad Request", &format!("its {field} names nothing registered"));
+        }
+        if kind == "nodes" {
+            self.heard.insert(id.clone(), Instant::now());
+        }
+        let list = self.registry.get_mut(kind).expect("a resource type");
+        match list.iter_mut().find(|r| r["id"] == id.as_str()) {
+            Some(registered) => {
+                let pre = std::mem::replace(registered, data.clone());
+                self.changes.push((kind, pre, data.clone()));
+                (200, data.clone())
             }
-            Some(mode @ ("activate_scheduled_absolute" | "activate_scheduled_relative")) => {
-                let Some(requested) = requested else {
-                    return error(400, "Bad Request", "a scheduled activation needs a requested_time");
-                };
-                let due = if mode == "activate_scheduled_absolute" {
-                    requested
-                } else {
-                    now.add_nanos(requested.nanos()).unwrap_or(now)
-                };
-                resources.pending = Some(due);
-                resources.staged["activation"] = json!({
-                    "mode": mode, "requested_time": body["activation"]["requested_time"], "activation_time": tai(due),
-                });
-                (202, resources.staged.clone())
-            }
-            Some(other) => error(400, "Bad Request", &format!("no activation mode {other}")),
             None => {
-                if mode.is_some() {
-                    resources.pending = None;
-                    resources.staged["activation"] =
-                        json!({"mode": null, "requested_time": null, "activation_time": null});
-                }
-                (200, resources.staged.clone())
+                list.push(data.clone());
+                self.changes.push((kind, Value::Null, data.clone()));
+                (201, data.clone())
             }
         }
     }
 
-    fn activate(&mut self, side: Side, id: &str, at: PtpTime) {
-        let resources = self.side(side).get_mut(id).expect("a known Sender or Receiver");
-        let mut active = resources.staged.clone();
-        let legs = resources.constraints.as_array().cloned().unwrap_or_default();
-        let interface = side.interface();
-        for (leg, constraints) in active["transport_params"].as_array_mut().into_iter().flatten().zip(&legs) {
-            if leg[interface] == "auto" {
-                leg[interface] = constraints[interface]["enum"][1].clone();
+    /// Removes a resource from the registry, with those that belong to it.
+    fn unregister(&mut self, kind: &str, id: &str) {
+        let Some((kind, list)) = self.registry.iter_mut().find(|(k, _)| **k == kind) else {
+            return;
+        };
+        let kind: &'static str = kind;
+        let Some(at) = list.iter().position(|r| r["id"] == id) else {
+            return;
+        };
+        let removed = list.remove(at);
+        self.changes.push((kind, removed, Value::Null));
+        let children: Vec<(&'static str, String)> = match kind {
+            "nodes" => {
+                self.heard.remove(id);
+                self.registry["devices"]
+                    .iter()
+                    .filter(|d| d["node_id"] == id)
+                    .filter_map(|d| Some(("devices", d["id"].as_str()?.to_string())))
+                    .collect()
             }
+            "devices" => ["sources", "flows", "senders", "receivers"]
+                .into_iter()
+                .flat_map(|k| {
+                    self.registry[k]
+                        .iter()
+                        .filter(|r| r["device_id"] == id)
+                        .filter_map(move |r| Some((k, r["id"].as_str()?.to_string())))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (kind, id) in children {
+            self.unregister(kind, &id);
         }
-        active["activation"] = json!({
-            "mode": resources.staged["activation"]["mode"].as_str().unwrap_or("activate_immediate"),
-            "requested_time": resources.staged["activation"]["requested_time"],
-            "activation_time": tai(at),
-        });
-        resources.active = active;
-        resources.pending = None;
-        resources.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
-        self.dirty = true;
-        self.registered(side, id, at);
     }
 
     /// Tells the registry what a Sender sends or a Receiver takes now, as its Node would,
     /// and has a Sender's stream follow.
     fn registered(&mut self, side: Side, id: &str, at: PtpTime) {
-        let active = &self.side(side)[id].active;
+        let active = &self.endpoints(side)[id].active;
         let enabled = active["master_enable"] == true;
         let subscription = match side {
             // A Sender names its Receiver only while active (IS-04 v1.3 Behaviour: Nodes).
@@ -926,7 +802,7 @@ impl Facility {
 
     /// Each Sender's and Receiver's staged and active parameters, to keep for the next run.
     pub(crate) fn export(&self) -> Value {
-        let kept = |map: &BTreeMap<String, Resources>| -> serde_json::Map<String, Value> {
+        let kept = |map: &BTreeMap<String, Endpoint>| -> serde_json::Map<String, Value> {
             map.iter().map(|(id, r)| (id.clone(), json!({"staged": r.staged, "active": r.active}))).collect()
         };
         json!({"receivers": kept(&self.receivers), "senders": kept(&self.senders)})
@@ -938,15 +814,15 @@ impl Facility {
     pub(crate) fn restore(&mut self, kept: &Value) {
         let now = self.now();
         for side in [Side::Sender, Side::Receiver] {
-            let ids: Vec<String> = self.side(side).keys().cloned().collect();
+            let ids: Vec<String> = self.endpoints(side).keys().cloned().collect();
             for id in ids {
                 let Some(saved) = kept[side.plural()].get(&id) else { continue };
-                let legs = self.side(side)[&id].constraints.as_array().map_or(0, Vec::len);
+                let legs = self.endpoints(side)[&id].legs();
                 let fits = |v: &Value| v["transport_params"].as_array().is_some_and(|p| p.len() == legs);
                 if !fits(&saved["staged"]) || !fits(&saved["active"]) {
                     continue;
                 }
-                let resources = self.side(side).get_mut(&id).expect("a known Sender or Receiver");
+                let resources = self.endpoints(side).get_mut(&id).expect("a known Sender or Receiver");
                 resources.staged = saved["staged"].clone();
                 resources.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
                 resources.active = saved["active"].clone();
@@ -1019,7 +895,16 @@ impl Facility {
             let data: Vec<Value> = changes
                 .iter()
                 .filter(|(k, ..)| *k == kind)
-                .map(|(_, pre, post)| json!({"path": post["id"], "pre": pre, "post": post}))
+                .map(|(_, pre, post)| {
+                    let mut change = json!({"path": if post.is_null() { &pre["id"] } else { &post["id"] }});
+                    // A resource added has no `pre`, and one removed no `post`.
+                    for (name, resource) in [("pre", pre), ("post", post)] {
+                        if !resource.is_null() {
+                            change[name] = resource.clone();
+                        }
+                    }
+                    change
+                })
                 .collect();
             if !data.is_empty() {
                 out.push((uid.clone(), self.grain(uid, kind, data)));
@@ -1049,6 +934,8 @@ impl Facility {
         };
         let scope = if request.path.starts_with("/x-nmos/query") {
             "query"
+        } else if request.path.starts_with("/x-nmos/registration") {
+            "registration"
         } else if request.path.starts_with("/node/") {
             "connection"
         } else {
@@ -1086,8 +973,8 @@ impl Facility {
         let name =
             text("client_name").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a client_name"))?;
         let scope = text("scope").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a scope"))?;
-        if scope.split_whitespace().any(|s| s != "query" && s != "connection") {
-            return Err(refuse("invalid_client_metadata", "this demo's scopes are query and connection"));
+        if scope.split_whitespace().any(|s| !SCOPES.contains(&s)) {
+            return Err(refuse("invalid_client_metadata", "this demo's scopes are query, connection and registration"));
         }
         let grants = asked.get("grant_types").and_then(Value::as_array);
         if grants.is_some_and(|g| g.iter().any(|g| g.as_str() != Some("client_credentials"))) {
@@ -1169,7 +1056,7 @@ impl Facility {
                     "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
                     "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
                     "response_types_supported": ["none"],
-                    "scopes_supported": ["query", "connection"],
+                    "scopes_supported": SCOPES,
                 }),
             );
         }
@@ -1223,8 +1110,8 @@ impl Facility {
         }
         let asked = form.get("scope").map_or("query connection", String::as_str);
         let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
-        if scopes.is_empty() || scopes.iter().any(|s| s != "query" && s != "connection") {
-            return oauth_error(400, "invalid_scope", "this demo's scopes are query and connection");
+        if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
+            return oauth_error(400, "invalid_scope", "this demo's scopes are query, connection and registration");
         }
         let token = random_token();
         let now = Instant::now();
@@ -1237,6 +1124,37 @@ impl Facility {
                 "expires_in": TOKEN_LIFETIME.as_secs(), "scope": scopes.join(" "),
             }),
         )
+    }
+}
+
+impl Control for Facility {
+    fn endpoints(&mut self, side: Side) -> &mut BTreeMap<String, Endpoint> {
+        match side {
+            Side::Sender => &mut self.senders,
+            Side::Receiver => &mut self.receivers,
+        }
+    }
+
+    fn now(&self) -> PtpTime {
+        now(self.tai_utc).unwrap_or_else(|_| PtpTime::from_utc(0, 0).expect("the epoch"))
+    }
+
+    fn activated(&mut self, side: Side, id: &str, at: PtpTime) {
+        self.dirty = true;
+        self.registered(side, id, at);
+    }
+
+    fn transport_file(&self, id: &str) -> Option<String> {
+        self.sdp.get(id).cloned()
+    }
+
+    fn transport_type(&self, side: Side, id: &str) -> Option<String> {
+        let resource = self.registry.get(side.plural())?.iter().find(|r| r["id"] == id)?;
+        resource["transport"].as_str().map(str::to_string)
+    }
+
+    fn touched(&mut self) {
+        self.dirty = true;
     }
 }
 

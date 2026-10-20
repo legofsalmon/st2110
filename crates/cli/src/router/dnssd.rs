@@ -1,7 +1,8 @@
 //! The demo facility's DNS-SD: a stand-in DNS server, on the router's own address and
 //! port over UDP, that advertises the demo registry's Query API (`_nmos-query._tcp`)
-//! and, with `--demo-auth`, its Authorization Server (`_nmos-auth._tcp`), in whatever
-//! domain it is asked about, `local` included.
+//! and Registration API (`_nmos-register._tcp`) and, with `--demo-auth`, its
+//! Authorization Server (`_nmos-auth._tcp`), in whatever domain it is asked about,
+//! `local` included.
 //!
 //! So `st2110 nmos --dns-server 127.0.0.1:8110 --domain demo.test` finds the demo by
 //! unicast DNS-SD, as IS-04 and IS-10 prefer, and `--mdns 127.0.0.1:8110` by a
@@ -85,6 +86,7 @@ fn records(name: &Name, advertised: &Advertised) -> Vec<Record> {
     let a = Record::new(host.clone(), TTL, Data::A(address));
     let (instance, txt): (&str, Vec<&str>) = match kind.as_str() {
         "_nmos-query" => ("st2110 demo registry", vec!["api_proto=http", "api_ver=v1.0,v1.1,v1.2,v1.3", "pri=100"]),
+        "_nmos-register" => ("st2110 demo registry", vec!["api_proto=http", "api_ver=v1.3", "pri=100"]),
         "_nmos-auth" if advertised.auth => {
             ("st2110 demo authorization", vec!["api_proto=http", "api_ver=v1.0", "pri=100"])
         }
@@ -92,7 +94,7 @@ fn records(name: &Name, advertised: &Advertised) -> Vec<Record> {
         _ => return Vec::new(),
     };
     let mut txt: Vec<Vec<u8>> = txt.into_iter().map(|t| t.as_bytes().to_vec()).collect();
-    if kind == "_nmos-query" {
+    if kind != "_nmos-auth" {
         txt.push(format!("api_auth={}", advertised.auth).into_bytes());
     }
     let service = Name::parse(&format!("{kind}._tcp.{domain}"));
@@ -129,6 +131,8 @@ mod tests {
         assert_eq!(answer(&auth, &advertised).answers.len(), 1);
         let without = Advertised { auth: false, ..advertised };
         assert_eq!(answer(&auth, &without).rcode, 3, "no Authorization Server without --demo-auth");
+        let register = Message::query(11, vec![Question::new(Name::parse("_nmos-register._tcp.demo.test"), dns::PTR)]);
+        assert_eq!(answer(&register, &without).answers.len(), 1);
         let other = Message::query(10, vec![Question::new(Name::parse("example.com"), dns::A)]);
         assert_eq!(answer(&other, &without).rcode, 3);
     }
