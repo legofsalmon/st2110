@@ -599,8 +599,22 @@ impl Session {
                 ));
             }
             if c.malformed > 0 {
-                problems
-                    .push(format!("{} had payload headers that do not fit the format", count(c.malformed, "packet")));
+                let by = c.malformed_by;
+                let why: Vec<String> = [
+                    (by.lengths, "row segments of no whole number of pixel groups"),
+                    (by.places, "row segments outside the picture or off a pixel group"),
+                    (by.fields, "the second-field bit set in progressive video"),
+                    (by.headers, "more row segments than three, or than the payload holds"),
+                ]
+                .into_iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} with {what}"))
+                .collect();
+                problems.push(format!(
+                    "{} had payload headers that do not fit the format, left out: {} (ST 2110-20 §6.1.4, §6.2)",
+                    count(c.malformed, "packet"),
+                    why.join(", ")
+                ));
             }
             if c.late > 0 {
                 notes.push(format!(

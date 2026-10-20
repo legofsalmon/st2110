@@ -231,6 +231,31 @@ pub struct VideoCounts {
     pub late: u64,
     /// Packets whose payload header does not fit the format, left out.
     pub malformed: u64,
+    /// Why they did not fit.
+    pub malformed_by: MalformedCounts,
+}
+
+/// Why packets' payload headers did not fit the format (ST 2110-20:2022 §6.1.4, §6.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct MalformedCounts {
+    /// Row segments of no whole number of pixel groups, or empty beside others.
+    pub lengths: u64,
+    /// Row segments that start off a pixel group or lie outside the picture.
+    pub places: u64,
+    /// Row segments marked as a second field, in progressive video.
+    pub fields: u64,
+    /// Payloads shorter than their headers say, or with more than three row segments.
+    pub headers: u64,
+}
+
+/// Why a payload header does not fit the format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Malformed {
+    Length,
+    Place,
+    Field,
+    Headers,
 }
 
 struct Assembly {
@@ -322,9 +347,19 @@ impl Depacketiser {
             return;
         };
         let payload = rtp::payload(packet, &header);
-        let Some((extended, segments, data)) = self.parse(payload) else {
-            self.counts.malformed += 1;
-            return;
+        let (extended, segments, data) = match self.parse(payload) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                self.counts.malformed += 1;
+                let by = &mut self.counts.malformed_by;
+                *match why {
+                    Malformed::Length => &mut by.lengths,
+                    Malformed::Place => &mut by.places,
+                    Malformed::Field => &mut by.fields,
+                    Malformed::Headers => &mut by.headers,
+                } += 1;
+                return;
+            }
         };
         let sequence = (u32::from(extended) << 16) | u32::from(header.sequence);
         if let Some(a) = &self.assembly
@@ -398,13 +433,13 @@ impl Depacketiser {
     /// Reads the payload header: the extended sequence number and up to three row
     /// segments as (row, first pixel, octets), checked against the format.
     #[allow(clippy::type_complexity)]
-    fn parse<'p>(&self, payload: &'p [u8]) -> Option<(u16, [Option<(usize, usize, usize)>; 3], &'p [u8])> {
-        let extended = u16::from_be_bytes([*payload.first()?, *payload.get(1)?]);
+    fn parse<'p>(&self, payload: &'p [u8]) -> Result<(u16, [Option<(usize, usize, usize)>; 3], &'p [u8]), Malformed> {
+        let extended = payload.get(..ESN).map(|b| u16::from_be_bytes([b[0], b[1]])).ok_or(Malformed::Headers)?;
         let mut segments = [None; 3];
         let mut at = ESN;
         let mut total = 0;
         for (i, slot) in segments.iter_mut().enumerate() {
-            let h = payload.get(at..at + SRD)?;
+            let h = payload.get(at..at + SRD).ok_or(Malformed::Headers)?;
             at += SRD;
             let length = usize::from(u16::from_be_bytes([h[0], h[1]]));
             let second_field = h[2] & 0x80 != 0;
@@ -412,13 +447,17 @@ impl Depacketiser {
             let more = h[4] & 0x80 != 0;
             let pixel = usize::from(u16::from_be_bytes([h[4] & 0x7F, h[5]]));
             let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
-            let fits = !second_field
-                && row < self.format.height as usize
-                && length % octets == 0
+            if second_field {
+                return Err(Malformed::Field);
+            }
+            if length % octets != 0 || (length == 0 && (i > 0 || more)) {
+                return Err(Malformed::Length);
+            }
+            let inside = row < self.format.height as usize
                 && pixel % pixels == 0
                 && pixel + length / octets * pixels <= self.format.width as usize;
-            if !fits || (length == 0 && (i > 0 || more)) {
-                return None;
+            if !inside {
+                return Err(Malformed::Place);
             }
             if length > 0 {
                 *slot = Some((row, pixel, length));
@@ -428,11 +467,14 @@ impl Depacketiser {
                 break;
             }
             if i == 2 {
-                return None;
+                return Err(Malformed::Headers);
             }
         }
         let data = &payload[at..];
-        (data.len() >= total).then_some((extended, segments, data))
+        if data.len() < total {
+            return Err(Malformed::Headers);
+        }
+        Ok((extended, segments, data))
     }
 
     /// Finishes the frame being put together; `end` when receiving has stopped then.
@@ -738,6 +780,7 @@ mod tests {
         field[12 + 4] |= 0x80;
         d.push(0, &field, |_, _| panic!("no frame"));
         assert_eq!(d.counts().malformed, 4);
+        assert_eq!(d.counts().malformed_by, MalformedCounts { lengths: 1, places: 1, fields: 1, headers: 1 });
         assert_eq!(d.counts().packets, 0);
     }
 }
