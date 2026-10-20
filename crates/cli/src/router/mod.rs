@@ -7,7 +7,8 @@
 //! another site to send them requests, and no video passes through the browser.
 //!
 //! The page also turns a Sender on and off and changes where it sends, through the
-//! same controller ([`controller::control`]).
+//! same controller ([`controller::control`]), and shows and changes the channel map of
+//! each Device with an IS-08 Channel Mapping API ([`mapping::remap`]).
 //!
 //! The page hears of each change over a WebSocket ([`events`]), as the router hears of
 //! them from the registry's subscriptions. Requests to the registry and the Nodes carry
@@ -45,6 +46,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use st2110_connect::client::{self, ConnectionClient};
 use st2110_connect::controller::{self, Route, SenderControl, Settings, Take};
+use st2110_connect::mapping::{self, Remap, Remapped};
 use st2110_connect::{Destination, SenderChange};
 use st2110_nmos::auth::{ClientCredentials, SignIn, SigningKey, Token};
 use st2110_nmos::client::{Options, QueryClient};
@@ -585,6 +587,11 @@ fn answer(router: &Router, request: &Request) -> Response {
             Ok(()) => watch(router, request),
             Err(message) => Response::error(403, message),
         },
+        ("GET", "/api/map") => channel_map(router, request),
+        ("POST", "/api/map") => match same_origin(request) {
+            Ok(()) => remap(router, request),
+            Err(message) => Response::error(403, message),
+        },
         ("GET", SIGN_IN_PATH) => sign_in_start(router, request),
         ("GET", CALLBACK_PATH) => sign_in_finish(router, request),
         ("POST", SIGN_OUT_PATH) => match same_origin(request) {
@@ -600,8 +607,9 @@ fn answer(router: &Router, request: &Request) -> Response {
         ("GET", "/api/stream") => stream(router, request),
         (
             _,
-            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/sender" | "/api/watch" | "/api/live" | "/api/log"
-            | "/api/preview" | "/api/stream" | "/api/events" | SIGN_IN_PATH | CALLBACK_PATH | SIGN_OUT_PATH,
+            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/sender" | "/api/watch" | "/api/map" | "/api/live"
+            | "/api/log" | "/api/preview" | "/api/stream" | "/api/events" | SIGN_IN_PATH | CALLBACK_PATH
+            | SIGN_OUT_PATH,
         ) => Response::error(405, "not with that method"),
         _ => Response::error(404, "nothing here"),
     }
@@ -896,12 +904,17 @@ fn state_json(router: &Router) -> Result<Value, String> {
             })
         })
         .collect();
+    // The Devices whose channel maps the page can show: those with an IS-08 API.
+    let channel_maps: Vec<Value> = routing::mapping_devices(&snapshot)
+        .into_iter()
+        .map(|d| json!({"id": d.id, "label": d.label, "node": d.node}))
+        .collect();
     let read_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let body = json!({
         "registry": router.registry, "demo": router.demo.is_some(), "read_at": read_at as u64,
         "lead": router.settings.lead.as_secs_f64(), "previews": router.previews.most(),
         "auth": router.auth_note(), "sign_in": sign_in_json(router), "subscribed": router.subscribed(),
-        "senders": senders, "receivers": receivers,
+        "senders": senders, "receivers": receivers, "channel_maps": channel_maps,
     });
     if let Ok(mut last) = router.last.lock() {
         *last = Some(snapshot);
@@ -1129,6 +1142,196 @@ fn describe_control(report: &SenderControl, change: &SenderChange) -> String {
         what.push_str(&format!(", to {}", to.join(", ")));
     }
     format!("{}: {what}: {}", report.sender.describe(), report.state.describe())
+}
+
+/// A Device's channel map, read from its IS-08 Channel Mapping API as the page asks for
+/// it: its Inputs and Outputs (`/io`), the map it applies now (`/map/active`), and the
+/// activations waiting to change it (`/map/activations`), whose Outputs are locked until
+/// they take effect. The Device is found in the registry as last read.
+fn channel_map(router: &Router, request: &Request) -> Response {
+    let Some(id) = request.param("device") else {
+        return Response::error(400, "name a device");
+    };
+    let device = {
+        let Ok(last) = router.last.lock() else {
+            return Response::error(500, "the router failed");
+        };
+        let Some(snapshot) = last.as_ref() else {
+            return Response::error(409, "the registry has not been read yet");
+        };
+        match routing::find_device(snapshot, &id) {
+            Ok(device) => device,
+            Err(message) => return Response::error(404, message),
+        }
+    };
+    let Some(api) = device.channel_mapping.as_ref().map(|api| api.href.clone()) else {
+        return Response::error(404, format!("{} advertises no IS-08 Channel Mapping API", device.describe()));
+    };
+    let client = router.connection_client();
+    let read = |path: &str| match client.get(&format!("{api}{path}")) {
+        Ok(reply) if reply.status == 200 && reply.body.is_object() => Ok(reply.body),
+        Ok(reply) => Err(format!("its /{path} answered {}", reply.error())),
+        Err(e) => Err(format!("its /{path} did not answer: {}", e.message)),
+    };
+    let (io, active) = match (read("io"), read("map/active")) {
+        (Ok(io), Ok(active)) => (io, active),
+        (Err(message), _) | (_, Err(message)) => {
+            return Response::error(502, format!("{} cannot be read: {message}", device.describe()));
+        }
+    };
+    let (pending, pending_error) = match read("map/activations") {
+        Ok(pending) => (pending, Value::Null),
+        Err(message) => (Value::Null, json!(message)),
+    };
+    let read_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()) as u64;
+    Response::json(
+        200,
+        &json!({
+            "device": {"id": device.id, "label": device.label, "node": device.node, "href": api},
+            "io": io, "active": active, "pending": pending, "pending_error": pending_error,
+            "read_at": read_at, "tai_utc": router.settings.tai_utc,
+        }),
+    )
+}
+
+/// A change to a Device's channel map the page asks for: Output channels and the Input
+/// channels they are to take, counted from 0 as IS-08 counts them, or `cancel` to take
+/// away the activations waiting on it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapRequest {
+    device: String,
+    #[serde(default)]
+    routes: Vec<ChannelRoute>,
+    #[serde(default)]
+    cancel: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// One Output channel, and the Input channel it is to take, or `null` for silence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelRoute {
+    output: String,
+    channel: usize,
+    input: Option<String>,
+    #[serde(default)]
+    input_channel: Option<usize>,
+}
+
+/// Changes a Device's channel map at once, as `st2110 connect --device --map` does, or
+/// cancels the activations waiting on it, and logs what happened as a take is logged.
+/// The pages showing the Device's map are told to read it again.
+fn remap(router: &Router, request: &Request) -> Response {
+    let wanted: MapRequest = match serde_json::from_slice(&request.body) {
+        Ok(wanted) => wanted,
+        Err(e) => return Response::error(400, format!("not a change to a channel map: {e}")),
+    };
+    let change = match (wanted.cancel, wanted.routes.is_empty()) {
+        (true, true) => Remap::Cancel,
+        (true, false) => return Response::error(400, "cancel, or change channels, not both at once"),
+        (false, true) => return Response::error(400, "no channel was asked for"),
+        (false, false) if wanted.routes.len() > MOST => {
+            return Response::error(400, format!("at most {MOST} channels are changed at once"));
+        }
+        (false, false) => {
+            let mut routes = Vec::new();
+            for route in wanted.routes {
+                let input = match (route.input, route.input_channel) {
+                    (Some(input), Some(channel)) => Some((input, channel)),
+                    (None, None) => None,
+                    (Some(input), None) => return Response::error(400, format!("name a channel of input {input}")),
+                    (None, Some(_)) => return Response::error(400, "a silent channel takes no input channel"),
+                };
+                routes.push(mapping::Route { output: route.output, channel: route.channel, input });
+            }
+            Remap::Routes(routes)
+        }
+    };
+    let Ok(_taking) = router.taking.try_lock() else {
+        return Response::error(409, "other connections are being made; try again when they are done");
+    };
+    let registry = match router.query_client(false) {
+        Ok(registry) => registry,
+        Err(message) => return Response::error(502, format!("reading the registry: {message}")),
+    };
+    let snapshot = match registry.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(e) => return Response::error(502, format!("reading the registry: {e}")),
+    };
+    let client = router.connection_client();
+    // At once: a map change made from the page is heard as soon as it is taken.
+    let settings = Settings { dry_run: wanted.dry_run, activation: None, ..router.settings.clone() };
+    let report = match mapping::remap(&snapshot, &wanted.device, &change, &client, &settings) {
+        Ok(report) => report,
+        Err(message) => return Response::error(400, message),
+    };
+    // The names of the Inputs and Outputs, for the log.
+    let io = report
+        .device
+        .channel_mapping
+        .as_ref()
+        .and_then(|api| client.get(&format!("{}io", api.href)).ok())
+        .filter(|reply| reply.status == 200)
+        .map(|reply| reply.body);
+    let describe = describe_remap(&report, io.as_ref());
+    let connection = json!({
+        "state": report.state, "describe": describe,
+        "problems": report.problems, "warnings": report.warnings, "notes": report.notes,
+    });
+    let succeeded = report.state.is_success();
+    let log_id =
+        router.record(json!({"dry_run": wanted.dry_run, "succeeded": succeeded, "connections": [connection.clone()]}));
+    router.pages.send(|_| true, &json!({"type": "map", "device": report.device.id}).to_string());
+    let mut body = serde_json::to_value(&report).unwrap_or(Value::Null);
+    body["succeeded"] = json!(succeeded);
+    body["dry_run"] = json!(wanted.dry_run);
+    body["describe"] = json!(describe);
+    body["connections"] = json!([connection]);
+    body["log_id"] = json!(log_id);
+    Response::json(200, &body)
+}
+
+/// A change to a channel map and what became of it, in a line, with channels counted
+/// from 1 as an operator counts them: `device "Audio 1" (de71000b) map, Monitor 1 ←
+/// Tone 1, Monitor 2 silent: done`.
+fn describe_remap(report: &Remapped, io: Option<&Value>) -> String {
+    let name = |side: &str, id: &str| {
+        io.and_then(|io| io[side][id]["properties"]["name"].as_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(id)
+            .to_string()
+    };
+    let action = report.request.as_ref().and_then(|r| r.get("action")).and_then(Value::as_object);
+    let mut routes = Vec::new();
+    for (output, channels) in action.into_iter().flatten() {
+        let mut each: Vec<(usize, String)> = channels
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(index, route)| {
+                let index = index.parse::<usize>().ok()?;
+                let to = format!("{} {}", name("outputs", output), index + 1);
+                let text = match (route["input"].as_str(), route["channel_index"].as_u64()) {
+                    (Some(input), Some(channel)) => format!("{to} ← {} {}", name("inputs", input), channel + 1),
+                    _ => format!("{to} silent"),
+                };
+                Some((index, text))
+            })
+            .collect();
+        each.sort();
+        routes.extend(each.into_iter().map(|(_, text)| text));
+    }
+    let what = match (&report.request, routes.is_empty()) {
+        (Some(_), false) => format!("map, {}", routes.join(", ")),
+        (Some(_), true) => "map".to_string(),
+        (None, _) if report.problems.is_empty() || !report.notes.is_empty() => {
+            "cancel the activations waiting".to_string()
+        }
+        (None, _) => "map".to_string(),
+    };
+    format!("{} {what}: {}", report.device.describe(), report.state.describe())
 }
 
 /// The Senders whose streams the page is showing.
