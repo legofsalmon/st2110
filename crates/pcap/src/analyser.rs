@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::IpAddr;
 
 use st2110_ptp::Message;
 
 use crate::capture::{CaptureError, Format, Frame, Reader};
+use crate::dup::Pair;
 use crate::flow::{Flow, Key, RtpPacket, SdpStream};
 use crate::net::{self, Packet};
 use crate::ptp::Monitor;
@@ -30,11 +32,12 @@ enum Event {
         key: Key,
         packet: RtpPacket,
     },
-    /// `layer2` when the message came over Ethernet rather than UDP.
+    /// `to` is the destination address, or `None` when the message came over Ethernet
+    /// rather than UDP.
     Ptp {
         t: i128,
         from: String,
-        layer2: bool,
+        to: Option<IpAddr>,
         message: Box<Message>,
     },
 }
@@ -56,12 +59,32 @@ struct Running {
     /// RTP packets in flows past the first [`FLOW_LIMIT`].
     untracked: u64,
     ptp: Monitor,
+    /// The SDP files' `DUP` groups, each with its index by file and group, and the
+    /// pair and leg each flow is, by flow.
+    pairs: Vec<((usize, usize), Pair)>,
+    legs: Vec<Option<(usize, usize)>>,
 }
 
 impl Running {
     fn new(decision: Decision, sdp: Vec<SdpStream>) -> Self {
         let ptp = Monitor::new(decision.absolute());
-        Self { decision, sdp, flows: Vec::new(), index: HashMap::new(), untracked: 0, ptp }
+        let mut pairs: Vec<((usize, usize), Vec<&SdpStream>)> = Vec::new();
+        for stream in &sdp {
+            let Some((group, _)) = stream.dup else { continue };
+            match pairs.iter_mut().find(|(g, _)| *g == group) {
+                Some((_, streams)) => streams.push(stream),
+                None => pairs.push((group, vec![stream])),
+            }
+        }
+        let pairs = pairs
+            .into_iter()
+            .filter(|(_, streams)| streams.len() > 1)
+            .map(|(group, streams)| {
+                let label = streams.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(" and ");
+                (group, Pair::new(label, streams.len(), streams[0].wide_sequence()))
+            })
+            .collect();
+        Self { decision, sdp, flows: Vec::new(), index: HashMap::new(), untracked: 0, ptp, pairs, legs: Vec::new() }
     }
 
     fn event(&mut self, event: Event) {
@@ -79,14 +102,31 @@ impl Running {
                             self.sdp[i].matched = true;
                             self.sdp[i].clone()
                         });
+                        let leg = stream.as_ref().and_then(|s| s.dup).and_then(|(group, leg)| {
+                            let pair = self.pairs.iter().position(|(g, _)| *g == group)?;
+                            self.pairs[pair].1.set_flow(leg, self.flows.len() + 1);
+                            Some((pair, leg))
+                        });
+                        self.legs.push(leg);
                         self.flows.push(Flow::new(self.flows.len() + 1, key, stream, self.decision.absolute()));
                         self.index.insert(key, self.flows.len() - 1);
                         self.flows.len() - 1
                     }
                 };
+                if let Some((pair, leg)) = self.legs[i] {
+                    let pair = &mut self.pairs[pair].1;
+                    let sequence = if pair.wide() {
+                        packet.extended_sequence().map(|high| u32::from(high) << 16 | u32::from(packet.header.sequence))
+                    } else {
+                        Some(u32::from(packet.header.sequence))
+                    };
+                    if let Some(sequence) = sequence {
+                        pair.push(leg, t + shift, sequence, packet.ip_length);
+                    }
+                }
                 self.flows[i].push(t + shift, packet);
             }
-            Event::Ptp { t, from, layer2, message } => self.ptp.push(t + shift, &from, layer2, &message),
+            Event::Ptp { t, from, to, message } => self.ptp.push(t + shift, &from, to, &message),
         }
     }
 }
@@ -141,9 +181,12 @@ impl Analyser {
                 if PTP_PORTS.contains(&d.destination.port()) {
                     c.ptp += 1;
                     match st2110_ptp::decode(d.payload) {
-                        Ok(message) => {
-                            Event::Ptp { t, from: d.source.ip().to_string(), layer2: false, message: Box::new(message) }
-                        }
+                        Ok(message) => Event::Ptp {
+                            t,
+                            from: d.source.ip().to_string(),
+                            to: Some(d.destination.ip()),
+                            message: Box::new(message),
+                        },
                         Err(_) => {
                             self.undecodable += 1;
                             return;
@@ -159,7 +202,7 @@ impl Analyser {
             Packet::Ptp { source, payload } => {
                 c.ptp += 1;
                 match st2110_ptp::decode(payload) {
-                    Ok(message) => Event::Ptp { t, from: mac(source), layer2: true, message: Box::new(message) },
+                    Ok(message) => Event::Ptp { t, from: mac(source), to: None, message: Box::new(message) },
                     Err(_) => {
                         self.undecodable += 1;
                         return;
@@ -245,7 +288,10 @@ impl Analyser {
             );
         }
         let end = self.last + running.decision.shift;
-        let (ptp, more) = running.ptp.finish(end, self.undecodable, &timeline);
+        let pairs = running.pairs.into_iter().map(|(_, pair)| pair.finish(&timeline)).collect();
+        let refclks: Vec<_> =
+            running.sdp.iter().filter_map(|s| Some((s.label.clone(), s.reference_clock.clone()?))).collect();
+        let (ptp, more) = running.ptp.finish(end, self.undecodable, &timeline, &refclks);
         findings.extend(more);
         let missing =
             running.sdp.iter().filter(|s| !s.matched).map(|s| format!("{}, to {}", s.label, s.destination())).collect();
@@ -259,6 +305,7 @@ impl Analyser {
                 note: decision.note,
             },
             flows,
+            pairs,
             ptp,
             missing,
             findings,

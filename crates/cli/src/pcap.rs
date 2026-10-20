@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use st2110_pcap::{
-    AudioReport, CinstReport, Clock, FLOW_LIMIT, Finding, FlowReport, Options, PORT_LIMIT, PtpDomainReport, Report,
-    SdpFile, Stats, Timescale, VideoReport, VrxReport,
+    AudioReport, CinstReport, Clock, FLOW_LIMIT, Finding, FlowReport, Options, PORT_LIMIT, PairReport, PtpDomainReport,
+    Report, SdpFile, Stats, Timescale, VideoReport, VrxReport,
 };
 use st2110_sdp::{Essence, Severity};
 
@@ -123,6 +123,9 @@ fn write_text(out: &mut impl Write, a: &Analysed, quiet: bool, style: Style) -> 
         }
         for flow in &report.flows {
             write_flow(out, flow)?;
+        }
+        for pair in &report.pairs {
+            write_pair(out, pair)?;
         }
         if capture.rtp_untracked > 0 {
             writeln!(
@@ -370,6 +373,52 @@ fn write_domain(out: &mut impl Write, domain: &PtpDomainReport) -> io::Result<()
     }
     if let Some(offset) = &domain.sync_offset_us {
         writeln!(out, "    Sync arrival less departure {}", range(offset, " µs"))?;
+    }
+    if domain.quality.len() > 1 {
+        for q in &domain.quality {
+            writeln!(
+                out,
+                "    at {:.3} s {}: class {}, accuracy {:02X}h, variance {:04X}h, time source {:02X}h{}{}",
+                q.at,
+                q.grandmaster,
+                q.class,
+                q.accuracy,
+                q.variance,
+                q.time_source,
+                if q.ptp_timescale { "" } else { ", ARB timescale" },
+                if q.time_traceable { ", traceable" } else { "" }
+            )?;
+        }
+    }
+    if let Some(metadata) = &domain.sync_metadata {
+        let every = metadata.interval_ms.map(|i| format!(" every {:.1} ms", i.mean)).unwrap_or_default();
+        let locking: Vec<String> = metadata.locking.iter().map(|l| format!("{} at {:.3} s", l.status, l.at)).collect();
+        let locking = if locking.is_empty() { String::new() } else { format!("; {}", locking.join(", ")) };
+        writeln!(out, "    {}{every}{locking}", count(metadata.messages, "synchronization metadata TLV"))?;
+    }
+    Ok(())
+}
+
+fn write_pair(out: &mut impl Write, pair: &PairReport) -> io::Result<()> {
+    let flows: Vec<String> =
+        pair.flows.iter().map(|f| f.map_or_else(|| "missing".to_string(), |f| format!("flow {f}"))).collect();
+    writeln!(out, "  ST 2022-7 {}: {}", pair.group, flows.join(" and "))?;
+    let copies = if pair.copies == 1 { "1 copy".to_string() } else { format!("{} copies", pair.copies) };
+    let mut line = format!("    {}, {copies} on another leg", count(pair.packets, "packet"));
+    if let Some(pd) = pair.pd_us {
+        let class = pair.class.as_deref().map_or_else(|| "beyond class C".to_string(), |c| format!("class {c}"));
+        line.push_str(&format!(", PD {pd:.1} µs ({class})"));
+    }
+    line.push_str(&format!(", {} lost after merging", count(pair.lost, "packet")));
+    if pair.restarts > 0 {
+        line.push_str(&format!(", {}", count(pair.restarts, "restart")));
+    }
+    writeln!(out, "{line}")?;
+    for outage in &pair.outages {
+        match outage.to {
+            Some(to) => writeln!(out, "    leg {} gone from {:.3} s to {to:.3} s", outage.leg, outage.from)?,
+            None => writeln!(out, "    leg {} gone from {:.3} s to the end", outage.leg, outage.from)?,
+        }
     }
     Ok(())
 }

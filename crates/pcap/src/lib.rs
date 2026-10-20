@@ -39,6 +39,7 @@
 mod analyser;
 mod audio;
 pub mod capture;
+mod dup;
 mod flow;
 pub mod net;
 mod ptp;
@@ -52,8 +53,9 @@ mod video;
 pub use analyser::{Analyser, analyse};
 pub use capture::{CaptureError, Format, Frame, Reader};
 pub use report::{
-    AudioReport, AudioWindow, Capture, CinstReport, Clock, Finding, FlowReport, MessageCount, PtpDomainReport,
-    PtpPortReport, PtpReport, Report, TimescaleReport, VideoReport, VideoWindow, VrxReport,
+    AudioReport, AudioWindow, Capture, CinstReport, Clock, Finding, FlowReport, GrandmasterQuality, LockingChange,
+    MessageCount, Outage, PairReport, PairWindow, PtpDomainReport, PtpPortReport, PtpReport, Report,
+    SyncMetadataReport, TimescaleReport, VideoReport, VideoWindow, VrxReport,
 };
 pub use stats::Stats;
 

@@ -622,6 +622,63 @@ export interface PtpDomainReport {
   ports: PtpPortReport[];
   /** From a Sync leaving the grandmaster to its arrival, in microseconds. */
   sync_offset_us: Stats | null;
+  /** The grandmaster and its quality as Announce messages gave them: the first, then each change, up to 64. */
+  quality: GrandmasterQuality[];
+  /** The synchronization metadata TLVs (ST 2059-2 §6.12), when any came. */
+  sync_metadata: SyncMetadataReport | null;
+}
+
+/** `at` is seconds since the capture began. */
+export interface GrandmasterQuality {
+  at: number;
+  grandmaster: string;
+  class: number;
+  accuracy: number;
+  variance: number;
+  time_source: number;
+  ptp_timescale: boolean;
+  time_traceable: boolean;
+}
+
+export interface SyncMetadataReport {
+  messages: number;
+  interval_ms: Stats | null;
+  /** gmLockingStatus: the first, then each change, with when in seconds since the capture began. */
+  locking: { at: number; status: string }[];
+}
+
+/** One second of an ST 2022-7 pair; `second` is whole seconds of PTP time. */
+export interface PairWindow {
+  second: number;
+  copies: number;
+  pd_us: number | null;
+  class: string | null;
+  lost: number;
+}
+
+/** A leg (from 1) that brought nothing while another did, in seconds since the capture began; `to` null when it never came back. */
+export interface Outage {
+  leg: number;
+  from: number;
+  to: number | null;
+}
+
+/** The legs of an SDP file's DUP group, merged as an ST 2022-7 receiver would. */
+export interface PairReport {
+  group: string;
+  /** Each leg's FlowReport index, null for a leg not in the capture. */
+  flows: (number | null)[];
+  packets: number;
+  copies: number;
+  /** The packet time differential, PD = max |Pi − Pj| (ST 2022-7 §7), in microseconds. */
+  pd_us: number | null;
+  /** The tightest receiver class of ST 2022-7 Table 1 that allows it. */
+  class: string | null;
+  /** Packets no leg delivered. */
+  lost: number;
+  restarts: number;
+  seconds: PairWindow[];
+  outages: Outage[];
 }
 
 export interface CapturePtp {
@@ -648,6 +705,7 @@ export interface CaptureReport {
   capture: CaptureFile;
   timescale: CaptureTimescale;
   flows: FlowReport[];
+  pairs: PairReport[];
   ptp: CapturePtp;
   /** Streams in the SDP files that no flow matched. */
   missing: string[];

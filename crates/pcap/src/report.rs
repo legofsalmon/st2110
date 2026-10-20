@@ -14,6 +14,8 @@ pub struct Report {
     pub timescale: TimescaleReport,
     /// Each RTP flow, in order of its first packet.
     pub flows: Vec<FlowReport>,
+    /// Each ST 2022-7 pair: the flows of an SDP file's `DUP` group, merged.
+    pub pairs: Vec<PairReport>,
     /// The PTP messages.
     pub ptp: PtpReport,
     /// Streams in the SDP files that no flow in the capture matched.
@@ -281,6 +283,62 @@ pub struct AudioWindow {
     pub ts_df: Option<f64>,
 }
 
+/// The legs of an ST 2022-7 stream, merged as a receiver would merge them.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct PairReport {
+    /// The SDP file's `DUP` group, such as `camera1.sdp streams 0 and 1`.
+    pub group: String,
+    /// The flow that carried each leg, by [`FlowReport::index`], path 1 first.
+    pub flows: Vec<Option<usize>>,
+    /// Packets that came on any leg, each counted once.
+    pub packets: u64,
+    /// Copies that came on another leg after the first.
+    pub copies: u64,
+    /// The packet time differential, PD: the most a copy came after the first, in
+    /// microseconds (ST 2022-7:2019 §7).
+    pub pd_us: Option<f64>,
+    /// The tightest receiver class of ST 2022-7:2019 Table 1 that allows that PD: D, A,
+    /// B or C.
+    pub class: Option<String>,
+    /// Packets that came on no leg: lost after merging.
+    pub lost: u64,
+    /// Times the sequence numbers jumped so far that the pair started again.
+    pub restarts: u64,
+    /// Each second in which copies came or packets were lost.
+    pub seconds: Vec<PairWindow>,
+    /// When each leg went, and came back if it did: the pair was unprotected between.
+    pub outages: Vec<Outage>,
+}
+
+/// One second of an ST 2022-7 pair.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct PairWindow {
+    /// The second: PTP seconds when the capture's clock is known, else the capture's.
+    pub second: i64,
+    /// Copies that came on another leg after the first.
+    pub copies: u64,
+    /// The packet time differential, in microseconds.
+    pub pd_us: Option<f64>,
+    /// The tightest receiver class that allows it.
+    pub class: Option<String>,
+    /// Packets lost after merging.
+    pub lost: u64,
+}
+
+/// A time when one leg of a pair brought nothing for more than 50 ms while another did.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Outage {
+    /// The leg, counting from 1.
+    pub leg: usize,
+    /// When its last packet before came: seconds since the capture began.
+    pub from: f64,
+    /// When it came back, if it did.
+    pub to: Option<f64>,
+}
+
 /// The PTP messages in a capture.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -318,6 +376,55 @@ pub struct PtpDomainReport {
     /// PTP time plus the delay from the last clock that corrected it. Only for domains on
     /// the PTP timescale, when the capture's clock is known.
     pub sync_offset_us: Option<Stats>,
+    /// The grandmaster and its quality as Announce messages gave them: the first, then
+    /// each change, up to 64.
+    pub quality: Vec<GrandmasterQuality>,
+    /// The synchronization metadata TLVs, when any came.
+    pub sync_metadata: Option<SyncMetadataReport>,
+}
+
+/// The grandmaster an Announce message named, and its quality, from one time on.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct GrandmasterQuality {
+    /// From when: seconds since the capture began.
+    pub at: f64,
+    /// grandmasterIdentity.
+    pub grandmaster: String,
+    /// clockClass.
+    pub class: u8,
+    /// clockAccuracy.
+    pub accuracy: u8,
+    /// offsetScaledLogVariance.
+    pub variance: u16,
+    /// timeSource.
+    pub time_source: u8,
+    /// Whether ptpTimescale was set.
+    pub ptp_timescale: bool,
+    /// Whether timeTraceable was set.
+    pub time_traceable: bool,
+}
+
+/// The synchronization metadata TLVs of a domain (ST 2059-2 §6.12).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct SyncMetadataReport {
+    /// Management messages that carried one.
+    pub messages: u64,
+    /// Milliseconds between one port's TLVs.
+    pub interval_ms: Option<Stats>,
+    /// gmLockingStatus: the first, then each change, up to 64.
+    pub locking: Vec<LockingChange>,
+}
+
+/// The grandmaster's gmLockingStatus from one time on.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct LockingChange {
+    /// From when: seconds since the capture began.
+    pub at: f64,
+    /// Such as `externally locked`.
+    pub status: String,
 }
 
 /// One PTP port and its messages.

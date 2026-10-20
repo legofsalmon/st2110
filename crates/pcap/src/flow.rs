@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use st2110_sdp::{Essence, Param, Rule};
+use st2110_sdp::{Essence, Param, RefClock, Rule};
 
 use crate::audio::{AudioConfig, AudioEngine};
 use crate::net::Datagram;
@@ -61,7 +61,7 @@ impl RtpPacket {
     }
 
     /// The payload header's high 16 bits of the sequence number.
-    fn extended_sequence(&self) -> Option<u16> {
+    pub(crate) fn extended_sequence(&self) -> Option<u16> {
         let head = self.head();
         (head.len() >= 2).then(|| u16::from_be_bytes([head[0], head[1]]))
     }
@@ -83,6 +83,11 @@ pub(crate) struct SdpStream {
     ptime_ms: Option<f64>,
     video: VideoConfig,
     maxudp: Option<u32>,
+    /// Its `a=ts-refclk`.
+    pub reference_clock: Option<RefClock>,
+    /// The `a=group:DUP` it is a leg of: the file's index and the group's, then its
+    /// place in the group, counting from 0.
+    pub dup: Option<((usize, usize), usize)>,
     /// Whether a flow has matched it.
     pub matched: bool,
 }
@@ -91,9 +96,17 @@ impl SdpStream {
     /// Every stream in the files.
     pub(crate) fn read(files: &[SdpFile]) -> Vec<Self> {
         let mut streams = Vec::new();
-        for file in files {
+        for (f, file) in files.iter().enumerate() {
             let report = st2110_sdp::lint(&file.text);
             let (sdp, _) = st2110_sdp::parse(&file.text);
+            let groups: Vec<Vec<&str>> = sdp
+                .session
+                .attributes_named("group")
+                .filter_map(|a| {
+                    let mut words = a.text().split_whitespace();
+                    words.next().filter(|w| w.eq_ignore_ascii_case("DUP")).map(|_| words.collect())
+                })
+                .collect();
             for stream in &report.streams {
                 let params = &stream.parameters;
                 let ptime = sdp
@@ -132,6 +145,13 @@ impl SdpStream {
                     ptime_ms: ptime,
                     maxudp: video.maxudp,
                     video,
+                    reference_clock: stream.reference_clock.clone(),
+                    dup: stream.mid.as_deref().and_then(|mid| {
+                        groups
+                            .iter()
+                            .enumerate()
+                            .find_map(|(g, mids)| mids.iter().position(|m| *m == mid).map(|place| ((f, g), place)))
+                    }),
                     matched: false,
                 });
             }
@@ -164,6 +184,12 @@ impl SdpStream {
     /// The RTP clock rate the stream declares.
     pub(crate) fn clock_rate(&self) -> Option<u32> {
         self.clock_rate
+    }
+
+    /// Whether its payload header carries the sequence number's high 16 bits, as
+    /// ST 2110-20 video and ST 2110-40 ancillary data do.
+    pub(crate) fn wide_sequence(&self) -> bool {
+        matches!(self.essence, Essence::Video | Essence::Ancillary)
     }
 }
 
