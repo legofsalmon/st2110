@@ -332,6 +332,8 @@ bars.sdp: arrived whole
 
 Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. The receiver times each datagram by the kernel's receive timestamp on Linux and macOS, and by when it reads it elsewhere. It needs a large socket buffer for video: raise `net.core.rmem_max` on Linux (`sysctl -w net.core.rmem_max=67108864`) or `kern.ipc.maxsockbuf` on macOS; `receive` says when the system allows less than 4 MiB.
 
+Not yet: ST 2110-22 JPEG XS, sent from pre-encoded codestreams or received to files; 4:2:0 interlaced video; and AES3 channel status other than professional linear PCM, or user data.
+
 ## Watch a stream
 
 `st2110 view` shows an ST 2110-20 video stream in a window as it arrives. A Mac with no network at all can play a capture, 600 MB of it here:
