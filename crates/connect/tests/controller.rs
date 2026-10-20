@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use st2110_connect::Activation;
 use st2110_connect::client::{ConnectionClient, Options};
-use st2110_connect::controller::{Outcome, Route, Settings, State, Take, cancel, connect};
+use st2110_connect::controller::{Outcome, Route, Settings, State, Take, cancel, connect, control};
+use st2110_connect::{Activation, Destination, SenderChange};
 use st2110_nmos::Snapshot;
 use st2110_nmos::client::{self, QueryClient};
 use st2110_ptp::PtpTime;
@@ -70,9 +70,14 @@ struct Faults {
     stuck: Vec<String>,
 }
 
-/// The Connection API of Monitor 1 and Camera 1, and the registry's copy of each Receiver.
+/// The Connection API of Monitor 1 and Camera 1, and the registry's copy of each Sender
+/// and Receiver.
 struct Facility {
     receivers: BTreeMap<String, Receiver>,
+    /// Each Sender's `/constraints` and `/active`; its changes take effect at once.
+    senders: BTreeMap<String, (Value, Value)>,
+    /// Whether the audio Sender sends unicast.
+    unicast_audio: bool,
     registry: BTreeMap<String, Value>,
     sdp: BTreeMap<String, String>,
     faults: Faults,
@@ -131,10 +136,89 @@ impl Facility {
                 (r["id"].as_str().unwrap().to_string(), r)
             })
             .collect();
+        let mut registry: BTreeMap<String, Value> = registry;
+        for sender in facility["senders"].as_array().unwrap() {
+            registry.insert(sender["id"].as_str().unwrap().to_string(), sender.clone());
+        }
         let sdp = [VIDEO_SENDER, AUDIO_SENDER]
             .map(|id| (id.to_string(), facility["manifests"][id]["sdp"].as_str().unwrap().to_string()))
             .into();
-        Self { receivers, registry, sdp, faults: Faults::default(), log: Vec::new() }
+        let sender = |legs: &[(&str, &str, u16)]| {
+            let constraints: Vec<Value> = legs
+                .iter()
+                .map(|(source, ..)| {
+                    json!({"source_ip": {"enum": [source]}, "destination_ip": {}, "source_port": {},
+                           "destination_port": {"minimum": 5000, "maximum": 5999}, "rtp_enabled": {}})
+                })
+                .collect();
+            let params: Vec<Value> = legs
+                .iter()
+                .map(|(source, destination, port)| {
+                    json!({"source_ip": source, "destination_ip": destination, "source_port": 5004,
+                           "destination_port": port, "rtp_enabled": true})
+                })
+                .collect();
+            let active = json!({
+                "receiver_id": null, "master_enable": true,
+                "activation": {"mode": null, "requested_time": null, "activation_time": null},
+                "transport_params": params,
+            });
+            (Value::Array(constraints), active)
+        };
+        let senders = BTreeMap::from([
+            (
+                VIDEO_SENDER.to_string(),
+                sender(&[("192.168.10.21", "239.10.10.1", 5004), ("192.168.20.21", "239.20.10.1", 5004)]),
+            ),
+            (AUDIO_SENDER.to_string(), sender(&[("192.168.10.22", "239.10.10.2", 5006)])),
+        ]);
+        Self { receivers, senders, unicast_audio: false, registry, sdp, faults: Faults::default(), log: Vec::new() }
+    }
+
+    /// What a Sender's `/transportfile` serves: its SDP file, sending where `/active` says.
+    fn transport_file(&self, id: &str) -> Option<String> {
+        let sdp = self.sdp.get(id)?.clone();
+        let Some((_, active)) = self.senders.get(id).filter(|_| id == AUDIO_SENDER) else {
+            return Some(sdp);
+        };
+        let leg = &active["transport_params"][0];
+        let (to, port) = (leg["destination_ip"].as_str()?, leg["destination_port"].as_u64()?);
+        Some(
+            sdp.replace("239.10.10.2/32", to)
+                .replace("239.10.10.2", to)
+                .replace("m=audio 5006", &format!("m=audio {port}")),
+        )
+    }
+
+    /// What a `PATCH` to a Sender's `/staged` does: it takes effect at once.
+    fn stage_sender(&mut self, id: &str, body: &Value) -> (u16, Value) {
+        let at = now();
+        let Some((constraints, active)) = self.senders.get_mut(id) else {
+            return error(404, "not found", "no such Sender");
+        };
+        if let Some(params) = body.get("transport_params") {
+            let Some(params) = params.as_array().filter(|p| p.len() == constraints.as_array().unwrap().len()) else {
+                return error(400, "Invalid transport_params", "one entry per leg");
+            };
+            for (leg, params) in active["transport_params"].as_array_mut().unwrap().iter_mut().zip(params) {
+                for (name, value) in params.as_object().unwrap() {
+                    leg[name] = value.clone();
+                }
+            }
+        }
+        for field in ["receiver_id", "master_enable"] {
+            if let Some(value) = body.get(field) {
+                active[field] = value.clone();
+            }
+        }
+        active["activation"] =
+            json!({"mode": "activate_immediate", "requested_time": null, "activation_time": tai(at)});
+        let active = active.clone();
+        let registered = self.registry.get_mut(id).unwrap();
+        let enabled = active["master_enable"] == true;
+        registered["subscription"] = json!({"receiver_id": if enabled { active["receiver_id"].clone() } else { Value::Null }, "active": enabled});
+        registered["version"] = json!(tai(at));
+        (200, active)
     }
 
     /// Answers a request: the status, extra header lines and the body.
@@ -147,7 +231,10 @@ impl Facility {
     }
 
     fn route(&mut self, method: &str, path: &str, body: &Value) -> (u16, Value) {
-        if let Some(id) = path.strip_prefix("/x-nmos/query/v1.3/receivers/") {
+        if let Some(id) = path
+            .strip_prefix("/x-nmos/query/v1.3/receivers/")
+            .or_else(|| path.strip_prefix("/x-nmos/query/v1.3/senders/"))
+        {
             let id = id.split('?').next().unwrap_or_default();
             return match self.registry.get(id) {
                 Some(receiver) => (200, receiver.clone()),
@@ -158,9 +245,21 @@ impl Facility {
             .strip_prefix("/x-nmos/connection/v1.1/single/senders/")
             .and_then(|rest| rest.strip_suffix("/transportfile"));
         if let Some(id) = path.strip_prefix("/sdp/").or(transport_file) {
-            return match self.sdp.get(id) {
-                Some(sdp) => (200, Value::String(sdp.clone())),
+            return match self.transport_file(id) {
+                Some(sdp) => (200, Value::String(sdp)),
                 None => error(404, "not found", ""),
+            };
+        }
+        if let Some((id, resource)) =
+            path.strip_prefix("/x-nmos/connection/v1.1/single/senders/").and_then(|r| r.split_once('/'))
+        {
+            let id = id.to_string();
+            return match (method, resource, self.senders.get(&id)) {
+                (_, _, None) => error(404, "not found", "no such Sender"),
+                ("GET", "constraints", Some((constraints, _))) => (200, constraints.clone()),
+                ("GET", "active", Some((_, active))) => (200, active.clone()),
+                ("PATCH", "staged", Some(_)) => self.stage_sender(&id, body),
+                _ => error(405, "Method Not Allowed", ""),
             };
         }
         if path == "/x-nmos/connection/v1.1/bulk/receivers" && method == "POST" {
@@ -375,6 +474,10 @@ impl Mock {
         for receiver in value["receivers"].as_array_mut().unwrap() {
             receiver["subscription"] = json!({"sender_id": null, "active": false});
         }
+        if self.facility.lock().unwrap().unicast_audio {
+            value["senders"][1]["transport"] = json!("urn:x-nmos:transport:rtp.ucast");
+            value["receivers"][1]["transport"] = json!("urn:x-nmos:transport:rtp");
+        }
         value["manifests"] = json!({});
         serde_json::from_value(value).unwrap()
     }
@@ -414,6 +517,14 @@ impl Mock {
 
     fn staged(&self, id: &str) -> Value {
         self.facility.lock().unwrap().receivers[id].staged.clone()
+    }
+
+    fn client(&self) -> ConnectionClient {
+        ConnectionClient::new(&Options { timeout: Duration::from_millis(800), env_proxy: false, token: None })
+    }
+
+    fn sender_active(&self, id: &str) -> Value {
+        self.facility.lock().unwrap().senders[id].1.clone()
     }
 }
 
@@ -505,6 +616,89 @@ fn connects_one_receiver_at_once() {
     // The registry heard, and nothing lags.
     assert_eq!(mock.registered(VIDEO_RECEIVER)["subscription"], json!({"sender_id": VIDEO_SENDER, "active": true}));
     assert!(outcome.succeeded());
+}
+
+#[test]
+fn turns_a_sender_off_and_on() {
+    let mock = Mock::start(|_| {});
+    let off = SenderChange { enable: false, ..SenderChange::default() };
+    let control = |change: &SenderChange| {
+        control(&mock.snapshot(), "CAM 1 audio", change, &mock.client(), Some(&mock.registry()), &settings()).unwrap()
+    };
+    let report = control(&off);
+    assert_eq!(report.state, State::Done, "{report:#?}");
+    assert!(report.problems.is_empty() && report.warnings.is_empty(), "{report:#?}");
+    assert_eq!(mock.changes(), [format!("PATCH /x-nmos/connection/v1.1/single/senders/{AUDIO_SENDER}/staged")]);
+    assert_eq!(mock.sender_active(AUDIO_SENDER)["master_enable"], false);
+    assert_eq!(mock.registered(AUDIO_SENDER)["subscription"], json!({"receiver_id": null, "active": false}));
+    let on = SenderChange { enable: true, ..SenderChange::default() };
+    assert_eq!(control(&on).state, State::Done);
+    assert_eq!(mock.sender_active(AUDIO_SENDER)["master_enable"], true);
+}
+
+#[test]
+fn sends_a_pair_to_other_groups() {
+    let mock = Mock::start(|_| {});
+    let to = |text: &str| Destination::parse(text).unwrap();
+    let change = SenderChange {
+        enable: true,
+        destinations: vec![to("239.10.10.9:5004"), to("239.20.10.9:5004")],
+        receiver_id: None,
+    };
+    let report =
+        control(&mock.snapshot(), "CAM 1 video", &change, &mock.client(), Some(&mock.registry()), &settings()).unwrap();
+    assert_eq!(report.state, State::Done, "{report:#?}");
+    let request = &mock.bodies("PATCH")[0];
+    assert_eq!((request["master_enable"].clone(), request["receiver_id"].clone()), (json!(true), Value::Null));
+    let active = mock.sender_active(VIDEO_SENDER);
+    assert_eq!(active["transport_params"][1]["destination_ip"], "239.20.10.9");
+    // An rtp.mcast Sender does not send to a unicast address, and a dry run sends nothing.
+    let change = SenderChange { destinations: vec![to("192.168.10.31")], ..change };
+    let report = control(&mock.snapshot(), "CAM 1 video", &change, &mock.client(), None, &settings()).unwrap();
+    assert_eq!(report.state, State::Refused);
+    assert_eq!(report.problems, ["leg 1: 192.168.10.31 is not a multicast group, which an rtp.mcast Sender sends to"]);
+    let dry = Settings { dry_run: true, ..settings() };
+    let change = SenderChange { enable: false, ..SenderChange::default() };
+    let report = control(&mock.snapshot(), "CAM 1 video", &change, &mock.client(), None, &dry).unwrap();
+    assert_eq!(report.state, State::Planned);
+    assert_eq!(mock.changes().len(), 1, "only the first change was sent");
+}
+
+#[test]
+fn a_unicast_sender_is_pointed_at_its_receiver_first() {
+    let mock = Mock::start(|f| f.unicast_audio = true);
+    let outcome = mock.connect(&[route("MON 1 audio", sender("CAM 1 audio"))], &settings());
+    let connection = &outcome.connections[0];
+    assert_eq!(connection.state, State::Done, "{connection:#?}");
+    assert_eq!(
+        connection.notes,
+        [format!(
+            "sender \"CAM 1 audio\" (5e0d0002) sends unicast, so it is first pointed at this Receiver, at \
+             192.168.10.32:5004"
+        )]
+    );
+    assert_eq!(
+        mock.changes(),
+        [
+            format!("PATCH /x-nmos/connection/v1.1/single/senders/{AUDIO_SENDER}/staged"),
+            format!("PATCH /x-nmos/connection/v1.1/single/receivers/{AUDIO_RECEIVER}/staged"),
+        ]
+    );
+    let pointed = mock.sender_active(AUDIO_SENDER);
+    assert_eq!(pointed["receiver_id"], AUDIO_RECEIVER);
+    assert_eq!(pointed["transport_params"][0]["destination_ip"], "192.168.10.32");
+    let receiver = mock.active(AUDIO_RECEIVER);
+    assert_eq!(receiver["transport_params"][0]["interface_ip"], "192.168.10.32");
+    assert_eq!(receiver["transport_params"][0]["multicast_ip"], Value::Null);
+    assert_eq!(mock.registered(AUDIO_SENDER)["subscription"], json!({"receiver_id": AUDIO_RECEIVER, "active": true}));
+    // A dry run plans both, and sends neither.
+    let mock = Mock::start(|f| f.unicast_audio = true);
+    let outcome =
+        mock.connect(&[route("MON 1 audio", sender("CAM 1 audio"))], &Settings { dry_run: true, ..settings() });
+    assert_eq!(states(&outcome), [State::Planned]);
+    let request = outcome.connections[0].request.as_ref().unwrap();
+    assert_eq!(request["transport_params"][0]["interface_ip"], "192.168.10.32");
+    assert_eq!(mock.changes(), Vec::<String>::new());
 }
 
 #[test]

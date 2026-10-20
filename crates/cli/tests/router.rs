@@ -135,7 +135,7 @@ fn serves_the_page_and_the_demo_registry() {
 
     let state = router.get("/api/state");
     assert_eq!(state["demo"], true);
-    assert_eq!(state["senders"].as_array().unwrap().len(), 9);
+    assert_eq!(state["senders"].as_array().unwrap().len(), 10);
     assert_eq!(state["receivers"].as_array().unwrap().len(), 8);
     let routes = router.routes();
     assert_eq!(taking(&routes, "MON 1 video").as_deref(), Some("CAM 1 video"));
@@ -200,6 +200,55 @@ fn refuses_what_a_receiver_cannot_take_and_says_why() {
     ));
     assert_eq!(why["fits"], false);
     assert!(why["reason"].as_str().unwrap().contains("frame_height 270 is not one of 180"), "{why}");
+}
+
+#[test]
+fn turns_a_sender_off_and_sends_it_elsewhere() {
+    let router = Router::start();
+    let camera = router.sender("CAM 3 video");
+    let enabled = |router: &Router| {
+        let state = router.get("/api/state");
+        state["senders"].as_array().unwrap().iter().find(|s| s["id"] == camera.as_str()).unwrap()["enabled"].clone()
+    };
+    assert_eq!(enabled(&router), true);
+    let stream = router.get(&format!("/api/stream?sender={camera}"));
+    assert_eq!(stream["active"]["master_enable"], true, "{stream:#}");
+    assert_eq!(stream["active"]["transport_params"][0]["destination_ip"], "239.10.3.1", "{stream:#}");
+
+    let (status, off) = router.post("/api/sender", &json!({"sender": camera, "enable": false}));
+    assert_eq!(status, 200, "{off:#}");
+    assert_eq!(off["succeeded"], true, "{off:#}");
+    assert_eq!(off["state"], "done");
+    assert!(off["describe"].as_str().unwrap().ends_with(": off: done"), "{off:#}");
+    assert_eq!(enabled(&router), false);
+
+    // Turned on again, to other groups; a leg past the last one given is turned off.
+    let (status, moved) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["239.10.3.9:5006"]}));
+    assert_eq!(status, 200, "{moved:#}");
+    assert_eq!(moved["succeeded"], true, "{moved:#}");
+    let stream = router.get(&format!("/api/stream?sender={camera}"));
+    let legs = &stream["active"]["transport_params"];
+    assert_eq!(legs[0]["destination_ip"], "239.10.3.9", "{stream:#}");
+    assert_eq!(legs[0]["destination_port"], 5006);
+    assert_eq!(legs[1]["rtp_enabled"], false);
+    assert_eq!(enabled(&router), true);
+    // Both are in the log, as takes are.
+    assert_eq!(router.get("/api/log")["log"].as_array().unwrap().len(), 2);
+
+    // A unicast address on a multicast Sender is refused, and a bad one named.
+    let (_, refused) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["192.168.10.31:5004"]}));
+    assert_eq!(refused["state"], "refused", "{refused:#}");
+    let (status, bad) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["239.10"]}));
+    assert_eq!(status, 400);
+    assert!(bad["error"].as_str().unwrap().starts_with("leg 1: "), "{bad:#}");
+    // Only from the page.
+    let headers = [("Content-Type", "application/json"), ("Origin", "http://evil.example")];
+    let body = json!({"sender": camera, "enable": false}).to_string();
+    assert_eq!(router.request("POST", "/api/sender", &headers, &body).0, 403);
+    assert_eq!(enabled(&router), true);
 }
 
 #[test]

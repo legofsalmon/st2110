@@ -6,6 +6,8 @@
 //! - [`Constraints`] reads a Receiver's `/constraints`, and says which values it refuses.
 //! - [`Plan`] is the request that connects or disconnects a Receiver, the problems its
 //!   constraints would raise, and what its `/active` endpoint should show afterwards.
+//! - [`SenderPlan`] is the request that turns a Sender on or off, or sends it somewhere
+//!   else: to a multicast group, or to a Receiver it names.
 //!
 //! The `client` feature adds [`client::ConnectionClient`], an HTTP client for
 //! Connection APIs, and [`controller`], which finds Senders and Receivers in an NMOS
@@ -45,7 +47,9 @@ mod constraints;
 pub mod controller;
 mod legs;
 mod plan;
+mod sender;
 
 pub use constraints::{Constraint, Constraints};
 pub use legs::{Leg, Legs, legs};
 pub use plan::{Activation, Expect, Plan, tai};
+pub use sender::{Destination, SenderChange, SenderPlan, destinations};

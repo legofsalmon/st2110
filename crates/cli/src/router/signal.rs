@@ -6,13 +6,19 @@
 //! The packets of a frame go out a millisecond's worth at a time rather than each at its
 //! ST 2110-21 time: the demo is for looking at, and a sender that spins to keep exact
 //! time would keep a whole processor core busy for each stream.
+//!
+//! Each stream follows its [`Live`]: it stops while its Sender is off, and goes where
+//! the Sender is told to send, as a controller changes it through IS-05.
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use st2110_media::describe::{Description, Media};
+use st2110_media::describe::{Description, Leg, Media};
 use st2110_media::format::VideoFormat;
 use st2110_media::net::{Transmitter, tai_now};
 use st2110_media::pixels::{Converter, Order};
@@ -21,19 +27,55 @@ use st2110_media::send::{FrameSource, Output, Sender, VideoSender};
 /// Packets due sooner than this go at once.
 const BURST_NS: i128 = 1_000_000;
 
+/// What a demo Sender is told to send now: where each leg goes, or nothing while it is
+/// off or sends where this machine cannot.
+pub(crate) struct Live {
+    /// Advanced on every change, so a stream need not lock to see none.
+    generation: AtomicU64,
+    legs: Mutex<Option<Vec<Leg>>>,
+}
+
+impl Live {
+    pub(crate) fn new(legs: Option<Vec<Leg>>) -> Self {
+        Self { generation: AtomicU64::new(0), legs: Mutex::new(legs) }
+    }
+
+    /// Tells the stream where to send from now on, or to stop.
+    pub(crate) fn set(&self, legs: Option<Vec<Leg>>) {
+        if let Ok(mut held) = self.legs.lock() {
+            *held = legs;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn legs(&self) -> Option<Vec<Leg>> {
+        self.legs.lock().ok()?.clone()
+    }
+}
+
+/// Opens the sockets for `legs`, from the loopback interface.
+fn transmitter(legs: &[Leg], ttl: u8, tai_utc: i32) -> io::Result<Transmitter> {
+    let interfaces = vec![Some(Ipv4Addr::LOCALHOST); legs.len()];
+    Transmitter::new(legs, &interfaces, ttl, 0, tai_utc)
+}
+
 /// Starts sending each stream on its own thread, from the loopback interface, until the
-/// program ends. Fails, sending nothing, when a stream's sockets cannot be opened.
-pub(crate) fn start(streams: &[(String, Description)], tai_utc: i32) -> io::Result<()> {
+/// program ends, to where its [`Live`] says. Fails, sending nothing, when a stream's
+/// sockets cannot be opened.
+pub(crate) fn start(streams: &[(String, Description, Arc<Live>)], tai_utc: i32) -> io::Result<()> {
     let mut ready = Vec::new();
-    for (label, description) in streams {
-        let interfaces = vec![Some(Ipv4Addr::LOCALHOST); description.legs.len()];
-        let transmitter = Transmitter::new(&description.legs, &interfaces, description.ttl, 0, tai_utc)?;
-        ready.push((label.clone(), description.clone(), transmitter));
+    for (label, description, live) in streams {
+        let seen = live.generation.load(Ordering::Acquire);
+        let sending = match live.legs() {
+            Some(legs) => Some(transmitter(&legs, description.ttl, tai_utc)?),
+            None => None,
+        };
+        let output = Bursts { sending, live: live.clone(), seen, ttl: description.ttl, tai_utc };
+        ready.push((label.clone(), description.clone(), output));
     }
     let (mut pictures, mut tones) = (0, 0);
-    for (i, (label, description, transmitter)) in ready.into_iter().enumerate() {
+    for (i, (label, description, mut output)) in ready.into_iter().enumerate() {
         let ssrc = 0x5354_0000 | i as u32;
-        let mut output = Bursts { transmitter, tai_utc };
         let start = tai_now(tai_utc);
         let sending = match &description.media {
             Media::Video(format) => {
@@ -61,9 +103,15 @@ pub(crate) fn start(streams: &[(String, Description)], tai_utc: i32) -> io::Resu
 /// Each camera's tone, in Hz, and its level, in dBFS.
 const TONES: [(u32, f64); 4] = [(440, -18.0), (660, -12.0), (880, -24.0), (1000, -6.0)];
 
-/// Sends packets a millisecond's worth at a time, sleeping between.
+/// Sends packets a millisecond's worth at a time, sleeping between, to where its
+/// [`Live`] says.
 struct Bursts {
-    transmitter: Transmitter,
+    /// The sockets to send on; `None` while the Sender sends nothing.
+    sending: Option<Transmitter>,
+    live: Arc<Live>,
+    /// The [`Live`] generation `sending` was opened for.
+    seen: u64,
+    ttl: u8,
     tai_utc: i32,
 }
 
@@ -74,8 +122,20 @@ impl Output for Bursts {
             thread::sleep(Duration::from_nanos((at - now) as u64));
             now = tai_now(self.tai_utc);
         }
-        // A time that has passed sends at once.
-        self.transmitter.send(packet, at.min(now))
+        let generation = self.live.generation.load(Ordering::Acquire);
+        if generation != self.seen {
+            self.seen = generation;
+            self.sending = match self.live.legs() {
+                Some(legs) => Some(transmitter(&legs, self.ttl, self.tai_utc)?),
+                None => None,
+            };
+        }
+        // A time that has passed sends at once; a Sender that is off keeps time and
+        // sends nothing.
+        match &mut self.sending {
+            Some(transmitter) => transmitter.send(packet, at.min(now)),
+            None => Ok(()),
+        }
     }
 
     fn now(&self) -> Option<i128> {

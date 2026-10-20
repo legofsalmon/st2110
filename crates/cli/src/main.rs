@@ -97,6 +97,11 @@ enum Command {
     /// names), by transport, format and capabilities. --cancel cancels an activation
     /// scheduled on a Receiver.
     ///
+    /// With --sender and --enable, --disable or --destination, it turns that Sender on
+    /// or off, or sends it to other multicast groups or unicast addresses. A Receiver
+    /// connected to a unicast (rtp.ucast) Sender has the Sender pointed at it first,
+    /// naming it as the Sender's receiver_id.
+    ///
     /// Each connection is checked against the Receiver's constraints and capabilities
     /// before anything is sent, and on its /active endpoint and in the registry after.
     /// Several are made as a salvo that switches at one PTP time, --lead from now, and is
@@ -111,8 +116,23 @@ enum Command {
         #[arg(long, value_name = "RECEIVER", conflicts_with = "salvo")]
         receiver: Option<String>,
         /// The Sender whose stream it is to take: its id, its label, or the start of its id.
-        #[arg(long, value_name = "SENDER", group = "take", requires = "receiver")]
+        /// With --enable, --disable or --destination, the Sender to change.
+        #[arg(long, value_name = "SENDER", group = "take")]
         sender: Option<String>,
+        /// Turn the Sender on, sending where it sent before or where --destination says.
+        #[arg(long, requires = "sender", conflicts_with_all = ["receiver", "disable", "salvo", "cancel"])]
+        enable: bool,
+        /// Turn the Sender off.
+        #[arg(long, requires = "sender", conflicts_with_all = ["receiver", "destination", "salvo", "cancel"])]
+        disable: bool,
+        /// Where the Sender sends, and turn it on: a multicast group or a unicast address,
+        /// with a port or not, such as 239.10.1.1:5004. Give it twice for an ST 2022-7
+        /// pair, path 1 first; a leg left without one is turned off.
+        #[arg(long, value_name = "ADDRESS", requires = "sender", conflicts_with_all = ["receiver", "salvo", "cancel"])]
+        destination: Vec<String>,
+        /// The Receiver a unicast Sender's --destination is, named as its receiver_id.
+        #[arg(long, value_name = "RECEIVER", requires = "destination")]
+        receiver_id: Option<String>,
         /// An SDP file of the stream it is to take, such as one from outside NMOS; `-`
         /// reads standard input.
         #[arg(long, value_name = "FILE", group = "take", requires = "receiver")]
@@ -454,6 +474,10 @@ fn main() -> ExitCode {
             target,
             receiver,
             sender,
+            enable,
+            disable,
+            destination,
+            receiver_id,
             sdp,
             disconnect,
             cancel,
@@ -473,6 +497,10 @@ fn main() -> ExitCode {
                 target,
                 receiver,
                 sender,
+                enable,
+                disable,
+                destination,
+                receiver_id,
                 sdp,
                 disconnect,
                 cancel,

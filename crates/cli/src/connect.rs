@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use st2110_connect::Activation;
 use st2110_connect::client::{self, ConnectionClient};
-use st2110_connect::controller::{self, Connection, Outcome, Route, Settings, State, Take};
+use st2110_connect::controller::{self, Connection, Outcome, Route, SenderControl, Settings, State, Take};
+use st2110_connect::{Activation, Destination, SenderChange};
 use st2110_nmos::auth::Token;
 use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::routing::{self, Matrix};
@@ -26,6 +26,10 @@ pub(crate) struct Args {
     pub target: String,
     pub receiver: Option<String>,
     pub sender: Option<String>,
+    pub enable: bool,
+    pub disable: bool,
+    pub destination: Vec<String>,
+    pub receiver_id: Option<String>,
     pub sdp: Option<PathBuf>,
     pub disconnect: bool,
     pub cancel: bool,
@@ -42,8 +46,13 @@ pub(crate) struct Args {
 }
 
 pub(crate) fn run(args: &Args, format: Format) -> io::Result<ExitCode> {
+    let changes_sender = args.enable || args.disable || !args.destination.is_empty();
     let result = match (&args.salvo, &args.receiver, &args.sender, &args.sdp, args.disconnect) {
         (None, Some(receiver), ..) if args.cancel => cancel(args, receiver, format),
+        (None, None, Some(sender), None, false) if changes_sender => control(args, sender, format),
+        (None, None, Some(_), None, false) => Err(Failure::Usage(
+            "--sender needs --receiver to connect, or --enable, --disable or --destination to change it".into(),
+        )),
         (None, _, None, None, false) => {
             let making = [
                 ("--dry-run", args.dry_run),
@@ -263,21 +272,111 @@ fn activation(args: &Args) -> Result<Option<Activation>, String> {
     }
 }
 
-/// Makes the connections asked for.
-fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
-    let routes = routes(args)?;
-    let settings = Settings {
+fn settings(args: &Args) -> Result<Settings, String> {
+    Ok(Settings {
         activation: activation(args)?,
         lead: seconds("--lead", args.lead)?,
         force: args.force,
         dry_run: args.dry_run,
         wait: seconds("--wait", args.wait)?,
         tai_utc: args.tai_utc,
-    };
+    })
+}
+
+fn timeout(args: &Args) -> Result<Duration, String> {
     let timeout = seconds("--timeout", args.timeout)?;
     if timeout.is_zero() {
-        return Err(Failure::Usage("--timeout 0 is not a number of seconds above 0".into()));
+        return Err("--timeout 0 is not a number of seconds above 0".into());
     }
+    Ok(timeout)
+}
+
+/// Turns a Sender on or off, or changes where it sends.
+fn control(args: &Args, sender: &str, format: Format) -> Result<ExitCode, Failure> {
+    let destinations = args
+        .destination
+        .iter()
+        .map(|d| Destination::parse(d).map_err(|e| format!("--destination {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let settings = settings(args)?;
+    let timeout = timeout(args)?;
+    let token = args.auth.token(timeout, true)?;
+    let (snapshot, registry) = load(&args.target, timeout, false, token.as_ref())?;
+    let receiver_id = match &args.receiver_id {
+        Some(name) => Some(routing::find(&snapshot, Kind::Receiver, name)?.id),
+        None => None,
+    };
+    let change = SenderChange { enable: !args.disable, destinations, receiver_id };
+    let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
+    let report = controller::control(&snapshot, sender, &change, &client, registry.as_ref(), &settings)?;
+    let mut out = io::stdout().lock();
+    match format {
+        Format::Text => write_control(&mut out, &report, args.tai_utc, Style::detect())?,
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, &report)?;
+            writeln!(out)?;
+        }
+    }
+    Ok(if report.state.is_success() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+fn write_control(out: &mut impl Write, report: &SenderControl, tai_utc: i32, style: Style) -> io::Result<()> {
+    let request = report.request.as_ref();
+    let enable = request.and_then(|r| r.get("master_enable")).and_then(Value::as_bool);
+    let what = match enable {
+        Some(false) => "off",
+        _ => "on",
+    };
+    let mut line = format!(
+        "{} {what}: {}",
+        style.paint("1", &report.sender.describe()),
+        style.paint(state_code(report.state), report.state.describe())
+    );
+    if let Some(time) = report.activation_time.as_deref().and_then(PtpTime::parse) {
+        let when = if report.state == State::Scheduled { "for" } else { "at" };
+        line.push_str(&format!(" {when} {} UTC", time.utc(tai_utc)));
+    }
+    writeln!(out, "{line}")?;
+    let legs = request.and_then(|r| r.get("transport_params")).and_then(Value::as_array);
+    for (i, leg) in legs.into_iter().flatten().enumerate() {
+        let to = match (leg.get("rtp_enabled"), leg.get("destination_ip").and_then(Value::as_str)) {
+            (Some(Value::Bool(false)), _) => "off".to_string(),
+            (_, Some(ip)) => {
+                let ip = if ip.contains(':') { format!("[{ip}]") } else { ip.to_string() };
+                match leg.get("destination_port") {
+                    Some(port) => format!("to {ip}:{port}"),
+                    None => format!("to {ip}"),
+                }
+            }
+            _ => "unchanged".to_string(),
+        };
+        writeln!(out, "  leg {}: {to}", i + 1)?;
+    }
+    if let Some(receiver) = request.and_then(|r| r.get("receiver_id")).and_then(Value::as_str) {
+        writeln!(out, "  receiver_id: {receiver}")?;
+    }
+    for (label, texts) in [("note", &report.notes), ("problem", &report.problems), ("warning", &report.warnings)] {
+        for text in texts {
+            writeln!(out, "  {label}: {text}")?;
+        }
+    }
+    Ok(())
+}
+
+/// The colour a state is shown in.
+fn state_code(state: State) -> &'static str {
+    match state {
+        State::Planned | State::Scheduled | State::Done => "1;32",
+        State::RolledBack | State::Held => "1;33",
+        _ => "1;31",
+    }
+}
+
+/// Makes the connections asked for.
+fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
+    let routes = routes(args)?;
+    let settings = settings(args)?;
+    let timeout = timeout(args)?;
     let token = args.auth.token(timeout, true)?;
     let (snapshot, registry) = load(&args.target, timeout, false, token.as_ref())?;
     let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
@@ -296,11 +395,7 @@ fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
 fn write_outcome(out: &mut impl Write, outcome: &Outcome, tai_utc: i32, style: Style) -> io::Result<()> {
     for connection in &outcome.connections {
         let state = connection.state;
-        let code = match state {
-            State::Planned | State::Scheduled | State::Done => "1;32",
-            State::RolledBack | State::Held => "1;33",
-            _ => "1;31",
-        };
+        let code = state_code(state);
         let mut line = format!(
             "{} ← {}: {}",
             style.paint("1", &connection.receiver.describe()),
