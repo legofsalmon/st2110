@@ -27,6 +27,9 @@
 //! access token [`INITIAL_TOKEN`], for a secret or for `private_key_jwt`, as the router
 //! itself does. Its tokens are opaque strings it keeps a list of, where a real
 //! Authorization Server issues signed JWTs for each Resource Server to check for itself.
+//! It signs people in too, for `st2110 router --sign-in`, by the Authorization Code grant
+//! with PKCE, to the public client [`SIGN_IN_CLIENT_ID`]: it approves at once, where a
+//! real server asks who they are, and gives a refresh token with each access token.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -135,14 +138,44 @@ pub(crate) const CLIENT_SECRET: &str = "demo-secret";
 /// Credentials grant.
 pub(crate) const INITIAL_TOKEN: &str = "demo-registration";
 
+/// The demo Authorization Server's public client, which a person signs in to the router
+/// with: it has no secret, since the router gives it to anyone who reaches its page, and
+/// PKCE protects its codes.
+pub(crate) const SIGN_IN_CLIENT_ID: &str = "st2110-sign-in";
+
 /// Where the demo Authorization Server registers clients.
 const REGISTER_PATH: &str = "/x-nmos/auth/v1.0/register";
+
+/// Where it signs people in: its authorization endpoint.
+const AUTHORIZE_PATH: &str = "/x-nmos/auth/v1.0/authorize";
+
+/// How long a code it gives may wait to be swapped for a token: RFC 6749 §4.1.2 asks
+/// for a short time.
+const CODE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// A client registered with the demo Authorization Server, and how it authenticates.
 enum Client {
     Secret(String),
     /// `private_key_jwt`, with the keys at its `jwks_uri`.
     Key(String),
+    /// None at all: the Authorization Code grant with PKCE only.
+    Public,
+}
+
+/// A code given to a client for a person signed in, until it is swapped for a token.
+struct Code {
+    client_id: String,
+    redirect_uri: String,
+    /// The PKCE `code_challenge`, by S256.
+    challenge: String,
+    scopes: Vec<String>,
+    expires: Instant,
+}
+
+/// What a refresh token renews: the client it was given to, and its scopes.
+struct Refresh {
+    client_id: String,
+    scopes: Vec<String>,
 }
 
 /// The scopes the demo Authorization Server issues tokens for.
@@ -197,6 +230,10 @@ pub(crate) struct Facility {
     clients: HashMap<String, Client>,
     /// The `jti` of each client assertion taken, so that none is taken twice.
     assertions: HashSet<String>,
+    /// The codes given to people signing in, not yet swapped.
+    codes: HashMap<String, Code>,
+    /// The refresh tokens given, each taken once.
+    refreshes: HashMap<String, Refresh>,
     /// Whether a Receiver changed since the facility was last kept.
     dirty: bool,
     /// The Nodes registered through the Registration API, by `id`, and when each was
@@ -261,8 +298,13 @@ impl Facility {
             subscriptions: BTreeMap::new(),
             changes: Vec::new(),
             tokens: None,
-            clients: HashMap::from([(CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string()))]),
+            clients: HashMap::from([
+                (CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string())),
+                (SIGN_IN_CLIENT_ID.to_string(), Client::Public),
+            ]),
             assertions: HashSet::new(),
+            codes: HashMap::new(),
+            refreshes: HashMap::new(),
             dirty: false,
             heard: HashMap::new(),
         };
@@ -570,7 +612,9 @@ impl Facility {
     /// Answers a request for the registry, a Connection API or the Authorization Server.
     pub(crate) fn answer(&mut self, request: &Request) -> Response {
         self.settle();
-        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH || request.path == REGISTER_PATH {
+        if request.path.starts_with(METADATA_PATH)
+            || [TOKEN_PATH, REGISTER_PATH, AUTHORIZE_PATH].contains(&request.path.as_str())
+        {
             return self.authorization_server(request);
         }
         if let Err(refused) = self.authorized(request) {
@@ -1003,6 +1047,8 @@ impl Facility {
                 issued["client_secret_expires_at"] = json!(0);
             }
             Client::Key(uri) => issued["jwks_uri"] = json!(uri),
+            // Not registered: only the demo's own sign-in client is public.
+            Client::Public => {}
         }
         self.clients.insert(client_id, client);
         Ok(issued)
@@ -1016,6 +1062,13 @@ impl Facility {
                 Some(Client::Secret(kept)) if *kept == secret => Ok(id),
                 _ => Err("the client id or secret is not one this demo issued"),
             };
+        }
+        // A public client gives its id alone.
+        if let Some(id) = form.get("client_id")
+            && !form.contains_key("client_assertion")
+            && matches!(self.clients.get(id), Some(Client::Public))
+        {
+            return Ok(id.clone());
         }
         let (Some(id), Some(assertion)) = (form.get("client_id"), form.get("client_assertion")) else {
             return Err("give the client's id and secret, or a signed client_assertion");
@@ -1050,12 +1103,14 @@ impl Facility {
                 200,
                 &json!({
                     "issuer": format!("{base}/"),
+                    "authorization_endpoint": format!("{base}{AUTHORIZE_PATH}"),
                     "token_endpoint": format!("{base}{TOKEN_PATH}"),
                     "registration_endpoint": format!("{base}{REGISTER_PATH}"),
-                    "grant_types_supported": ["client_credentials"],
-                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
+                    "grant_types_supported": ["client_credentials", "authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt", "none"],
                     "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
-                    "response_types_supported": ["none"],
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
                     "scopes_supported": SCOPES,
                 }),
             );
@@ -1084,6 +1139,9 @@ impl Facility {
                 Err((status, body)) => Response::json(status, &body),
             };
         }
+        if request.path == AUTHORIZE_PATH {
+            return self.authorize(request);
+        }
         let oauth_error = |status: u16, error: &str, description: &str| {
             let mut response = Response::json(status, &json!({"error": error, "error_description": description}));
             if status == 401 {
@@ -1099,31 +1157,141 @@ impl Facility {
             .filter_map(|pair| pair.split_once('='))
             .map(|(name, value)| (auth::form_decode(name), auth::form_decode(value)))
             .collect();
-        if let Err(why) = self.client_of(request, &form) {
-            return oauth_error(401, "invalid_client", why);
-        }
+        let client = match self.client_of(request, &form) {
+            Ok(client) => client,
+            Err(why) => return oauth_error(401, "invalid_client", why),
+        };
+        let now = Instant::now();
+        let public = matches!(self.clients.get(&client), Some(Client::Public));
+        let (scopes, refresh) = match form.get("grant_type").map(String::as_str) {
+            Some("client_credentials") if public => {
+                return oauth_error(400, "unauthorized_client", "a public client gets tokens by signing someone in");
+            }
+            Some("client_credentials") => {
+                let asked = form.get("scope").map_or("query connection", String::as_str);
+                let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
+                if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
+                    return oauth_error(
+                        400,
+                        "invalid_scope",
+                        "this demo's scopes are query, connection and registration",
+                    );
+                }
+                (scopes, false)
+            }
+            // RFC 6749 §4.1.3, and RFC 7636 §4.6: the code, once, for the client and the
+            // redirect URI it was given for, with the verifier its challenge was made from.
+            Some("authorization_code") => {
+                self.codes.retain(|_, code| code.expires > now);
+                let Some(code) = form.get("code").and_then(|c| self.codes.remove(c)) else {
+                    return oauth_error(400, "invalid_grant", "the code is not one this demo gave, or was used before");
+                };
+                if code.client_id != client || form.get("redirect_uri") != Some(&code.redirect_uri) {
+                    return oauth_error(400, "invalid_grant", "the code was given for another client or redirect_uri");
+                }
+                let verifier = form.get("code_verifier").map_or("", String::as_str);
+                if !(43..=128).contains(&verifier.len()) || auth::pkce_challenge(verifier) != code.challenge {
+                    return oauth_error(
+                        400,
+                        "invalid_grant",
+                        "the code_verifier is not the one the code_challenge was made from",
+                    );
+                }
+                (code.scopes, true)
+            }
+            // RFC 6749 §6: each refresh token once, and a new one with the token.
+            Some("refresh_token") => {
+                let Some(refresh) = form.get("refresh_token").and_then(|r| self.refreshes.remove(r)) else {
+                    return oauth_error(
+                        400,
+                        "invalid_grant",
+                        "the refresh token is not one this demo gave, or was used before",
+                    );
+                };
+                if refresh.client_id != client {
+                    return oauth_error(400, "invalid_grant", "the refresh token was given to another client");
+                }
+                (refresh.scopes, true)
+            }
+            _ => {
+                return oauth_error(
+                    400,
+                    "unsupported_grant_type",
+                    "this demo gives tokens by client_credentials, authorization_code and refresh_token",
+                );
+            }
+        };
         let Some(tokens) = &mut self.tokens else {
             return oauth_error(404, "invalid_request", "this demo asks for no tokens");
         };
-        if form.get("grant_type").map(String::as_str) != Some("client_credentials") {
-            return oauth_error(400, "unsupported_grant_type", "this demo issues tokens by client_credentials only");
-        }
-        let asked = form.get("scope").map_or("query connection", String::as_str);
-        let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
-        if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
-            return oauth_error(400, "invalid_scope", "this demo's scopes are query, connection and registration");
-        }
         let token = random_token();
-        let now = Instant::now();
         tokens.retain(|_, issued| issued.expires > now);
         tokens.insert(token.clone(), Issued { scopes: scopes.clone(), expires: now + TOKEN_LIFETIME });
-        Response::json(
-            200,
-            &json!({
-                "access_token": token, "token_type": "Bearer",
-                "expires_in": TOKEN_LIFETIME.as_secs(), "scope": scopes.join(" "),
-            }),
-        )
+        let mut body = json!({
+            "access_token": token, "token_type": "Bearer",
+            "expires_in": TOKEN_LIFETIME.as_secs(), "scope": scopes.join(" "),
+        });
+        if refresh {
+            let next = random_token();
+            body["refresh_token"] = json!(next);
+            self.refreshes.insert(next, Refresh { client_id: client, scopes });
+        }
+        Response::json(200, &body)
+    }
+
+    /// The authorization endpoint (RFC 6749 §4.1.1): a person signing in is approved at
+    /// once, where a real server asks who they are, and sent back to the client with a
+    /// code. Only to this machine, as RFC 8252 §7.3 has a loopback client be, and with a
+    /// PKCE challenge by S256 (RFC 7636 §4.3).
+    fn authorize(&mut self, request: &Request) -> Response {
+        if request.method != "GET" {
+            return Response::error(405, "sign in with GET");
+        }
+        let client_id = request.param("client_id").unwrap_or_default();
+        let redirect_uri = request.param("redirect_uri").unwrap_or_default();
+        // RFC 6749 §4.1.2.1: a client or redirect URI that is wrong is told to the person,
+        // and not followed.
+        if !matches!(self.clients.get(&client_id), Some(Client::Public)) {
+            return Response::error(400, format!("this demo signs people in for the client {SIGN_IN_CLIENT_ID} only"));
+        }
+        let loopback = redirect_uri.starts_with("http://") && auth::may_send_to(&redirect_uri);
+        if !loopback || redirect_uri.contains(|c: char| c == '#' || c.is_control()) {
+            return Response::error(
+                400,
+                "this demo sends people back to this machine only, by an http:// redirect_uri",
+            );
+        }
+        let state = request.param("state").map(|s| format!("&state={}", auth::form_encode(&s))).unwrap_or_default();
+        let join = if redirect_uri.contains('?') { '&' } else { '?' };
+        let back = |query: String| Response {
+            status: 302,
+            content_type: "text/plain; charset=utf-8",
+            headers: vec![("Location", format!("{redirect_uri}{join}{query}{state}"))],
+            body: Vec::new(),
+        };
+        let refuse = |error: &str, description: &str| {
+            back(format!("error={error}&error_description={}", auth::form_encode(description)))
+        };
+        if request.param("response_type").as_deref() != Some("code") {
+            return refuse("unsupported_response_type", "this demo gives codes only");
+        }
+        let challenge = request.param("code_challenge").unwrap_or_default();
+        if request.param("code_challenge_method").as_deref() != Some("S256") || challenge.len() != 43 {
+            return refuse("invalid_request", "this demo asks for PKCE, by S256");
+        }
+        let asked = request.param("scope").unwrap_or_else(|| "query connection".into());
+        let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
+        if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
+            return refuse("invalid_scope", "this demo's scopes are query, connection and registration");
+        }
+        let code = random_token();
+        let now = Instant::now();
+        self.codes.retain(|_, code| code.expires > now);
+        self.codes.insert(
+            code.clone(),
+            Code { client_id, redirect_uri: redirect_uri.clone(), challenge, scopes, expires: now + CODE_LIFETIME },
+        );
+        back(format!("code={code}"))
     }
 }
 

@@ -4,7 +4,7 @@
 //! A [`Token`] is given to [`crate::client::Options`] (and to the Connection API client
 //! in `st2110-connect`), which then send it in `Authorization: Bearer …` with each
 //! request (IS-10 v1.0 Behaviour: Clients, Accessing Protected Resources). It comes
-//! from one of three places:
+//! from one of four places:
 //!
 //! - [`Token::fixed`]: one given as it is.
 //! - [`Token::file`]: a file holding one, read again whenever it changes, so that
@@ -14,6 +14,12 @@
 //!   the client's id and secret (`client_secret_basic`) or an assertion signed with its
 //!   key (`private_key_jwt`, RFC 7523), and asked again when it is half way to
 //!   expiring, as IS-10 recommends, or when a server refuses it.
+//! - [`Token::sign_in`]: a person, who signs in to the Authorization Server in their
+//!   browser, by the Authorization Code grant (RFC 6749 §4.1) with PKCE (RFC 7636,
+//!   `S256`): [`Token::begin_sign_in`] gives the address to send the browser to, and
+//!   [`Token::finish_sign_in`] swaps the code it comes back with for a token. The
+//!   token is renewed with the refresh token the server gives, if it gives one, and
+//!   until someone signs in there is none to send.
 //!
 //! A client that is not registered yet can register itself with [`register`], by OAuth
 //! 2.0 Dynamic Client Registration (RFC 7591), as IS-10 recommends for zero
@@ -29,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::{Value, json};
@@ -44,6 +51,14 @@ const WELL_KNOWN: &str = "/.well-known/oauth-authorization-server";
 
 /// The most a token or metadata response may hold.
 const LIMIT: u64 = 1 << 20;
+
+/// How long a sign-in may take, from sending the browser to the Authorization Server
+/// to its coming back.
+const SIGN_IN_TIME: Duration = Duration::from_secs(300);
+
+/// The most sign-ins begun and not finished that are kept: a page reloaded many times
+/// should not fill memory.
+const MOST_PENDING: usize = 16;
 
 /// Why no token could be had.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +105,58 @@ impl fmt::Debug for ClientCredentials {
     }
 }
 
+/// How a person signs in, for a [`Token::sign_in`].
+#[derive(Clone)]
+pub struct SignIn {
+    /// The server's issuer URL, such as `https://auth.example/`, or its metadata URL.
+    pub server: String,
+    /// The id the client is registered with, for the Authorization Code grant.
+    pub client_id: String,
+    /// The secret of a confidential client; `None` for a public one, which PKCE alone
+    /// protects.
+    pub client_secret: Option<String>,
+    /// The scopes to ask for, separated by spaces: [`SCOPES`] for a controller.
+    pub scope: String,
+}
+
+impl fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignIn")
+            .field("server", &self.server)
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A sign-in begun: the Authorization Server's address to send the browser to, and the
+/// `state` that comes back with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authorize {
+    /// The authorization endpoint, with the request in its query.
+    pub url: String,
+    /// The `state` sent, which the browser brings back.
+    pub state: String,
+}
+
+/// Who has signed in, as far as the server says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignedIn {
+    /// The `sub` of an access token that is a JWT: who it acts for. Read without
+    /// checking its signature, so only to show.
+    pub subject: Option<String>,
+    /// The scopes the server granted, when it says.
+    pub scope: Option<String>,
+}
+
+/// A sign-in begun and not finished.
+struct Pending {
+    state: String,
+    verifier: String,
+    redirect_uri: String,
+    begun: Instant,
+}
+
 /// An access token, and how to get the next one. Clones share it.
 #[derive(Clone)]
 pub struct Token {
@@ -105,6 +172,7 @@ enum Source {
     Fixed(String),
     File(PathBuf),
     Client { credentials: ClientCredentials, agent: Agent },
+    SignIn { sign_in: SignIn, agent: Agent },
 }
 
 #[derive(Default)]
@@ -118,6 +186,14 @@ struct Held {
     modified: Option<SystemTime>,
     /// The Authorization Server's token endpoint, once its metadata has been read.
     endpoint: Option<String>,
+    /// With sign-in: its authorization endpoint, once its metadata has been read.
+    authorize: Option<String>,
+    /// With sign-in: the refresh token, when the server gave one.
+    refresh: Option<String>,
+    /// With sign-in: who signed in, while signed in.
+    signed_in: Option<SignedIn>,
+    /// With sign-in: the sign-ins begun and not finished, oldest first.
+    pending: Vec<Pending>,
 }
 
 impl fmt::Debug for Token {
@@ -147,6 +223,12 @@ impl Token {
         Self::new(Source::Client { credentials, agent: agent(timeout, env_proxy) })
     }
 
+    /// Tokens for whoever signs in, by the Authorization Code grant with PKCE. There is
+    /// none until someone has.
+    pub fn sign_in(sign_in: SignIn, timeout: Duration, env_proxy: bool) -> Self {
+        Self::new(Source::SignIn { sign_in, agent: agent(timeout, env_proxy) })
+    }
+
     fn new(source: Source) -> Self {
         Self { inner: Arc::new(Inner { source, held: Mutex::new(Held::default()) }) }
     }
@@ -160,7 +242,119 @@ impl Token {
                 let by = if credentials.key.is_some() { ", signing with its key" } else { "" };
                 format!("tokens for {} from {}{by}", credentials.client_id, credentials.server)
             }
+            Source::SignIn { sign_in, .. } => {
+                format!("tokens for whoever signs in, as {} at {}", sign_in.client_id, sign_in.server)
+            }
         }
+    }
+
+    /// Whether its tokens come from a person signing in.
+    pub fn signs_in(&self) -> bool {
+        matches!(self.inner.source, Source::SignIn { .. })
+    }
+
+    /// Who has signed in, while there is a token to send or a refresh token to get one
+    /// with; `None` before anyone has, after [`Token::sign_out`], and once the sign-in
+    /// has run out.
+    pub fn signed_in(&self) -> Option<SignedIn> {
+        let held = self.inner.held.lock().ok()?;
+        let current = held.value.is_some() && held.expires.is_none_or(|at| Instant::now() < at);
+        held.signed_in.clone().filter(|_| current || held.refresh.is_some())
+    }
+
+    /// Begins a sign-in: a fresh `state`, and a PKCE verifier kept for it (RFC 7636
+    /// §4.1), and the address of the Authorization Server's authorization endpoint
+    /// that asks for a code for them, to be sent back to `redirect_uri`.
+    pub fn begin_sign_in(&self, redirect_uri: &str) -> Result<Authorize, Error> {
+        let Source::SignIn { sign_in, agent } = &self.inner.source else {
+            return Err(error("these tokens come from no sign-in"));
+        };
+        let mut held = self.inner.held.lock().map_err(|_| error("the token store failed"))?;
+        let endpoint = match &held.authorize {
+            Some(url) => url.clone(),
+            None => {
+                let (token_endpoint, metadata) = discover(agent, &sign_in.server, "authorization_code")?;
+                let url = metadata
+                    .get("authorization_endpoint")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error(format!("{}: no authorization_endpoint in its metadata", sign_in.server)))?
+                    .to_string();
+                // RFC 8414 §2: a server that lists its methods without S256 does not
+                // take it, and no sign-in is made without PKCE.
+                let methods = metadata.get("code_challenge_methods_supported").and_then(Value::as_array);
+                if methods.is_some_and(|m| !m.iter().any(|m| m.as_str() == Some("S256"))) {
+                    return Err(error(format!("{}: the server does not take PKCE with S256", sign_in.server)));
+                }
+                if !may_send_to(&url) {
+                    return Err(error(format!("{url}: people sign in over https:// only, or on this machine")));
+                }
+                held.endpoint = Some(token_endpoint);
+                held.authorize = Some(url.clone());
+                url
+            }
+        };
+        let state = random_id()?;
+        let mut secret = [0u8; 32];
+        SystemRandom::new().fill(&mut secret).map_err(|_| error("no random number"))?;
+        // 43 characters of the unreserved set, as RFC 7636 §4.1 asks.
+        let verifier = base64url(&secret);
+        let url = authorize_url(&endpoint, sign_in, redirect_uri, &state, &pkce_challenge(&verifier));
+        let now = Instant::now();
+        held.pending.retain(|p| now.duration_since(p.begun) < SIGN_IN_TIME);
+        let extra = (held.pending.len() + 1).saturating_sub(MOST_PENDING);
+        held.pending.drain(..extra);
+        held.pending.push(Pending {
+            state: state.clone(),
+            verifier,
+            redirect_uri: redirect_uri.to_string(),
+            begun: now,
+        });
+        Ok(Authorize { url, state })
+    }
+
+    /// Finishes the sign-in that `state` began, swapping the `code` the browser came
+    /// back with for a token (RFC 6749 §4.1.3), with the PKCE verifier kept for it. A
+    /// `state` not begun here, or begun too long ago, is refused, and each is taken
+    /// once.
+    pub fn finish_sign_in(&self, state: &str, code: &str) -> Result<SignedIn, Error> {
+        let Source::SignIn { sign_in, agent } = &self.inner.source else {
+            return Err(error("these tokens come from no sign-in"));
+        };
+        let mut held = self.inner.held.lock().map_err(|_| error("the token store failed"))?;
+        let now = Instant::now();
+        held.pending.retain(|p| now.duration_since(p.begun) < SIGN_IN_TIME);
+        let Some(at) = held.pending.iter().position(|p| p.state == state) else {
+            return Err(error("this sign-in was not begun here, or took too long: sign in again"));
+        };
+        let pending = held.pending.remove(at);
+        let endpoint = held.endpoint.clone().ok_or_else(|| error("the server's token endpoint is not known"))?;
+        let form = format!(
+            "grant_type=authorization_code&code={}&redirect_uri={}&code_verifier={}",
+            form_encode(code),
+            form_encode(&pending.redirect_uri),
+            form_encode(&pending.verifier)
+        );
+        let reply = post_form(agent, &endpoint, form, &sign_in.client_id, sign_in.client_secret.as_deref())?;
+        let (value, lifetime) = access_token(&reply, &endpoint)?;
+        let who = SignedIn {
+            subject: subject(&value),
+            scope: reply.get("scope").and_then(Value::as_str).map(str::to_string),
+        };
+        keep(&mut held, now, value, lifetime);
+        held.refresh = reply.get("refresh_token").and_then(Value::as_str).map(str::to_string);
+        held.signed_in = Some(who.clone());
+        Ok(who)
+    }
+
+    /// Forgets the tokens got by signing in, so that none is sent until someone signs
+    /// in again. They are not revoked at the server.
+    pub fn sign_out(&self) {
+        let Ok(mut held) = self.inner.held.lock() else { return };
+        held.value = None;
+        held.renew = None;
+        held.expires = None;
+        held.refresh = None;
+        held.signed_in = None;
     }
 
     /// Whether a refused token can be swapped for another.
@@ -194,18 +388,46 @@ impl Token {
                     return Ok(value.clone());
                 }
                 match request(agent, credentials, &mut held.endpoint) {
-                    Ok((value, lifetime)) => {
-                        // Half way, as IS-10 recommends, and at least 15 seconds early.
-                        held.renew = lifetime.map(|l| now + (l / 2).min(l.saturating_sub(Duration::from_secs(15))));
-                        held.expires = lifetime.map(|l| now + l);
-                        held.value = Some(value.clone());
-                        Ok(value)
-                    }
+                    Ok((value, lifetime)) => Ok(keep(&mut held, now, value, lifetime)),
                     // One that has not expired yet is still good to send.
                     Err(e) => match held.value.as_ref().filter(|_| held.expires.is_some_and(|at| now < at)) {
                         Some(value) => Ok(value.clone()),
                         None => Err(e),
                     },
+                }
+            }
+            Source::SignIn { sign_in, agent } => {
+                if let Some(value) = held.value.as_ref().filter(|_| held.renew.is_none_or(|at| now < at)) {
+                    return Ok(value.clone());
+                }
+                let unexpired = held.value.clone().filter(|_| held.expires.is_some_and(|at| now < at));
+                let (Some(refresh), Some(endpoint)) = (held.refresh.clone(), held.endpoint.clone()) else {
+                    return unexpired.ok_or_else(|| match held.signed_in {
+                        Some(_) => error("the sign-in has run out: sign in again on the router's page"),
+                        None => error("no one has signed in: sign in on the router's page"),
+                    });
+                };
+                // RFC 6749 §6, for the scopes first granted.
+                let form = format!("grant_type=refresh_token&refresh_token={}", form_encode(&refresh));
+                match post_form(agent, &endpoint, form, &sign_in.client_id, sign_in.client_secret.as_deref()) {
+                    Ok(reply) => {
+                        let (value, lifetime) = access_token(&reply, &endpoint)?;
+                        // A server may give a new refresh token, and then the old one is spent.
+                        if let Some(next) = reply.get("refresh_token").and_then(Value::as_str) {
+                            held.refresh = Some(next.to_string());
+                        }
+                        if let Some(who) = held.signed_in.as_mut() {
+                            who.subject = subject(&value).or(who.subject.take());
+                        }
+                        Ok(keep(&mut held, now, value, lifetime))
+                    }
+                    Err(e) => {
+                        // A refresh token the server no longer takes ends the sign-in.
+                        if e.message.contains("invalid_grant") {
+                            held.refresh = None;
+                        }
+                        unexpired.ok_or(e)
+                    }
                 }
             }
         }
@@ -266,58 +488,82 @@ fn request(
     let token_endpoint = match endpoint {
         Some(url) => url.clone(),
         None => {
-            let url = metadata_url(&credentials.server)?;
-            if !may_send_to(&url) {
-                return Err(error(format!("{url}: tokens are asked for over https:// only, or on this machine")));
-            }
-            let metadata = get_json(agent, &url)?;
-            let found = metadata
-                .get("token_endpoint")
-                .and_then(Value::as_str)
-                .ok_or_else(|| error(format!("{url}: no token_endpoint in the server's metadata")))?;
-            let grants = metadata.get("grant_types_supported").and_then(Value::as_array);
-            if grants.is_some_and(|g| !g.iter().any(|g| g.as_str() == Some("client_credentials"))) {
-                return Err(error(format!("{url}: the server does not offer the client_credentials grant")));
-            }
-            *endpoint = Some(found.to_string());
-            found.to_string()
+            let (found, _) = discover(agent, &credentials.server, "client_credentials")?;
+            *endpoint = Some(found.clone());
+            found
         }
     };
-    if !may_send_to(&token_endpoint) {
-        return Err(error(format!("{token_endpoint}: secrets are sent over https:// only, or on this machine")));
-    }
     let mut body = format!("grant_type=client_credentials&scope={}", form_encode(&credentials.scope));
-    let mut post = agent
-        .post(&token_endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json");
-    match &credentials.key {
+    let reply = match &credentials.key {
         // RFC 7523 §2.2: the client authenticates with an assertion it signs, and sends
         // no secret.
         Some(key) => {
             let assertion = key.assertion(&credentials.client_id, &token_endpoint)?;
             body.push_str(&format!(
-                "&client_id={}&client_assertion_type={}&client_assertion={assertion}",
-                form_encode(&credentials.client_id),
+                "&client_assertion_type={}&client_assertion={assertion}",
                 form_encode(ASSERTION_TYPE)
             ));
+            post_form(agent, &token_endpoint, body, &credentials.client_id, None)?
         }
-        None => {
-            let basic = base64(
-                format!("{}:{}", form_encode(&credentials.client_id), form_encode(&credentials.client_secret))
-                    .as_bytes(),
-            );
+        None => post_form(agent, &token_endpoint, body, &credentials.client_id, Some(&credentials.client_secret))?,
+    };
+    access_token(&reply, &token_endpoint)
+}
+
+/// Reads the metadata of the Authorization Server whose issuer or metadata URL is
+/// `server`: its token endpoint, which it must give, and the whole of it. A server that
+/// lists the grants it offers without `grant` is refused.
+fn discover(agent: &Agent, server: &str, grant: &str) -> Result<(String, Value), Error> {
+    let url = metadata_url(server)?;
+    if !may_send_to(&url) {
+        return Err(error(format!("{url}: tokens are asked for over https:// only, or on this machine")));
+    }
+    let metadata = get_json(agent, &url)?;
+    let found = metadata
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error(format!("{url}: no token_endpoint in the server's metadata")))?
+        .to_string();
+    let grants = metadata.get("grant_types_supported").and_then(Value::as_array);
+    if grants.is_some_and(|g| !g.iter().any(|g| g.as_str() == Some(grant))) {
+        return Err(error(format!("{url}: the server does not offer the {grant} grant")));
+    }
+    Ok((found, metadata))
+}
+
+/// Posts a token request to `endpoint` (RFC 6749 §3.2) for the client `client_id`: with
+/// its secret by HTTP Basic (`client_secret_basic`), or without one, with its id in the
+/// form, as a public client, or one whose form carries an assertion, sends it. The
+/// server's answer, when it is HTTP 200.
+fn post_form(
+    agent: &Agent,
+    endpoint: &str,
+    mut body: String,
+    client_id: &str,
+    secret: Option<&str>,
+) -> Result<Value, Error> {
+    if !may_send_to(endpoint) {
+        return Err(error(format!("{endpoint}: secrets are sent over https:// only, or on this machine")));
+    }
+    let mut post = agent
+        .post(endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json");
+    match secret {
+        Some(secret) => {
+            let basic = base64(format!("{}:{}", form_encode(client_id), form_encode(secret)).as_bytes());
             post = post.header("Authorization", format!("Basic {basic}"));
         }
+        None => body.push_str(&format!("&client_id={}", form_encode(client_id))),
     }
-    let mut response = post.send(body).map_err(|e| error(format!("{token_endpoint}: {e}")))?;
+    let mut response = post.send(body).map_err(|e| error(format!("{endpoint}: {e}")))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .with_config()
         .limit(LIMIT)
         .read_to_string()
-        .map_err(|e| error(format!("{token_endpoint}: reading the response: {e}")))?;
+        .map_err(|e| error(format!("{endpoint}: reading the response: {e}")))?;
     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if status != 200 {
         // RFC 6749 §5.2: `error`, and perhaps `error_description`.
@@ -328,19 +574,63 @@ fn request(
             .collect::<Vec<_>>()
             .join(": ");
         let why = if why.is_empty() { String::new() } else { format!(": {why}") };
-        return Err(error(format!("{token_endpoint}: HTTP {status}{why}")));
+        return Err(error(format!("{endpoint}: HTTP {status}{why}")));
     }
+    Ok(reply)
+}
+
+/// The bearer token in a token endpoint's answer (RFC 6749 §5.1), and how long it lasts.
+fn access_token(reply: &Value, endpoint: &str) -> Result<(String, Option<Duration>), Error> {
     let value = reply
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty() && !t.contains(char::is_whitespace))
-        .ok_or_else(|| error(format!("{token_endpoint}: no access_token in the response")))?;
+        .ok_or_else(|| error(format!("{endpoint}: no access_token in the response")))?;
     let kind = reply.get("token_type").and_then(Value::as_str).unwrap_or_default();
     if !kind.eq_ignore_ascii_case("bearer") {
-        return Err(error(format!("{token_endpoint}: a {kind:?} token, not a bearer token")));
+        return Err(error(format!("{endpoint}: a {kind:?} token, not a bearer token")));
     }
     let lifetime = reply.get("expires_in").and_then(Value::as_f64).filter(|s| *s > 0.0).map(Duration::from_secs_f64);
     Ok((value.to_string(), lifetime))
+}
+
+/// Keeps a new token, to be renewed half way to expiring, as IS-10 recommends, and at
+/// least 15 seconds early.
+fn keep(held: &mut Held, now: Instant, value: String, lifetime: Option<Duration>) -> String {
+    held.renew = lifetime.map(|l| now + (l / 2).min(l.saturating_sub(Duration::from_secs(15))));
+    held.expires = lifetime.map(|l| now + l);
+    held.value = Some(value.clone());
+    value
+}
+
+/// The PKCE `code_challenge` for a verifier by the `S256` method (RFC 7636 §4.2): the
+/// base64url of its SHA-256.
+pub fn pkce_challenge(verifier: &str) -> String {
+    base64url(digest(&SHA256, verifier.as_bytes()).as_ref())
+}
+
+/// The address that asks the authorization endpoint for a code (RFC 6749 §4.1.1, RFC
+/// 7636 §4.3), keeping any query the endpoint has of its own (RFC 6749 §3.1).
+fn authorize_url(endpoint: &str, sign_in: &SignIn, redirect_uri: &str, state: &str, challenge: &str) -> String {
+    let join = if endpoint.contains('?') { '&' } else { '?' };
+    format!(
+        "{endpoint}{join}response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        form_encode(&sign_in.client_id),
+        form_encode(redirect_uri),
+        form_encode(&sign_in.scope),
+        form_encode(state),
+        form_encode(challenge)
+    )
+}
+
+/// The `sub` of an access token that is a JWT, read without checking it.
+fn subject(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let (Some(_), Some(claims), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    let claims: Value = serde_json::from_slice(&base64url_decode(claims)?).ok()?;
+    claims.get("sub").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// The agent every request to an Authorization Server is made with: no redirects, the
@@ -835,5 +1125,67 @@ mod key_tests {
         let mut tampered = assertion.clone();
         tampered.insert(assertion.find('.').unwrap() + 2, 'A');
         assert!(verify_assertion(&tampered, &jwks, "client-1", token).is_err(), "tampered");
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+
+    fn sign_in() -> SignIn {
+        SignIn {
+            server: "https://auth.example/".into(),
+            client_id: "st2110 router".into(),
+            client_secret: None,
+            scope: SCOPES.into(),
+        }
+    }
+
+    #[test]
+    fn makes_the_s256_challenge() {
+        // RFC 7636 Appendix B.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn asks_the_authorization_endpoint_for_a_code() {
+        let url = authorize_url(
+            "https://auth.example/authorize",
+            &sign_in(),
+            "http://127.0.0.1:8110/auth/callback",
+            "abc",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        );
+        assert_eq!(
+            url,
+            "https://auth.example/authorize?response_type=code&client_id=st2110+router\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8110%2Fauth%2Fcallback&scope=query+connection&state=abc\
+             &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
+        );
+        // An endpoint's own query is kept.
+        let url = authorize_url("https://auth.example/a?tenant=1", &sign_in(), "http://localhost/cb", "s", "c");
+        assert!(url.starts_with("https://auth.example/a?tenant=1&response_type=code&"), "{url}");
+    }
+
+    #[test]
+    fn has_no_token_until_someone_signs_in() {
+        let token = Token::sign_in(sign_in(), Duration::from_secs(1), false);
+        assert!(token.signs_in());
+        assert_eq!(token.signed_in(), None);
+        assert!(token.bearer().unwrap_err().message.contains("sign in"));
+        assert!(token.finish_sign_in("never-begun", "code").is_err());
+        assert!(token.renewable());
+        assert!(!Token::fixed("t").signs_in());
+    }
+
+    #[test]
+    fn reads_who_a_jwt_is_for() {
+        let claims = base64url(br#"{"sub":"colm","scope":"query"}"#);
+        assert_eq!(subject(&format!("e30.{claims}.sig")).as_deref(), Some("colm"));
+        assert_eq!(subject("opaque"), None);
+        assert_eq!(subject("a.b.c.d"), None);
     }
 }

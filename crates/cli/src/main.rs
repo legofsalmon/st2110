@@ -286,6 +286,14 @@ enum Command {
         /// be able to read it.
         #[arg(long, requires = "register")]
         private_key_jwt: bool,
+        /// Get tokens by having a person sign in on the page, in their browser, with the
+        /// Authorization Code grant and PKCE, as the client --client-id, which the
+        /// Authorization Server has registered for it with the redirect URI
+        /// http://<the page's address>/auth/callback. A confidential client's secret goes
+        /// in --client-secret-file or ST2110_CLIENT_SECRET; a public client needs none.
+        /// With --demo-auth, the demo's own sign-in client.
+        #[arg(long, conflicts_with_all = ["token_file", "register"])]
+        sign_in: bool,
         /// The file the router keeps its connection log in, and the demo facility its
         /// connections, so that they are there again after a restart. A file in this
         /// user's application data when omitted.
@@ -588,6 +596,7 @@ fn main() -> ExitCode {
             auth,
             demo_auth,
             private_key_jwt,
+            sign_in,
             state,
             no_state,
         } => {
@@ -613,6 +622,7 @@ fn main() -> ExitCode {
                 auth,
                 demo_auth,
                 private_key_jwt,
+                sign_in,
                 state,
             };
             router::run(&args)
