@@ -440,6 +440,9 @@ fn a_clean_facility_on_ptp_time() {
     assert_eq!(levels, (Some(0), Some(1.0), Some(0), Some(1.0), Some(0)));
     let margin = vrx.frame_margin_us.unwrap();
     assert!(close(margin.min, 20.0) && close(margin.max, 20.0) && margin.count == 50, "{margin:?}");
+    // By residence time, 20 µs is 1/24 of the 480 µs between reads (TRS).
+    let residence = vrx.residence.unwrap();
+    assert!(close(residence.min, 20.0 / 480.0) && close(residence.max, 20.0 / 480.0), "{residence:?}");
     assert_eq!(video.windows.len(), 1);
     assert_eq!((video.windows[0].vrx_min, video.windows[0].vrx_average), (Some(0), Some(1.0)));
     assert_eq!(video.windows[0].second, i64::try_from(NOON).unwrap());
@@ -978,6 +981,19 @@ fn interlaced_jpeg_xs_stamps_each_field() {
     let report = with_interlaced_jpeg_xs(true);
     assert_eq!(rules(&report), ["marker-bit", "jxs-payload-header"]);
     assert!(finding(&report, "jxs-payload-header").message.contains("L (1) and M (0)"));
+}
+
+#[test]
+fn jpeg_xs_packets_follow_the_signalled_packetmode() {
+    let mut scene = Scene::default();
+    send_jpeg_xs(&mut scene, |_| 30, |_| 700);
+    let mut sdp = jpeg_xs_at_rate();
+    sdp.text = sdp.text.replace("packetmode=0", "packetmode=1");
+    let report = scene.analyse(&[sdp]);
+    assert!(rules(&report).contains(&"jxs-payload-header"), "{:?}", rules(&report));
+    assert!(
+        finding(&report, "jxs-payload-header").message.ends_with("the first: K=0 but the SDP file says packetmode=1")
+    );
 }
 
 #[test]

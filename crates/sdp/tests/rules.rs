@@ -123,6 +123,10 @@ fn cases() -> Vec<(&'static str, String)> {
             with_first(with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI"), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500"),
         ),
         (
+            "multistream-phased-troff",
+            with_first(with(VIDEO, "a=group:DUP", "a=group:PHASED"), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500"),
+        ),
+        (
             "multistream-dup",
             with(VIDEO, "a=group:DUP primary secondary", "a=group:PHASED primary secondary\na=group:DUP primary"),
         ),
@@ -154,6 +158,7 @@ fn cases() -> Vec<(&'static str, String)> {
         ("cbr-bandwidth", with(JPEG_XS, "b=AS:116000\n", "")),
         ("jxsv-tr08", with(JPEG_XS, "packetmode=0", "packetmode=1")),
         ("jxsv-profile", with(JPEG_XS, "level=2k-1", "level=3k-1")),
+        ("jxsv-bpp", with(JPEG_XS, "b=AS:116000", "b=AS:400000")),
         // ST 2110-30 and -31.
         ("audio-rate", with(AUDIO, "L24/48000/8", "L24/32000/8")),
         ("audio-ptime-missing", with(AUDIO, "a=ptime:1\n", "")),
@@ -314,8 +319,8 @@ fn valid_variations_raise_nothing() {
         with(VIDEO, "08-00-11-FF-FE-21-E1-B0:127", "traceable"),
         // The default read offset for 1080i59.94 is 652.5 µs.
         with(VIDEO, "exactframerate=50", "exactframerate=30000/1001; interlace; TROFF=652"),
-        // Any TROFF on 525- and 625-line video, whose defaults are misprinted.
-        with(sd("width=720; height=486", Some("10:11")), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500"),
+        // 525-line video at the ST 2110-21:2017 default, 20/525 of a frame: 1271.1 µs.
+        with(sd("width=720; height=486", Some("10:11")), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=1271"),
         // Phases of a high frame rate camera, each with the same format.
         with(VIDEO, "a=group:DUP", "a=group:PHASED"),
         // JPEG XS at a TR-08 profile, level and sublevel, in lower case.
@@ -399,6 +404,10 @@ fn messages_suggest_the_fix() {
     assert!(message(&offset, "troff-nondefault").contains("default of 764 µs"));
     let interlaced = with(VIDEO, "exactframerate=50", "exactframerate=25; interlace; TROFF=500");
     assert!(message(&interlaced, "troff-nondefault").contains("default of 782 µs for 1080-line interlaced video"));
+    // ST 2110-21:2022 misprints the 525- and 625-line defaults; the 2017 ones stand.
+    let pal = with(VIDEO, "exactframerate=50", "exactframerate=25; interlace; TROFF=500");
+    let pal = with(with(&pal, "width=1920", "width=720"), "height=1080", "height=576");
+    assert!(message(&pal, "troff-nondefault").contains("default of 1664 µs for 576-line interlaced video"), "{pal}");
     // A 2SI part that writes out the default read offset reads from the same offset as one
     // that leaves it out.
     let split = with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI");

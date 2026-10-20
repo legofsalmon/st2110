@@ -200,16 +200,24 @@ pub fn tro_default_progressive(height: u32, frame_rate: Rational) -> f64 {
     if height >= 1080 { 43.0 / 1125.0 * frame } else { 28.0 / 750.0 * frame }
 }
 
-/// The ST 2110-21 default read offset for interlaced and PsF video of the 1125-line
-/// systems, in seconds: Int((1125 − height) ÷ 2) ÷ 1125 of a frame (§6.3.3 Table 1),
-/// 22/1125 at 1080 lines. `None` at 608 lines and fewer, the 525- and 625-line systems,
-/// whose Table 1 entries are misprinted in ST 2110-21:2022.
+/// The ST 2110-21 default read offset for interlaced and PsF video, in seconds.
+///
+/// For the 1125-line systems it is Int((1125 − height) ÷ 2) ÷ 1125 of a frame (§6.3.3
+/// Table 1), 22/1125 at 1080 lines. ST 2110-21:2022 Table 1 misprints the entries of
+/// the 525- and 625-line systems, so for them this takes the values ST 2110-21:2017
+/// gave and RP 2110-24 carries: 20/525 of a frame for 525 lines at 30000/1001 (up to
+/// 512 lines, with Extended Window Mode) and 26/625 for 625 lines at 25 (up to 608).
+/// `None` for other heights and rates.
 pub fn tro_default_interlaced(height: u32, frame_rate: Rational) -> Option<f64> {
-    if height <= 608 || height >= 1125 {
-        return None;
+    let frame = 1.0 / frame_rate.to_f64();
+    let rate = (frame_rate.numerator(), frame_rate.denominator());
+    match height {
+        0 => None,
+        ..=512 if rate == (30_000, 1001) => Some(20.0 / 525.0 * frame),
+        ..=608 if rate == (25, 1) => Some(26.0 / 625.0 * frame),
+        ..=608 | 1125.. => None,
+        _ => Some(f64::from((1125 - height) / 2) / 1125.0 * frame),
     }
-    let lines = (1125 - height) / 2;
-    Some(f64::from(lines) / 1125.0 / frame_rate.to_f64())
 }
 
 #[cfg(test)]
@@ -248,6 +256,10 @@ mod tests {
         // 1080i59.94: 22/1125 of 33.367 ms.
         let tro = tro_default_interlaced(1080, Rational::new(30000, 1001).unwrap()).unwrap() * 1e6;
         assert!((tro - 652.5).abs() < 0.05, "{tro}");
-        assert_eq!(tro_default_interlaced(486, Rational::new(30000, 1001).unwrap()), None);
+        let ntsc = tro_default_interlaced(486, Rational::new(30000, 1001).unwrap()).unwrap() * 1e6;
+        assert!((ntsc - 20.0 / 525.0 * 1001.0 / 30.0 * 1000.0).abs() < 1e-6, "{ntsc}");
+        let pal = tro_default_interlaced(576, Rational::new(25, 1).unwrap()).unwrap() * 1e6;
+        assert!((pal - 1664.0).abs() < 1e-6, "{pal}");
+        assert_eq!(tro_default_interlaced(576, Rational::new(30000, 1001).unwrap()), None);
     }
 }

@@ -96,6 +96,8 @@ pub(crate) struct VideoConfig {
     pub maxudp: Option<u32>,
     /// The `b=AS` of compressed video, in kilobits a second.
     pub bandwidth_kbps: Option<u64>,
+    /// JPEG XS `packetmode`: whether the SDP file says slice mode (K=1).
+    pub slice_mode: Option<bool>,
     /// Whether to keep each unit's first arrival and timestamp, for comparing the
     /// streams of a multi-stream group.
     pub keep_starts: bool,
@@ -318,6 +320,10 @@ impl VideoEngine {
                 u8::from(first.0),
                 u8::from(first.1)
             ))
+        } else if let Some(signalled) = self.config.slice_mode
+            && signalled != j.slice_mode
+        {
+            Some(format!("K={} but the SDP file says packetmode={}", u8::from(j.slice_mode), u8::from(signalled)))
         } else if !j.sequential && !j.slice_mode {
             Some("T=0 (out of order) with K=0: out-of-order sending needs slice mode, K=1".to_string())
         } else if !j.slice_mode && j.last != a.marker {
@@ -1159,6 +1165,8 @@ struct Vrx {
     gap_min: Option<u64>,
     /// TROFFSET − FPT for each frame whose first packet arrived (RP 2110-25 §4.8.6).
     frame_margin: Accumulator,
+    /// Each packet's read less its arrival, in read intervals (RP 2110-25 Annex A).
+    residence: Accumulator,
 }
 
 /// One second of the virtual receiver buffer.
@@ -1213,6 +1221,7 @@ impl Vrx {
             steady_average: Accumulator::default(),
             gap_min: None,
             frame_margin: Accumulator::default(),
+            residence: Accumulator::default(),
         }
     }
 
@@ -1231,6 +1240,7 @@ impl Vrx {
         let read = self.schedule.read(n, i128::from(j));
         let margin = (read - now) as f64 / self.schedule.scale as f64 / 1000.0;
         self.margin.add(margin);
+        self.residence.add((read - now) as f64 / self.schedule.step as f64);
         if j == 0 {
             self.frame_margin.add(margin);
         }
@@ -1283,7 +1293,9 @@ impl Vrx {
             overflows: self.overflow.count,
             margin_us: self.margin.stats(),
             frame_margin_us: self.frame_margin.stats(),
-            method: "event history, each packet read at its own time, over the whole capture and in each frame's steady state"
+            residence: self.residence.stats(),
+            method: "event history, each packet read at its own time, over the whole capture and in each frame's steady state; \
+                     and residence time, each packet's read less its arrival in read intervals"
                 .to_string(),
         }
     }
