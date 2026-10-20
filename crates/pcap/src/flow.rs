@@ -145,6 +145,11 @@ impl SdpStream {
                     cmax: number("CMAX"),
                     maxudp: number("MAXUDP"),
                     keep_starts: false,
+                    slice_mode: match value(params, "packetmode").map(str::trim) {
+                        Some("0") => Some(false),
+                        Some("1") => Some(true),
+                        _ => None,
+                    },
                     bandwidth_kbps: sdp
                         .media
                         .get(stream.index)

@@ -306,9 +306,9 @@ fn interlace(m: &Media<'_>, line: usize, picture: &Picture, d: &mut Diagnostics)
     }
 }
 
-/// Type N receivers only have to accept the default read offset (ST 2110-21 §7.2).
-/// Interlaced and PsF video is checked in the 1125-line systems only: ST 2110-21:2022
-/// Table 1 misprints the defaults for 525 and 625 lines.
+/// Type N receivers only have to accept the default read offset (ST 2110-21 §7.2). For
+/// interlaced 525- and 625-line video, whose ST 2110-21:2022 Table 1 entries are
+/// misprinted, the default is the one ST 2110-21:2017 gave.
 fn read_offset(m: &Media<'_>, line: usize, fmtp: &Fmtp, picture: &Picture, d: &mut Diagnostics) {
     let (Some(troff), Some(height), Some(rate)) = (fmtp.value("TROFF").and_then(digits), picture.height, picture.rate)
     else {

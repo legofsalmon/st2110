@@ -166,6 +166,8 @@ rules! {
         "The streams of a multi-stream group share one format: sampling, depth, size, frame rate, scan and colour.";
     MULTISTREAM_TROFF = "multistream-troff", Error, "RP 2110-23:2019 §5.5",
         "The streams of a `MULTI-2SI` or `MULTI-SD` group share one `TROFF`.";
+    MULTISTREAM_PHASED_TROFF = "multistream-phased-troff", Warning, "RP 2110-23:2019 §5.5",
+        "The phases of a `PHASED` group should share one `TROFF`; only their timestamps differ.";
     MULTISTREAM_DUP = "multistream-dup", Error, "RP 2110-23:2019 §5.4",
         "Either every stream of a multi-stream group has an ST 2022-7 `DUP` partner, or none does.";
     FID_ANC = "fid-anc", Error, "ST 2110-40:2023 §7",
@@ -201,13 +203,15 @@ rules! {
     SHAPING_PARAM = "shaping-param", Error, "ST 2110-21:2022 §8",
         "`TROFF` is a positive whole number of microseconds, and `CMAX` a positive whole number of packets.";
     TROFF_NONDEFAULT = "troff-nondefault", Warning, "ST 2110-21:2022 §6.3, §7.2",
-        "A non-default `TROFF` (checked for progressive video, and for 1125-line interlaced and PsF video): Type N receivers are only required to accept the default.";
+        "A non-default `TROFF`: Type N receivers are only required to accept the default. For interlaced 525- and 625-line video, whose ST 2110-21:2022 Table 1 entries are misprinted, the default is the ST 2110-21:2017 one: 20/525 and 26/625 of a frame.";
 
     // ST 2110-22 compressed video.
     CBR_BANDWIDTH = "cbr-bandwidth", Error, "ST 2110-22:2022 §7",
         "Compressed video carries `b=AS:<kbit/s>` in its media section.";
     JXSV_TR08 = "jxsv-tr08", Warning, "VSF TR-08:2026 §8.1.2",
         "JPEG XS in ST 2110-22 uses codestream mode (`packetmode=0`).";
+    JXSV_BITS = "jxsv-bpp", Warning, "VSF TR-08:2026 §8.1.1",
+        "JPEG XS `b=AS` stays within the bits a pixel its sublevel allows, and within 4 at most, allowing 5% for packet headers.";
     JXSV_PROFILE = "jxsv-profile", Warning, "VSF TR-08:2026 §8.1.1",
         "JPEG XS uses a profile, level, sublevel and depth that TR-08 allows: `High444.12`, `TDC444.12` or, for 4:2:0, `High420.12`; levels `1k-1`, `2k-1`, `4k-2` and `8k-2`; `Sublev2bpp` to `Sublev4bpp`; 8, 10 or 12 bits.";
 

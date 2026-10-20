@@ -23,6 +23,9 @@ const NAMES: Names<'static> = Names {
         "profile",
         "level",
         "sublevel",
+        // The successor to RFC 9134 (draft-ietf-avtcore-rtp-jpegxs-3ed), which TR-08:2026
+        // follows for its FBB levels.
+        "fbblevel",
         "depth",
         "sampling",
         "colorimetry",
@@ -130,6 +133,42 @@ fn jpeg_xs(m: &Media<'_>, line: usize, fmtp: &Fmtp, d: &mut Diagnostics) {
         d.report(&rules::PARAM_VALUE, m.index, line, format!("transmode={value} is not 0 or 1")).cite("RFC 9134");
     }
     tr08_profile(m, line, fmtp, d);
+    tr08_rate(m, line, fmtp, d);
+}
+
+/// Packet headers add a few per cent to the coded rate at the sizes ST 2110-22 uses.
+const HEADROOM: f64 = 1.05;
+
+/// VSF TR-08:2026 §8.1.1 codes at most 4 bits a pixel, and a sublevel caps it lower:
+/// `b=AS`, which counts whole IP packets, says how many the stream spends.
+fn tr08_rate(m: &Media<'_>, line: usize, fmtp: &Fmtp, d: &mut Diagnostics) {
+    let number = |name: &str| fmtp.value(name).and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| *n > 0);
+    let (Some(kbps), Some(width), Some(height), Some(rate)) = (
+        average_bandwidth(m),
+        number("width"),
+        number("height"),
+        fmtp.value("exactframerate").and_then(super::read_frame_rate),
+    ) else {
+        return;
+    };
+    let (cap, by) = match fmtp.value("sublevel").map(str::to_ascii_lowercase).as_deref() {
+        Some("sublev2bpp") => (2.0, "sublevel=Sublev2bpp"),
+        Some("sublev3bpp") => (3.0, "sublevel=Sublev3bpp"),
+        _ => (4.0, "TR-08"),
+    };
+    let pixels = f64::from(width) * f64::from(height) * rate.to_f64();
+    let bits = kbps as f64 * 1000.0 / pixels;
+    if bits > cap * HEADROOM {
+        d.report(
+            &rules::JXSV_BITS,
+            m.index,
+            line,
+            format!(
+                "b=AS:{kbps} is {bits:.1} bits a pixel at {width}x{height} and {} fps, but {by} codes at most {cap:.0}, with a few per cent more for packet headers",
+                super::fps(rate)
+            ),
+        );
+    }
 }
 
 /// The profiles, levels, sublevels and depths that VSF TR-08:2026 §8.1.1 allows, as

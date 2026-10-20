@@ -56,7 +56,7 @@ rules! {
     FRAME_PACKETS = "frame-packets", Error, "ST 2110-22:2022 §4",
         "Compressed video sends the same number of packets for every frame.";
     JXS_PAYLOAD_HEADER = "jxs-payload-header", Error, "RFC 9134 §4.3",
-        "JPEG XS payload headers keep T and K for the whole stream, set L with M (and equal to it in codestream mode), use no reserved I value, and mark fields only in interlaced video.";
+        "JPEG XS payload headers keep T and K for the whole stream, with K as `packetmode` says, set L with M (and equal to it in codestream mode), use no reserved I value, and mark fields only in interlaced video.";
 
     // Ancillary data.
     ANC_KEEPALIVE = "anc-keepalive", Error, "ST 2110-40:2023 §5.5",

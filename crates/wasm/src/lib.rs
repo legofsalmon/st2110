@@ -596,6 +596,8 @@ export interface VrxReport {
   margin_us: Stats | null;
   /** Margin (RP 2110-25 §4.8.6): from each frame's first packet to its first read. */
   frame_margin_us: Stats | null;
+  /** RP 2110-25 Annex A residence time: each packet's read less its arrival, in read intervals. */
+  residence: Stats | null;
   method: string;
 }
 

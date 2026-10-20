@@ -279,20 +279,19 @@ fn constituents(
             );
             continue;
         }
-        if split && !same_read_offset(first, other) {
+        if !same_read_offset(first, other) {
             let show =
                 |m: &Media<'_>| m.value("TROFF").map_or("the default TROFF".to_string(), |v| format!("TROFF={v}"));
+            let (rule, reads) = if split {
+                (&rules::MULTISTREAM_TROFF, format!("the parts of a {semantics} picture are read from one offset"))
+            } else {
+                (&rules::MULTISTREAM_PHASED_TROFF, "the phases of a PHASED group should be read from one offset".into())
+            };
             d.report(
-                &rules::MULTISTREAM_TROFF,
+                rule,
                 other.index,
                 other.line,
-                format!(
-                    "{} has {} and {} has {}; the parts of a {semantics} picture are read from one offset",
-                    mid(other),
-                    show(other),
-                    mid(first),
-                    show(first)
-                ),
+                format!("{} has {} and {} has {}; {}", mid(other), show(other), mid(first), show(first), reads),
             );
         }
     }

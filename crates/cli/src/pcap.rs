@@ -350,6 +350,12 @@ fn describe_vrx(vrx: &VrxReport) -> String {
         Some(margin) => text.push_str(&format!("; packets arrived {:.1} µs or more before their reads", margin.min)),
         None => {}
     }
+    if let Some(residence) = &vrx.residence {
+        text.push_str(&format!(
+            "; by residence time, {:.1} to {:.1} read intervals from arrival to read",
+            residence.min, residence.max
+        ));
+    }
     for (n, what) in [(vrx.underflows, "underflow"), (vrx.overflows, "overflow")] {
         if n > 0 {
             text.push_str(&format!(", {}", count(n, what)));
@@ -510,6 +516,7 @@ mod tests {
             overflows: 1,
             margin_us: Some(stats),
             frame_margin_us: None,
+            residence: None,
             method: String::new(),
         };
         assert_eq!(
@@ -532,6 +539,11 @@ mod tests {
             describe_vrx(&vrx),
             "virtual receiver buffer peaked at 9 of VRXFULL 8, gapped reads from TROFFSET 764.4 µs; \
              packets arrived as much as 12.2 µs after their reads, 3 underflows"
+        );
+        vrx.residence = Some(Stats { count: 2, min: -2.0, max: 5.25, mean: 1.0 });
+        assert!(
+            describe_vrx(&vrx)
+                .ends_with("; by residence time, -2.0 to 5.2 read intervals from arrival to read, 3 underflows")
         );
     }
 }

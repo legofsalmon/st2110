@@ -281,6 +281,10 @@ pub struct VrxReport {
     /// Margin, as RP 2110-25 §4.8.6 defines it: TROFFSET less the first packet time,
     /// from each frame's first packet to its first read, in microseconds.
     pub frame_margin_us: Option<Stats>,
+    /// The buffer level by RP 2110-25 Annex A's residence-time method: each packet's read
+    /// time less its arrival, in read intervals (TRS). Negative for a packet that arrived
+    /// after its read.
+    pub residence: Option<Stats>,
     /// How the buffer was modelled.
     pub method: String,
 }
