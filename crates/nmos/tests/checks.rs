@@ -135,7 +135,53 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("channel-map", with(|v| v["channel_mapping"] = json!({MONITOR: channel_mapping("in9")}))),
         ("system-global", with(|v| v["system"] = system(json!({"heartbeat_interval": 0}), 127))),
         ("system-ptp-domain", with(|v| v["system"] = system(json!({"heartbeat_interval": 5}), 0))),
+        ("ncp-control", with(|v| monitored(v, json!({"error": "connection refused"})))),
+        ("monitor-touchpoint", with(|v| monitored(v, monitors(UNREGISTERED, 1)))),
+        ("monitor-status", with(|v| monitored(v, monitors(VIDEO_RECEIVER, 3)))),
+        ("monitor-activity", with(|v| monitored(v, monitors(VIDEO_RECEIVER, 0)))),
     ]
+}
+
+/// Gives the Monitor Device an IS-12 control endpoint, and what reading it gave.
+fn monitored(value: &mut Value, read: Value) {
+    let href = "ws://192.168.10.31/x-nmos/ncp/v1.0/";
+    value["devices"][1]["controls"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"href": href, "type": "urn:x-nmos:control:ncp/v1.0"}));
+    let mut read = read;
+    read["href"] = json!(href);
+    value["ncp"] = json!({MONITOR: read});
+}
+
+/// A Device model with one Receiver monitor, watching `receiver`, whose overall status
+/// and connection status are `status`.
+fn monitors(receiver: &str, status: u64) -> Value {
+    json!({
+        "root": {"role": "root", "members": [
+            {"role": "DeviceManager", "oid": 2, "classId": [1, 3, 1]},
+            {"role": "ClassManager", "oid": 3, "classId": [1, 3, 2]},
+            {"role": "receiver-monitor", "oid": 4, "classId": [1, 2, 2, 1]},
+        ]},
+        "monitors": [{
+            "role": "receiver-monitor", "oid": 4, "classId": [1, 2, 2, 1],
+            "touchpoints": [{"contextNamespace": "x-nmos", "resource": {"resourceType": "receiver", "id": receiver}}],
+            "properties": {"overallStatus": status, "overallStatusMessage": null, "linkStatus": 1,
+                           "connectionStatus": status, "externalSynchronizationStatus": 0, "streamStatus": status.min(1)},
+            "counters": {"lost": [], "late": []},
+        }],
+    })
+}
+
+#[test]
+fn a_healthy_monitor_is_shown_and_raises_nothing() {
+    let snapshot = with(|v| monitored(v, monitors(VIDEO_RECEIVER, 1)));
+    let report = check(&snapshot);
+    assert_eq!(report.findings, [], "{:#?}", report.findings);
+    let receiver = report.receivers.iter().find(|r| r.id.as_deref() == Some(VIDEO_RECEIVER)).unwrap();
+    assert_eq!(receiver.monitor.as_ref().and_then(|m| m.overall.as_deref()), Some("Healthy"));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["receivers"].as_array().unwrap().iter().filter(|r| r.get("monitor").is_some()).count(), 1);
 }
 
 const MONITOR: &str = "de710002-0000-4000-8000-000000000002";

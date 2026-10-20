@@ -104,6 +104,26 @@ pub(crate) const STREAM_COMPAT: &str = "urn:x-nmos:control:stream-compat/";
 /// The control type an IS-08 Channel Mapping API is advertised under, before its version.
 pub(crate) const CM_CTRL: &str = "urn:x-nmos:control:cm-ctrl/";
 
+/// Whether a URL is a WebSocket's: `ws://` or `wss://`.
+pub(crate) fn is_ws(href: &str) -> bool {
+    let lower = href.trim().to_ascii_lowercase();
+    lower.starts_with("ws://") || lower.starts_with("wss://")
+}
+
+/// The IS-12 control endpoint of a Device: the `href` of its first control of a v1
+/// `urn:x-nmos:control:ncp` type that is a WebSocket's URL.
+pub(crate) fn ncp_href<'a>(device: &Device<'a>) -> Option<&'a str> {
+    let prefix = format!("{}/v1.", crate::ncp::CONTROL_PREFIX);
+    device.controls.iter().flatten().find(|c| c.kind.starts_with(&prefix) && is_ws(c.href)).map(|c| c.href.trim())
+}
+
+/// Each Device with an IS-12 control endpoint, as `(device id, href)`, in the
+/// registry's order.
+pub fn ncp_endpoints(snapshot: &Snapshot) -> Vec<(String, String)> {
+    let model = Model::read(snapshot);
+    model.devices.iter().filter_map(|d| Some((d.core.id?.to_string(), ncp_href(d)?.to_string()))).collect()
+}
+
 /// The APIs of one control type, `prefix` such as `urn:x-nmos:control:sr-ctrl/`, that a
 /// Device advertises, newest v1 version first, each with its versioned base URL: the
 /// `href`, with the version added where it stops short at `path`, such as

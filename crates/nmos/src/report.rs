@@ -141,6 +141,9 @@ pub struct SenderView {
     /// How many IS-11 active constraint sets it has, when they were read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_constraints: Option<usize>,
+    /// What its BCP-008-02 monitor says, when its Device's IS-12 endpoint was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<MonitorView>,
 }
 
 /// A Receiver, as a controller would list it.
@@ -167,6 +170,54 @@ pub struct ReceiverView {
     /// Its IS-11 `status` `state`, such as `compliant_stream`, when it was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<String>,
+    /// What its BCP-008-01 monitor says, when its Device's IS-12 endpoint was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<MonitorView>,
+}
+
+/// What an IS-12 status monitor says of the Receiver or Sender it watches (BCP-008-01
+/// and -02), as a controller shows it: the messages verbatim, as the Device words them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MonitorView {
+    /// Its Device's IS-12 control endpoint.
+    pub href: String,
+    /// Its role in the Device model.
+    pub role: String,
+    /// Its `overallStatus`: `Inactive`, `Healthy`, `PartiallyHealthy` or `Unhealthy`.
+    pub overall: Option<String>,
+    /// Its `overallStatusMessage`.
+    pub overall_message: Option<String>,
+    /// Each domain's status: link, connection or transmission, synchronization, and
+    /// stream or essence.
+    pub domains: Vec<DomainStatus>,
+    /// Its `synchronizationSourceId`.
+    pub synchronization_source: Option<String>,
+    /// Its lost and late packet counters, or its transmission error counters.
+    pub counters: Vec<MonitorCounter>,
+}
+
+/// One domain of a status monitor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DomainStatus {
+    /// `link`, `connection`, `transmission`, `synchronization`, `stream` or `essence`.
+    pub domain: String,
+    /// Its status, such as `Healthy`, `AllUp` or `NotUsed`.
+    pub status: String,
+    /// Why, as the Device says.
+    pub message: Option<String>,
+    /// How often it has become less healthy since the counters were last reset.
+    pub transitions: Option<u64>,
+}
+
+/// A counter a monitor keeps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MonitorCounter {
+    /// Which: `lost`, `late` or `transmission_errors`.
+    pub kind: String,
+    /// The counter's name, as the Device gives it.
+    pub name: String,
+    /// Its value.
+    pub value: u64,
 }
 
 /// A Node's network interface, with what LLDP says of it.
