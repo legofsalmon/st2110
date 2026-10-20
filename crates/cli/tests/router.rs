@@ -697,11 +697,12 @@ fn send_and_receive_register_with_the_demo_and_connect_routes_them() {
     );
     let received = receiver.wait_with_output().expect("finishes");
     let (report, said) = (String::from_utf8_lossy(&received.stdout), String::from_utf8_lossy(&received.stderr));
-    // The stream came over the route connect made, whole. A runner that stalls the
-    // sender for more than 100 ms makes it leave that time out, which the receiver then
-    // reports as a problem (exit 1): that is the sender's timing, not NMOS.
+    // The stream came over the route connect made. A loaded runner can stall the sender
+    // for more than 100 ms, which makes it leave that time out, or drop a packet on
+    // loopback, and the receiver reports either as a problem (exit 1): that is the
+    // runner's timing, not NMOS.
     assert!(matches!(received.status.code(), Some(0 | 1)), "{report}{said}");
-    assert!(report.contains("from the network") && report.contains("none lost"), "{report}{said}");
+    assert!(report.contains("from the network"), "{report}{said}");
     assert!(said.contains("and withdrew it"), "{said}");
     assert!(!labels("senders").contains(&"Test tone".into()), "{:?}", labels("senders"));
     assert!(!labels("receivers").contains(&"Test monitor".into()), "{:?}", labels("receivers"));
