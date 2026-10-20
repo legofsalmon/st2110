@@ -42,6 +42,7 @@ pub fn check(snapshot: &Snapshot) -> Report {
     controls::stream_compat(&model, snapshot, &sender_sdps, &mut findings);
     let channel_maps = controls::channel_maps(&model, snapshot, &mut findings);
     let system = controls::system(&model, snapshot, &sender_sdps, &mut findings);
+    crate::monitors::check(&model, snapshot, &mut findings);
 
     let summary = Summary {
         nodes: model.nodes.len(),
@@ -61,6 +62,7 @@ pub fn check(snapshot: &Snapshot) -> Report {
     let mut receivers: Vec<ReceiverView> = model.receivers.iter().map(|r| receiver_view(&model, r)).collect();
     receivers.sort_by_cached_key(|r| (r.label.to_lowercase(), r.id.clone()));
     controls::compat_views(snapshot, &mut senders, &mut receivers);
+    crate::monitors::views(snapshot, &mut senders, &mut receivers);
     Report {
         source: snapshot.source.clone(),
         api_version: snapshot.api_version.clone(),
@@ -897,6 +899,7 @@ fn sender_view(model: &Model<'_>, sender: &Sender<'_>, sdp: Option<Sdp>) -> Send
         streams: sdp.map(|s| s.report.streams).unwrap_or_default(),
         receivers,
         compat: None,
+        monitor: None,
         active_constraints: None,
     }
 }
@@ -915,6 +918,7 @@ fn receiver_view(model: &Model<'_>, receiver: &Receiver<'_>) -> ReceiverView {
         sender_id: sender_id.map(str::to_string),
         sender_label: sender_id.and_then(|id| model.sender(id)).map(|s| s.core.label.to_string()),
         compat: None,
+        monitor: None,
     }
 }
 

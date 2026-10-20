@@ -60,6 +60,13 @@ pub struct Snapshot {
     /// `active`, each left out when it could not be read.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub channel_mapping: BTreeMap<String, Value>,
+    /// What each Device's IS-12 control endpoint gave, keyed by Device `id`, where it
+    /// advertises one: an object with its `href`, the root block's `root` (its `role`
+    /// and `members`) and each status monitor in `monitors` (its `role`, `oid`,
+    /// `classId`, `touchpoints`, its `properties` by name and its `counters`), or an
+    /// `error` where it could not be read.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ncp: BTreeMap<String, Value>,
     /// What the IS-09 System API returned, when it was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<System>,

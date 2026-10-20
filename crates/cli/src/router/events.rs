@@ -3,7 +3,8 @@
 //!
 //! The page connects to `/api/events`. The router sends it what it last read straight
 //! away, then the registry again whenever it changes (`state`), what has arrived of each
-//! stream being previewed (`live`), and each connection made from any page (`log`).
+//! stream being previewed (`live`), each connection made from any page (`log`), and the
+//! status monitors of the Senders and Receivers ([`super::monitors`], `monitors`).
 //!
 //! To know when the registry changes, the router subscribes to its Query API (IS-04 Query
 //! API: Subscriptions) for each type of resource, and reads the registry again whenever
@@ -12,7 +13,7 @@
 //! read again every 30 seconds too, in case a change went unheard.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -22,7 +23,7 @@ use serde_json::{Value, json};
 use st2110_nmos::ws::{self, Frame};
 
 use super::{Router, live_json, state_json};
-use crate::http::Request;
+use crate::http::{Request, accept};
 
 /// The resources the router subscribes to: everything the page shows.
 const RESOURCES: [&str; 6] = ["/nodes", "/devices", "/sources", "/flows", "/senders", "/receivers"];
@@ -139,31 +140,6 @@ impl Client {
     }
 }
 
-/// Whether a request asks to become a WebSocket.
-pub(crate) fn is_upgrade(request: &Request) -> bool {
-    request.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
-        && request.header("Connection").is_some_and(|c| c.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
-}
-
-/// Answers a WebSocket handshake: `Err` with the status to refuse it with, when it is
-/// not one this server takes.
-pub(crate) fn accept(mut stream: &TcpStream, request: &Request) -> Result<(), (u16, String)> {
-    if request.method != "GET" || !is_upgrade(request) {
-        return Err((400, "not a WebSocket request".into()));
-    }
-    if request.header("Sec-WebSocket-Version") != Some("13") {
-        return Err((426, "WebSocket version 13 only".into()));
-    }
-    let Some(key) = request.header("Sec-WebSocket-Key") else {
-        return Err((400, "no Sec-WebSocket-Key".into()));
-    };
-    let head = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-        ws::accept_key(key)
-    );
-    stream.write_all(head.as_bytes()).and_then(|()| stream.flush()).map_err(|e| (500, e.to_string()))
-}
-
 /// Tells the threads below that something may have changed.
 #[derive(Default)]
 pub(crate) struct Signal {
@@ -218,6 +194,7 @@ pub(crate) fn page(router: &Arc<Router>, stream: &TcpStream, request: &Request) 
     if let Some(known) = known {
         ok = ok && client.send(&Frame::Text(known)).is_ok();
     }
+    ok = ok && client.send(&Frame::Text(router.monitors.message())).is_ok();
     // Read it again for this page, so that what it has is current.
     router.changes.raise();
     if ok {
@@ -267,7 +244,7 @@ fn read_registry(router: &Arc<Router>) {
 
 /// Reads the registry, and sends the pages the result when it differs from what they
 /// have, or just when it was read.
-pub(crate) fn broadcast_state(router: &Router) {
+pub(crate) fn broadcast_state(router: &Arc<Router>) {
     let read = state_json(router);
     let Ok(mut sent) = router.sent.lock() else { return };
     match read {
@@ -286,6 +263,12 @@ pub(crate) fn broadcast_state(router: &Router) {
             }
             sent.message = Some(message);
             sent.error = None;
+            drop(sent);
+            // The status monitors of what was read, followed over IS-12.
+            let last = router.last.lock().ok().and_then(|l| l.clone());
+            if let Some(snapshot) = last {
+                super::monitors::follow_all(router, &snapshot);
+            }
         }
         Err(message) => {
             let error = json!({"type": "error", "message": message}).to_string();

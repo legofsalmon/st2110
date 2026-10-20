@@ -1,6 +1,7 @@
 //! Just enough HTTP/1.1 to serve the router page, its API and the demo facility, and
 //! the Node API and Connection API of `st2110 send --nmos` and `st2110 receive --nmos`:
-//! one request per connection, with limits on what a request may hold.
+//! one request per connection, with limits on what a request may hold, or one that
+//! becomes a WebSocket.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -99,6 +100,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
         423 => "Locked",
+        426 => "Upgrade Required",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
@@ -171,6 +173,31 @@ pub(crate) fn write(mut stream: &TcpStream, response: &Response) -> io::Result<(
     stream.write_all(head.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()
+}
+
+/// Whether a request asks to become a WebSocket.
+pub(crate) fn is_upgrade(request: &Request) -> bool {
+    request.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
+        && request.header("Connection").is_some_and(|c| c.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+}
+
+/// Answers a WebSocket handshake: `Err` with the status to refuse it with, when it is
+/// not one this server takes.
+pub(crate) fn accept(mut stream: &TcpStream, request: &Request) -> Result<(), (u16, String)> {
+    if request.method != "GET" || !is_upgrade(request) {
+        return Err((400, "not a WebSocket request".into()));
+    }
+    if request.header("Sec-WebSocket-Version") != Some("13") {
+        return Err((426, "WebSocket version 13 only".into()));
+    }
+    let Some(key) = request.header("Sec-WebSocket-Key") else {
+        return Err((400, "no Sec-WebSocket-Key".into()));
+    };
+    let head = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        st2110_nmos::ws::accept_key(key)
+    );
+    stream.write_all(head.as_bytes()).and_then(|()| stream.flush()).map_err(|e| (500, e.to_string()))
 }
 
 #[cfg(test)]
