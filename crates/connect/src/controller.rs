@@ -479,6 +479,41 @@ pub fn connect(
     Ok(Outcome { activation: activation.to_json(), connections: jobs.into_iter().map(|j| j.report).collect() })
 }
 
+/// Adds the rest of each Receiver's BCP-002-01 natural group to `routes`, so that a
+/// group, such as a monitor's video and audio, takes a Sender's group, such as a
+/// camera's, as one: each other Receiver of the group takes the Sender of the other
+/// group that [`st2110_nmos::groups::companions`] pairs it with, or is disconnected
+/// with it. A Receiver `routes` already names keeps what it was given there.
+///
+/// Also returns, for each Receiver of a group left as it is, why. Fails when a name
+/// finds no Sender or Receiver, or more than one.
+pub fn with_groups(snapshot: &Snapshot, routes: &[Route]) -> Result<(Vec<Route>, Vec<String>), String> {
+    let mut named: Vec<String> = Vec::with_capacity(routes.len());
+    for route in routes {
+        named.push(routing::find(snapshot, Kind::Receiver, &route.receiver)?.id);
+    }
+    let mut all = routes.to_vec();
+    let mut left = Vec::new();
+    for (route, receiver) in routes.iter().zip(named.clone()) {
+        let sender = match &route.take {
+            Take::Sender(name) => Some(routing::find(snapshot, Kind::Sender, name)?.id),
+            Take::Nothing => None,
+            Take::Sdp { .. } => continue,
+        };
+        let companions = st2110_nmos::groups::companions(snapshot, &receiver, sender.as_deref());
+        left.extend(companions.left);
+        for (other, take) in companions.routes {
+            if named.iter().any(|id| id.eq_ignore_ascii_case(&other.id)) {
+                continue;
+            }
+            named.push(other.id.clone());
+            let take = take.map_or(Take::Nothing, |s| Take::Sender(s.id));
+            all.push(Route { receiver: other.id, take });
+        }
+    }
+    Ok((all, left))
+}
+
 /// A Receiver's scheduled activation, cancelled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Cancelled {

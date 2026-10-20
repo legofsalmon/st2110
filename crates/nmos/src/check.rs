@@ -31,6 +31,8 @@ pub fn check(snapshot: &Snapshot) -> Report {
     subscriptions(&model, &sdps, &mut findings);
     active(&model, snapshot, &mut findings);
     connections(&model, &sdps, &mut findings);
+    crate::groups::check_groups(&model, snapshot, &mut findings);
+    crate::groups::check_assets(&model, snapshot, &mut findings);
 
     let summary = Summary {
         nodes: model.nodes.len(),

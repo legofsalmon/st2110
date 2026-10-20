@@ -68,6 +68,26 @@ fn core(id: &str, label: &str) -> Value {
     json!({"id": id, "version": "1790510437:0", "label": label, "description": label, "tags": {}})
 }
 
+/// A Sender's or Receiver's BCP-002-01 natural group and its role there.
+fn grouphint(group: &str, role: &str) -> Value {
+    json!({"tags": {st2110_nmos::groups::GROUPHINT: [format!("{group}:{role}")]}})
+}
+
+/// A Node's or Device's BCP-002-02 asset tags: what the box is and which one, and
+/// for a Device, what it does.
+fn asset(label: &str, n: u32, device: bool) -> Value {
+    let function = label.split(' ').next().unwrap_or(label);
+    let mut tags = json!({
+        "urn:x-nmos:tag:asset:manufacturer/v1.0": ["st2110 demo"],
+        "urn:x-nmos:tag:asset:product/v1.0": [format!("Demo {function}")],
+        "urn:x-nmos:tag:asset:instance-id/v1.0": [format!("DEMO-{n:04}")],
+    });
+    if device {
+        tags["urn:x-nmos:tag:asset:function/v1.0"] = json!([function]);
+    }
+    json!({"tags": tags})
+}
+
 fn merge(mut base: Value, more: Value) -> Value {
     if let (Some(base), Value::Object(more)) = (base.as_object_mut(), more) {
         base.extend(more);
@@ -427,7 +447,7 @@ impl Facility {
             })
             .collect();
         self.registry.get_mut("nodes").expect("nodes").push(merge(
-            core(&node_id, label),
+            merge(core(&node_id, label), asset(label, n, false)),
             json!({
                 "href": format!("http://{host}/"), "hostname": hostname,
                 "api": {"versions": ["v1.3"], "endpoints": [{"host": host, "port": 80, "protocol": "http"}]},
@@ -438,7 +458,7 @@ impl Facility {
             }),
         ));
         self.registry.get_mut("devices").expect("devices").push(merge(
-            core(&device_id, label),
+            merge(core(&device_id, label), asset(label, n, true)),
             json!({
                 "type": "urn:x-nmos:device:generic", "node_id": node_id, "senders": [], "receivers": [],
                 "controls": [{"href": format!("{base}/node/{n}/x-nmos/connection/v1.1/"), "type": "urn:x-nmos:control:sr-ctrl/v1.1"}],
@@ -499,6 +519,12 @@ impl Facility {
                 // sender model allows; its SDP says the same.
                 sender["st2110_21_sender_type"] = json!("2110TPW");
             }
+            // A camera's video and audio are one natural group, as BCP-002-01 has a
+            // Node say; the graphics Node says nothing, as many do not.
+            if !label.starts_with("Graphics") {
+                let role = if matches!(s.description.media, Media::Video(_)) { "Video" } else { "Audio 1" };
+                sender = merge(sender, grouphint(label, role));
+            }
             self.registry.get_mut("senders").expect("senders").push(sender);
             self.senders.insert(sender_id.clone(), sender_resources(&s.description.legs, s.enabled));
             let live = Arc::new(Live::new(None));
@@ -544,8 +570,9 @@ impl Facility {
             let bindings: Vec<String> = (0..interfaces.len()).map(|i| format!("eth{i}")).collect();
             // Monitor 3's video takes the PTZ camera's unicast too.
             let transport = if monitor == 3 && format == VIDEO { RTP } else { MCAST };
+            let role = if format == VIDEO { "Video" } else { "Audio 1" };
             self.registry.get_mut("receivers").expect("receivers").push(merge(
-                core(&receiver_id, &label),
+                merge(core(&receiver_id, &label), grouphint(&format!("Monitor {monitor}"), role)),
                 json!({
                     "device_id": device_id, "transport": transport, "interface_bindings": bindings,
                     "subscription": {"sender_id": null, "active": false}, "format": format, "caps": caps,

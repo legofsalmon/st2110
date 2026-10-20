@@ -149,7 +149,7 @@ fn endpoint(model: &Model<'_>, core: &Core<'_>, device_id: Option<&str>) -> Endp
     }
 }
 
-fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
+pub(crate) fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
     let (flow, source) = model.flow_of(sender);
     Endpoint {
         transport: sender.transport.map(str::to_string),
@@ -161,7 +161,7 @@ fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
     }
 }
 
-fn receiver_endpoint(model: &Model<'_>, receiver: &Receiver<'_>) -> Endpoint {
+pub(crate) fn receiver_endpoint(model: &Model<'_>, receiver: &Receiver<'_>) -> Endpoint {
     Endpoint {
         transport: receiver.transport.map(str::to_string),
         format: receiver.format.map(str::to_string),

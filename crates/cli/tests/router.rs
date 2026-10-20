@@ -178,6 +178,55 @@ fn takes_one_route_and_a_salvo() {
     assert_eq!(taking(&routes, "MON 2 video"), None);
 }
 
+/// With `group`, a monitor's audio follows its video from the camera's group
+/// (BCP-002-01), and disconnects with it; what of a group is left as it is, says why.
+#[test]
+fn takes_a_monitors_group_from_a_cameras() {
+    let router = Router::start();
+    let state = router.get("/api/state");
+    let mon3 = state["receivers"].as_array().unwrap().iter().find(|r| r["label"] == "MON 3 audio").unwrap();
+    assert_eq!((&mon3["group"]["name"], &mon3["group"]["role"]), (&json!("Monitor 3"), &json!("Audio 1")));
+    let (status, grouped) = router
+        .post("/api/take", &json!({"routes": [{"receiver": "MON 3 video", "sender": "CAM 2 video"}], "group": true}));
+    assert_eq!((status, &grouped["succeeded"]), (200, &json!(true)), "{grouped:#}");
+    assert_eq!(grouped["activation"]["mode"], "activate_scheduled_absolute", "the two switch together");
+    let routes = router.routes();
+    assert_eq!(taking(&routes, "MON 3 video").as_deref(), Some("CAM 2 video"));
+    assert_eq!(taking(&routes, "MON 3 audio").as_deref(), Some("CAM 2 audio"));
+
+    let (_, off) =
+        router.post("/api/take", &json!({"routes": [{"receiver": "MON 3 audio", "sender": null}], "group": true}));
+    assert_eq!(off["connections"].as_array().unwrap().len(), 2, "{off:#}");
+    let routes = router.routes();
+    assert_eq!((taking(&routes, "MON 3 video"), taking(&routes, "MON 3 audio")), (None, None));
+
+    // The graphics Node gives no group, so the monitor's audio is left as it is.
+    let (_, gfx) = router
+        .post("/api/take", &json!({"routes": [{"receiver": "MON 4 video", "sender": "GFX 1 video"}], "group": true}));
+    assert_eq!(gfx["connections"].as_array().unwrap().len(), 1, "{gfx:#}");
+    assert!(gfx["notes"][0].as_str().unwrap().starts_with("MON 4 audio left as it is"), "{gfx:#}");
+    let log = router.get("/api/log");
+    assert!(log.to_string().contains("MON 4 audio left as it is"), "the log keeps it");
+}
+
+/// `st2110 connect --group` takes the same group, here only checked.
+#[test]
+fn connect_takes_a_group_too() {
+    let router = Router::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["connect", &format!("http://{}", router.address), "--receiver", "MON 3 video"])
+        .args(["--sender", "CAM 3 video", "--group", "--dry-run"])
+        .env("NO_COLOR", "1")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(text.contains("receiver \"MON 3 audio\""), "{text}");
+    assert!(text.contains("CAM 3 audio"), "{text}");
+}
+
 #[test]
 fn refuses_what_a_receiver_cannot_take_and_says_why() {
     let router = Router::start();

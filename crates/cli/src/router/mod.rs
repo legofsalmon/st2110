@@ -43,7 +43,7 @@ use st2110_connect::controller::{self, Route, SenderControl, Settings, Take};
 use st2110_connect::{Destination, SenderChange};
 use st2110_nmos::auth::{ClientCredentials, SigningKey, Token};
 use st2110_nmos::client::{Options, QueryClient};
-use st2110_nmos::{Kind, Manifest, Snapshot, routing};
+use st2110_nmos::{Kind, Manifest, Snapshot, groups, routing};
 
 use self::demo::Facility;
 use self::events::{Hub, Sent, Signal, Subscriptions};
@@ -696,6 +696,14 @@ fn state_json(router: &Router) -> Result<Value, String> {
     let snapshot = read.map_err(|message| format!("reading the registry: {message}"))?;
     let matrix = routing::matrix(&snapshot);
     let flows = &snapshot.flows;
+    // Each one's BCP-002-01 natural group, for taking a group as one.
+    let group = |memberships: &std::collections::BTreeMap<String, (groups::Group, String)>, id: &str| {
+        memberships
+            .get(id)
+            .map(|(g, role)| json!({"name": g.name, "key": format!("{}/{}", g.scope, g.name), "role": role}))
+    };
+    let sender_groups = groups::memberships(&snapshot, Kind::Sender);
+    let receiver_groups = groups::memberships(&snapshot, Kind::Receiver);
     let senders: Vec<Value> = matrix
         .senders
         .iter()
@@ -710,6 +718,7 @@ fn state_json(router: &Router) -> Result<Value, String> {
             let enabled = raw.get("subscription").and_then(|s| s.get("active")).and_then(Value::as_bool);
             json!({
                 "id": s.id, "label": s.label, "device": device, "node": node, "enabled": enabled,
+                "group": s.id.as_deref().and_then(|id| group(&sender_groups, id)),
                 "format": format_name(flow.and_then(|f| f.get("format")).and_then(Value::as_str)),
                 "summary": text(raw, "id").and_then(|id| summary(&snapshot, &id)),
             })
@@ -724,6 +733,7 @@ fn state_json(router: &Router) -> Result<Value, String> {
             let (device, node) = device_and_node(&snapshot, raw);
             json!({
                 "id": row.receiver.id, "label": row.receiver.label, "device": device, "node": node,
+                "group": row.receiver.id.as_deref().and_then(|id| group(&receiver_groups, id)),
                 "format": format_name(raw.get("format").and_then(Value::as_str)),
                 "fits": row.fits, "current": row.current,
                 "sender_id": subscription.and_then(|s| s.get("sender_id")).and_then(Value::as_str),
@@ -789,6 +799,9 @@ struct TakeRequest {
     routes: Vec<Wanted>,
     #[serde(default)]
     dry_run: bool,
+    /// Take the rest of each Receiver's natural group with it.
+    #[serde(default)]
+    group: bool,
 }
 
 /// Makes the connections the page asks for, together, as `st2110 connect --salvo` does,
@@ -807,7 +820,7 @@ fn take(router: &Router, request: &Request) -> Response {
             "error": error, "connections": [],
         }),
         None => json!({
-            "dry_run": body["dry_run"], "succeeded": body["succeeded"],
+            "dry_run": body["dry_run"], "succeeded": body["succeeded"], "notes": body["notes"],
             "connections": body["connections"].as_array().into_iter().flatten().map(|c| json!({
                 "state": c["state"], "describe": c["describe"],
                 "problems": c["problems"], "warnings": c["warnings"], "notes": c["notes"],
@@ -850,11 +863,23 @@ fn make(router: &Router, request: &Request) -> Response {
         Ok(snapshot) => snapshot,
         Err(e) => return Response::error(502, format!("reading the registry: {e}")),
     };
+    let (routes, left) = if wanted.group {
+        match controller::with_groups(&snapshot, &routes) {
+            Ok(grouped) => grouped,
+            Err(message) => return Response::error(400, message),
+        }
+    } else {
+        (routes, Vec::new())
+    };
+    if routes.len() > MOST {
+        return Response::error(400, format!("at most {MOST} connections are made at once, with their groups"));
+    }
     let settings = Settings { dry_run: wanted.dry_run, ..router.settings.clone() };
     match controller::connect(&snapshot, &routes, &router.connection_client(), Some(&registry), &settings) {
         Ok(outcome) => {
             let mut body = serde_json::to_value(&outcome).unwrap_or(Value::Null);
             body["succeeded"] = json!(outcome.succeeded());
+            body["notes"] = json!(left);
             for (value, connection) in
                 body["connections"].as_array_mut().into_iter().flatten().zip(&outcome.connections)
             {

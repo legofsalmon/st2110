@@ -3018,6 +3018,7 @@ pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-spa
   <button id="clear" class="ds-btn" title="Release every armed crosspoint (Esc)" hidden>Clear</button>
   <span id="mode-hint" class="hint"></span>
   <label class="ds-switch" title="Check each connection against the Receiver, and connect nothing"><input type="checkbox" role="switch" id="dry"> Check only</label>
+  <label class="ds-switch" id="group-switch" title="Take the rest of a receiver's group with it, such as a monitor's audio with its video, from the source's group (BCP-002-01)" hidden><input type="checkbox" role="switch" id="group"> With its group</label>
   <label class="ds-switch" title="Receive each source's stream on this machine to show its picture or sound"><input type="checkbox" role="switch" id="live"> Live previews</label>
   <span class="spacer"></span>
   <button id="refresh" class="ds-btn" title="Read the registry again">Refresh</button>
@@ -3196,12 +3197,23 @@ function name(resource) {
   return resource.label || resource.id.slice(0, 8);
 }
 
+// Taking a receiver's group with it is offered only where the registry has groups,
+// and each crosspoint's label says the group goes too.
+function grouping() { return !$("group-switch").hidden && $("group").checked; }
+
+function withGroup(r) {
+  if (!grouping() || !r.group) return "";
+  const rest = state.receivers.filter((o) => o.id !== r.id && o.group && o.group.key === r.group.key).length;
+  return rest ? `, with the rest of group ${r.group.name} (${rest} more)` : "";
+}
+
 function render() {
   if (!state) return;
   $("registry").textContent = state.registry;
   $("registry").title = state.auth ? `IS-10: ${state.auth}` : "";
   $("auth").hidden = !state.auth;
   $("demo").hidden = !state.demo;
+  $("group-switch").hidden = !state.receivers.some((r) => r.group);
   renderLevels();
   const shown = (format) => level === "all" || format === level;
   // Grouped by format, video first, and in label order within each, as the registry lists them.
@@ -3239,13 +3251,13 @@ function render() {
       if (!thumb) { thumb = el("img", { class: "thumb", alt: "" }); thumbs.set(r.id, thumb); }
       thumb.setAttribute("data-thumb", r.sender_id);
     } else thumbs.delete(r.id);
-    const tr = el("tr", {}, el("th", { class: "dst", title: r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
+    const tr = el("tr", {}, el("th", { class: "dst", title: r.group ? `${r.id}\nGroup ${r.group.name}: ${r.group.role}` : r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
     columns.forEach((s, c) => {
       // The hover says what a click does in this mode, and the state it is in.
       const isArmed = armed.has(r.id) && armed.get(r.id) === s.id;
       let kind = "fit", label = salvo
-        ? (isArmed ? `${name(r)} from ${name(s)}, armed for the salvo: click to release` : `Arm ${name(r)} from ${name(s)} for the salvo`)
-        : `${$("dry").checked ? "Check" : "Connect"} ${name(r)} to ${name(s)}: click to ${$("dry").checked ? "check" : "take"} now`;
+        ? (isArmed ? `${name(r)} from ${name(s)}, armed for the salvo: click to release` : `Arm ${name(r)} from ${name(s)}${withGroup(r)} for the salvo`)
+        : `${$("dry").checked ? "Check" : "Connect"} ${name(r)} to ${name(s)}${withGroup(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
       if (r.current === s.i) { kind = "live"; label = `${name(r)} is taking ${name(s)}`; }
       else if (s.format && r.format && s.format !== r.format) { kind = "na"; label = ""; }
       else if (!fits.has(s.i)) { kind = "unfit"; label = `${name(r)} cannot take ${name(s)}: click for why`; }
@@ -3263,7 +3275,7 @@ function render() {
     const offArmed = armed.has(r.id) && armed.get(r.id) === null;
     const offTitle = !takes && !offArmed ? `${name(r)} is not taking a stream`
       : salvo ? (offArmed ? `Disconnecting ${name(r)} is armed for the salvo: click to release` : `Arm disconnecting ${name(r)} for the salvo`)
-      : `${$("dry").checked ? "Check disconnecting" : "Disconnect"} ${name(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
+      : `${$("dry").checked ? "Check disconnecting" : "Disconnect"} ${name(r)}${withGroup(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
     const off = el("button", {
       class: "off", text: "off", title: offTitle, "aria-label": `Disconnect ${name(r)}`,
       onclick: () => click(r, null, takes ? "fit" : "idle"),
@@ -3334,9 +3346,9 @@ async function take(routes) {
     const outcome = await call("/api/take", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ routes, dry_run: $("dry").checked }),
+      body: JSON.stringify({ routes, dry_run: $("dry").checked, group: grouping() }),
     });
-    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections });
+    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections, notes: outcome.notes });
     if (outcome.succeeded && !$("dry").checked) for (const route of routes) armed.delete(route.receiver);
   } catch (e) {
     // Nothing is switched when the router answers with a refusal; when it cannot
@@ -3430,6 +3442,10 @@ function logEntry(e) {
   if (e.error) {
     $("log").prepend(el("div", { class: "entry bad" }, stamp(e.at), (dry ? "Check only: " : "") + `Nothing was switched: ${e.error}`));
     return;
+  }
+  // What of a group was left as it is shows under the connections that were made.
+  for (const note of [...(e.notes || [])].reverse()) {
+    $("log").prepend(el("div", { class: "entry warn" }, stamp(e.at), (dry ? "Check only: " : "") + note));
   }
   for (const c of [...(e.connections || [])].reverse()) {
     const good = ["done", "scheduled", "planned"].includes(c.state);
@@ -3883,6 +3899,12 @@ setInterval(watch, 3000);
 setInterval(poll, 500);
 
 $("dry").onchange = () => { disarmSend(); renderSalvo(); render(); sendLabels(); };
+// Off until turned on, and then kept in this browser: it reaches more outputs than the one clicked.
+try { $("group").checked = localStorage.getItem("st2110-router-group") === "on"; } catch (_) { /* not kept */ }
+$("group").onchange = () => {
+  try { localStorage.setItem("st2110-router-group", $("group").checked ? "on" : "off"); } catch (_) { /* not kept */ }
+  render();
+};
 $("mode-take").onclick = () => { salvo = false; armed.clear(); render(); renderSalvo(); };
 $("mode-salvo").onclick = () => { salvo = true; render(); renderSalvo(); };
 $("clear").onclick = () => { armed.clear(); render(); renderSalvo(); };

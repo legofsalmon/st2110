@@ -34,6 +34,7 @@ pub(crate) struct Args {
     pub disconnect: bool,
     pub cancel: bool,
     pub salvo: Option<PathBuf>,
+    pub group: bool,
     pub at: Option<String>,
     pub after: Option<f64>,
     pub lead: f64,
@@ -379,6 +380,15 @@ fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
     let timeout = timeout(args)?;
     let token = args.auth.token(timeout, true)?;
     let (snapshot, registry) = load(&args.target, timeout, false, token.as_ref())?;
+    let routes = if args.group {
+        let (routes, left) = controller::with_groups(&snapshot, &routes)?;
+        for note in left {
+            eprintln!("st2110: {note}");
+        }
+        routes
+    } else {
+        routes
+    };
     let client = ConnectionClient::new(&client::Options { timeout, token, ..client::Options::default() });
     let outcome = controller::connect(&snapshot, &routes, &client, registry.as_ref(), &settings)?;
     let mut out = io::stdout().lock();

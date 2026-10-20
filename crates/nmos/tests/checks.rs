@@ -110,7 +110,79 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("transport-address", with(|v| v["senders"][1]["transport"] = json!("urn:x-nmos:transport:rtp.ucast"))),
         ("flow-sdp", with(|v| v["flows"][1]["bit_depth"] = json!(16))),
         ("sender-sdp", with(|v| v["senders"][0]["st2110_21_sender_type"] = json!("2110TPW"))),
+        ("group-hint", with(|v| v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Video:system"]}))),
+        ("asset-tags", with(|v| v["nodes"][0]["tags"] = json!({MANUFACTURER: ["Acme"]}))),
     ]
+}
+
+const GROUPHINT: &str = "urn:x-nmos:tag:grouphint/v1.0";
+const MANUFACTURER: &str = "urn:x-nmos:tag:asset:manufacturer/v1.0";
+
+/// The BCP-002-02 asset tags of a box, with a Function for a Device.
+fn asset(product: &str, serial: &str, function: Option<&str>) -> Value {
+    let mut tags = json!({
+        MANUFACTURER: ["Acme"],
+        "urn:x-nmos:tag:asset:product/v1.0": [product],
+        "urn:x-nmos:tag:asset:instance-id/v1.0": [serial],
+    });
+    if let Some(function) = function {
+        tags["urn:x-nmos:tag:asset:function/v1.0"] = json!([function]);
+    }
+    tags
+}
+
+#[test]
+fn group_hints_and_asset_tags() {
+    let found = |snapshot: &Snapshot| -> Vec<(String, String)> {
+        check(snapshot)
+            .findings
+            .iter()
+            .map(|f| (f.resource.as_ref().unwrap().label.clone(), f.message.clone()))
+            .collect()
+    };
+    // A camera's video and audio in one group, and the monitor's in another, each of
+    // the tag's forms; and boxes that say what they are.
+    let tagged = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Primary", "tally:left:node"]});
+        v["senders"][1]["tags"] = json!({GROUPHINT: ["CAM 1:Audio 1:device"]});
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["MON 1:Video:node"]});
+        v["receivers"][1]["tags"] = json!({GROUPHINT: [""]});
+        v["nodes"][0]["tags"] = asset("Camera Pro", "CP-1", None);
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", Some("Camera"));
+        v["nodes"][1]["tags"] = asset("Camera Pro", "CP-2", None);
+    });
+    assert_eq!(found(&tagged), []);
+    // Two Senders with one role in a group, and a Device without its Function.
+    let clash = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Audio 1"]});
+        v["senders"][1]["tags"] = json!({GROUPHINT: ["CAM 1:audio 1"]});
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", None);
+        v["devices"][1]["tags"] = asset("Camera Pro", "CP-1", Some("Monitor"));
+    });
+    let mut findings = found(&clash);
+    findings.sort();
+    assert_eq!(
+        findings,
+        [
+            ("CAM 1 audio".into(), "it has the same role in group CAM 1 as sender \"CAM 1 video\" (5e0d0001); roles tell a group's members apart".into()),
+            ("Camera 1".into(), "it gives asset tags, but no Function".into()),
+        ]
+    );
+    // The same role in groups of the same name on two Devices is two groups; and two
+    // Devices that both give a full set may not give the same one.
+    let apart = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["Box:Video"]});
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["Box:Video"]});
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", Some("Camera"));
+        v["devices"][1]["tags"] = asset("Camera Pro", "CP-1", Some("Monitor"));
+    });
+    assert_eq!(
+        found(&apart),
+        [(
+            "Monitor 1".into(),
+            "device \"Camera 1\" (de710001) gives the same Manufacturer, Product Name and Instance Identifier (Acme, Camera Pro, CP-1)".into()
+        )]
+    );
 }
 
 #[test]

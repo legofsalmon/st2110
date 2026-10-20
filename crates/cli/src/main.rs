@@ -153,6 +153,11 @@ enum Command {
         /// "feed.sdp"}, {"receiver": "MON 3", "disconnect": true}].
         #[arg(long, value_name = "FILE", conflicts_with = "take")]
         salvo: Option<PathBuf>,
+        /// Take the rest of each Receiver's BCP-002-01 natural group with it, such as a
+        /// monitor's audio with its video: each takes the Sender of the same role in
+        /// the Sender's group, or the next of its format, or is disconnected with it.
+        #[arg(long, conflicts_with = "cancel")]
+        group: bool,
         /// When they take effect: now, a PTP time such as 1790510437:0, or a UTC time such
         /// as 2026-09-27T12:00:00Z. Now for one connection when omitted, and --lead from
         /// now for several.
@@ -499,6 +504,7 @@ fn main() -> ExitCode {
             disconnect,
             cancel,
             salvo,
+            group,
             at,
             after,
             lead,
@@ -526,6 +532,7 @@ fn main() -> ExitCode {
                 disconnect,
                 cancel,
                 salvo,
+                group,
                 at,
                 after,
                 lead,

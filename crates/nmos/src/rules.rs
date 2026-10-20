@@ -46,6 +46,12 @@ rules! {
     UNKNOWN_CLOCK = "unknown-clock", Warning, "IS-04 v1.3 schemas",
         "A Source's `clock_name` is one of its Node's `clocks`.";
 
+    // Tags.
+    GROUP_HINT = "group-hint", Warning, "BCP-002-01 v1.0 · NMOS Parameter Registers: Tags (grouphint)",
+        "Each `urn:x-nmos:tag:grouphint/v1.0` value is `<group>:<role>`, with `:device` or `:node` after it for its scope, and no two Senders, or two Receivers, have one role in one group, so a controller can take a natural group, such as a camera's video and audio, as one.";
+    ASSET_TAGS = "asset-tags", Warning, "BCP-002-02 v1.0",
+        "A Node or Device that gives any `urn:x-nmos:tag:asset:` tag gives exactly one Manufacturer, Product Name and Instance Identifier, a Device at least one Function, and no two Nodes, or two Devices, give the same three, so crew can tell one box of a model from another.";
+
     // PTP.
     PTP_UNLOCKED = "ptp-unlocked", Warning, "IS-04 v1.3 schemas",
         "Each PTP clock a Node reports is locked to a grandmaster.";

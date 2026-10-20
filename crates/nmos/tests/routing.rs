@@ -45,6 +45,62 @@ fn finds_by_id_label_or_the_start_of_the_id() {
     assert_eq!((sender.active, sender.subscription.as_deref()), (Some(true), None));
 }
 
+const GROUPHINT: &str = "urn:x-nmos:tag:grouphint/v1.0";
+
+/// A second camera with a video and two audio Senders in one natural group, and the
+/// monitor's video and audio Receivers in another.
+fn grouped() -> Snapshot {
+    with(|v| {
+        for (i, label, role) in [(0, "CAM 1 video", "Primary"), (1, "CAM 1 audio", "Audio 1")] {
+            assert_eq!(v["senders"][i]["label"], label);
+            v["senders"][i]["tags"] = json!({GROUPHINT: [format!("Camera:{role}")]});
+        }
+        // A second audio Sender in the camera's group, sending the same Flow.
+        let mut audio2 = v["senders"][1].clone();
+        audio2["id"] = json!("5e0d0003-0000-4000-8000-000000000003");
+        audio2["label"] = json!("CAM 1 audio 2");
+        audio2["tags"] = json!({GROUPHINT: ["Camera:Audio 2"]});
+        v["senders"].as_array_mut().unwrap().push(audio2);
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["MON 1:Video"]});
+        v["receivers"][1]["tags"] = json!({GROUPHINT: ["MON 1:Audio 2"]});
+    })
+}
+
+#[test]
+fn pairs_a_receivers_group_with_a_senders() {
+    let snapshot = grouped();
+    let pairs = |c: &st2110_nmos::groups::Companions| -> Vec<(String, Option<String>)> {
+        c.routes.iter().map(|(r, s)| (r.label.clone(), s.as_ref().map(|s| s.label.clone()))).collect()
+    };
+    // The monitor's audio takes the camera's audio with its own role, Audio 2.
+    let c = st2110_nmos::groups::companions(&snapshot, VIDEO_RECEIVER, Some(VIDEO_SENDER));
+    assert_eq!(c.group.as_ref().map(|g| g.name.as_str()), Some("MON 1"));
+    assert_eq!(pairs(&c), [("MON 1 audio".into(), Some("CAM 1 audio 2".into()))]);
+    assert_eq!(c.left, Vec::<String>::new());
+    // With no role in common, the first audio in role order.
+    let renamed = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["Camera:Primary"]});
+        v["senders"][1]["tags"] = json!({GROUPHINT: ["Camera:Audio 1"]});
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["MON 1:Video"]});
+        v["receivers"][1]["tags"] = json!({GROUPHINT: ["MON 1:Left"]});
+    });
+    let c = st2110_nmos::groups::companions(&renamed, VIDEO_RECEIVER, Some(VIDEO_SENDER));
+    assert_eq!(pairs(&c), [("MON 1 audio".into(), Some("CAM 1 audio".into()))]);
+    // Disconnecting one disconnects the group.
+    let c = st2110_nmos::groups::companions(&snapshot, AUDIO_RECEIVER, None);
+    assert_eq!(pairs(&c), [("MON 1 video".into(), None)]);
+    // A Sender in no group leaves the rest of the group as it is, and says so.
+    let ungrouped = with(|v| {
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["MON 1:Video"]});
+        v["receivers"][1]["tags"] = json!({GROUPHINT: ["MON 1:Audio"]});
+    });
+    let c = st2110_nmos::groups::companions(&ungrouped, VIDEO_RECEIVER, Some(VIDEO_SENDER));
+    assert_eq!(pairs(&c), []);
+    assert_eq!(c.left, ["MON 1 audio left as it is: sender \"CAM 1 video\" (5e0d0001) is in no group"]);
+    // A Receiver in no group has no companions.
+    assert_eq!(st2110_nmos::groups::companions(&with(|_| {}), VIDEO_RECEIVER, Some(VIDEO_SENDER)), Default::default());
+}
+
 #[test]
 fn lists_senders_in_label_order() {
     let snapshot = with(|value| {
