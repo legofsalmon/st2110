@@ -352,6 +352,10 @@ enum Command {
         /// Count 30000/1001 time code without dropping frames.
         #[arg(long)]
         non_drop: bool,
+        /// Colour frame align 25 and 30000/1001 time code, as ST 2059-2's
+        /// colorFrameIdentificationMode asks: the jam waits for a colour frame sequence.
+        #[arg(long)]
+        color_frame: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
@@ -528,8 +532,20 @@ fn main() -> ExitCode {
             let args = pcap::Args { files, sdp, timescale: timescale.into(), tai_utc };
             pcap::run(&args, format, quiet, deny_warnings)
         }
-        Command::Time { at, video, audio, local_offset, tai_utc, jam, jam_local_offset, non_drop, format } => {
-            let args = timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop };
+        Command::Time {
+            at,
+            video,
+            audio,
+            local_offset,
+            tai_utc,
+            jam,
+            jam_local_offset,
+            non_drop,
+            color_frame,
+            format,
+        } => {
+            let args =
+                timing::Args { at, tai_utc, local_offset, video, audio, jam, jam_local_offset, non_drop, color_frame };
             timing::run(&args, format)
         }
         Command::Discover(args) => discover::run(&args),

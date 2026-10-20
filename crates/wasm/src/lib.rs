@@ -405,6 +405,9 @@ export interface TimingOptions {
   jamLocalOffset?: number;
   /** Whether 30000/1001 time code drops frames; true when omitted. */
   dropFrame?: boolean;
+  /** Whether 25 and 30000/1001 time code is colour frame aligned (ST 2059-1 §9.3.2.1);
+   *  false when omitted. */
+  colorFrame?: boolean;
 }
 
 /** Times are PTP times, "seconds.nanoseconds", or calendar times, "YYYY-MM-DD hh:mm:ss.nnnnnnnnn". */
@@ -412,6 +415,10 @@ export interface Timecode {
   address: string;
   rate: string;
   drop_frame: boolean;
+  /** The codeword's Color Frame Flag. */
+  color_frame: boolean;
+  /** The ST 309 date: Local Time on the time code's day, and its Modified Julian Date. */
+  date: { year: number; month: number; day: number; mjd: number };
   jam: string;
   jam_local: string;
 }
@@ -912,6 +919,7 @@ struct TimingOptions {
     jam: Option<String>,
     jam_local_offset: Option<i32>,
     drop_frame: Option<bool>,
+    color_frame: Option<bool>,
 }
 
 /// Works out where a PTP time falls, by ST 2059-1: for each video frame rate its frame,
@@ -969,6 +977,7 @@ pub fn timing(
         jam,
         jam_local_offset: o.jam_local_offset,
         drop_frame: o.drop_frame.unwrap_or(true),
+        color_frame: o.color_frame.unwrap_or(false),
     };
     to_js(&timing::at(t, &options).map_err(|e| JsError::new(&e.to_string()))?)
 }

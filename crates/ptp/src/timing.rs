@@ -8,7 +8,7 @@ use st2110_sdp::{FrameRateError, Rational, parse_frame_rate};
 
 use crate::epoch::{self, Signal};
 use crate::time::{Civil, PtpTime, TAI_UTC_2017};
-use crate::timecode::{Jam, TimeAddress, TimecodeRate, timecode_at};
+use crate::timecode::{Date, Jam, TimeAddress, TimecodeRate, date_at, timecode_at};
 
 /// The RTP clock rate of ST 2110-20 video and ST 2110-40 ancillary data.
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
@@ -33,10 +33,13 @@ pub struct Options {
     pub jam_local_offset: Option<i32>,
     /// Whether time code at 30000/1001 codewords a second counts in drop-frame.
     pub drop_frame: bool,
+    /// Whether time code at 25 or 30000/1001 codewords a second is colour frame aligned,
+    /// as ST 2059-2's `colorFrameIdentificationMode` asks.
+    pub color_frame: bool,
 }
 
-/// UTC as Local Time, TAI − UTC as it has been since 2017, drop-frame time code, and no
-/// signals.
+/// UTC as Local Time, TAI − UTC as it has been since 2017, drop-frame time code with no
+/// colour framing, and no signals.
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -47,6 +50,7 @@ impl Default for Options {
             jam: None,
             jam_local_offset: None,
             drop_frame: true,
+            color_frame: false,
         }
     }
 }
@@ -102,6 +106,10 @@ pub struct Timecode {
     pub rate: Rational,
     /// Whether it counts in drop-frame.
     pub drop_frame: bool,
+    /// Whether it is colour frame aligned: the Color Frame Flag of the codeword.
+    pub color_frame: bool,
+    /// The ST 309 date that goes with it.
+    pub date: Date,
     /// The daily jam it counts from.
     pub jam: PtpTime,
     /// The jam in Local Time.
@@ -159,7 +167,7 @@ enum Jams {
 impl Jams {
     /// The time code in progress at `t`, from the jam that set it.
     fn timecode(self, t: PtpTime, rate: TimecodeRate) -> Option<Timecode> {
-        let (address, jam) = match self {
+        let (address, jam): (TimeAddress, Jam) = match self {
             Self::Given(jam) => (timecode_at(t, rate, jam)?, jam),
             Self::Midnight(offset) => {
                 let jam = Jam::midnight(t, offset)?;
@@ -177,6 +185,8 @@ impl Jams {
             address,
             rate: rate.rate(),
             drop_frame: rate.drop_frame(),
+            color_frame: rate.color_frame(),
+            date: date_at(t, rate, jam)?,
             jam: jam.time,
             jam_local: jam.time.local(jam.local_offset),
         })
@@ -190,7 +200,7 @@ pub fn at(t: PtpTime, options: &Options) -> Result<Timing, TimingError> {
         Some(time) => Jams::Given(Jam { time, local_offset: jam_offset }),
         None => Jams::Midnight(jam_offset),
     };
-    let video = options.video.iter().map(|&rate| video(t, rate, jams, options.drop_frame)).collect::<Result<_, _>>()?;
+    let video = options.video.iter().map(|&rate| video(t, rate, jams, options)).collect::<Result<_, _>>()?;
     let audio = options.audio.iter().map(|&rate| audio(t, rate)).collect::<Result<_, _>>()?;
     Ok(Timing {
         ptp: t,
@@ -203,12 +213,14 @@ pub fn at(t: PtpTime, options: &Options) -> Result<Timing, TimingError> {
     })
 }
 
-fn video(t: PtpTime, rate: Rational, jams: Jams, drop_frame: bool) -> Result<Video, TimingError> {
+fn video(t: PtpTime, rate: Rational, jams: Jams, options: &Options) -> Result<Video, TimingError> {
     use TimingError::{End, Rate};
     let frame = epoch::period_index(t, rate).ok_or(Rate)?;
     let next = frame.checked_add(1).ok_or(Rate)?;
-    let timecode = TimecodeRate::for_frame_rate(rate, drop_frame)
+    // Colour framing where ST 2059-1 defines it, and none elsewhere.
+    let timecode = TimecodeRate::for_frame_rate(rate, options.drop_frame)
         .or_else(|| TimecodeRate::for_frame_rate(rate, false))
+        .map(|tc| if options.color_frame { tc.with_color_frame().unwrap_or(tc) } else { tc })
         .and_then(|tc| jams.timecode(t, tc));
     Ok(Video {
         rate,

@@ -21,6 +21,7 @@ pub(crate) struct Args {
     pub jam: Option<String>,
     pub jam_local_offset: Option<i32>,
     pub non_drop: bool,
+    pub color_frame: bool,
 }
 
 pub(crate) fn run(args: &Args, format: Format) -> io::Result<ExitCode> {
@@ -82,6 +83,7 @@ fn work_out(args: &Args) -> Result<Timing, String> {
         jam,
         jam_local_offset: args.jam_local_offset,
         drop_frame: !args.non_drop,
+        color_frame: args.color_frame,
     };
     timing::at(t, &options).map_err(|e| e.to_string())
 }
@@ -109,15 +111,19 @@ fn write_text(out: &mut impl Write, t: &Timing, style: Style) -> io::Result<()> 
         writeln!(out, "  {:<11} {}, RTP {} at 90 kHz", "began", v.frame_start, v.rtp)?;
         writeln!(out, "  {:<11} {}, RTP {}", "next", v.next_frame, v.next_rtp)?;
         match &v.timecode {
-            Some(tc) => writeln!(
-                out,
-                "  {:<11} {} ({} fps{}, from the jam at {:.0} Local Time)",
-                "time code",
-                tc.address,
-                tc.rate,
-                if tc.drop_frame { " drop-frame" } else { "" },
-                tc.jam_local
-            )?,
+            Some(tc) => {
+                writeln!(
+                    out,
+                    "  {:<11} {} ({} fps{}{}, from the jam at {:.0} Local Time)",
+                    "time code",
+                    tc.address,
+                    tc.rate,
+                    if tc.drop_frame { " drop-frame" } else { "" },
+                    if tc.color_frame { ", colour framed" } else { "" },
+                    tc.jam_local
+                )?;
+                writeln!(out, "  {:<11} {}", "ST 309 date", tc.date)?;
+            }
             None => {
                 let why = match TimecodeRate::for_frame_rate(v.rate, false) {
                     None => "ST 12-1 has no time code at this rate",
