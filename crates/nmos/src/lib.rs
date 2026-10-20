@@ -16,7 +16,9 @@
 //!
 //! [`routing`] reads what a controller needs to make connections: the Sender or
 //! Receiver a name refers to, its Device's IS-05 Connection API, and the crosspoint
-//! matrix of which Senders each Receiver can take.
+//! matrix of which Senders each Receiver can take. [`groups`] reads the BCP-002-01
+//! natural groups, such as a camera's video and audio, so a controller can take one as
+//! a whole.
 //!
 //! The `client` feature adds [`client::QueryClient`], which reads a snapshot from a
 //! live registry.
@@ -49,6 +51,7 @@ mod caps;
 mod check;
 #[cfg(feature = "client")]
 pub mod client;
+pub mod groups;
 mod model;
 mod report;
 pub mod routing;

@@ -1,10 +1,12 @@
 //! Typed views of IS-04 resources, read tolerantly from the registry's JSON.
 //!
 //! A registry may hold resources registered at any IS-04 version from v1.0, so only
-//! the attributes every version requires are treated as required. Anything present
-//! but of the wrong type is noted as a problem and otherwise ignored.
+//! the attributes every version requires are treated as required, except for the
+//! resources a snapshot knows to be at the version it was read through, which are held
+//! to that version's schema. Anything present but of the wrong type is noted as a
+//! problem and otherwise ignored.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -63,12 +65,15 @@ impl Kind {
 pub(crate) struct Fields<'a> {
     map: Option<&'a Map<String, Value>>,
     path: String,
+    /// The attributes already required, so a version's schema does not note one twice.
+    required: Vec<String>,
     pub problems: Vec<String>,
 }
 
 impl<'a> Fields<'a> {
     pub fn new(value: &'a Value) -> Self {
-        let mut fields = Self { map: value.as_object(), path: String::new(), problems: Vec::new() };
+        let mut fields =
+            Self { map: value.as_object(), path: String::new(), required: Vec::new(), problems: Vec::new() };
         if fields.map.is_none() {
             fields.problems.push("it is not a JSON object".into());
         }
@@ -91,12 +96,26 @@ impl<'a> Fields<'a> {
     /// Notes a required attribute that is absent. Says nothing when the resource is
     /// not an object at all, which is already noted.
     fn require(&mut self, key: &str) -> bool {
+        self.required.push(key.to_string());
         if self.map.is_some() && self.value(key).is_none() {
             let problem = format!("{} is missing", self.name(key));
             self.problems.push(problem);
             return false;
         }
         true
+    }
+
+    /// Notes an attribute that IS-04 `version` requires and that is absent, unless it
+    /// was already required.
+    fn require_at(&mut self, key: &str, version: &str) {
+        if self.required.iter().any(|k| k == key) {
+            return;
+        }
+        self.required.push(key.to_string());
+        if self.map.is_some() && self.value(key).is_none() {
+            let problem = format!("{} is missing, which IS-04 {version} requires", self.name(key));
+            self.problems.push(problem);
+        }
     }
 
     pub fn str(&mut self, key: &str) -> Option<&'a str> {
@@ -200,7 +219,8 @@ impl<'a> Fields<'a> {
             self.wrong(key, "an object");
             return None;
         };
-        let mut nested = Fields { map: Some(map), path: format!("{}{key}.", self.path), problems: Vec::new() };
+        let mut nested =
+            Fields { map: Some(map), path: format!("{}{key}.", self.path), required: Vec::new(), problems: Vec::new() };
         let result = read(&mut nested);
         self.problems.append(&mut nested.problems);
         Some(result)
@@ -216,7 +236,12 @@ impl<'a> Fields<'a> {
                 self.wrong(&format!("{key}[{i}]"), "an object");
                 continue;
             };
-            let mut nested = Fields { map: Some(map), path: format!("{}{key}[{i}].", self.path), problems: Vec::new() };
+            let mut nested = Fields {
+                map: Some(map),
+                path: format!("{}{key}[{i}].", self.path),
+                required: Vec::new(),
+                problems: Vec::new(),
+            };
             out.push(read(&mut nested));
             self.problems.append(&mut nested.problems);
         }
@@ -270,8 +295,23 @@ pub(crate) struct Node<'a> {
     pub core: Core<'a>,
     /// `None` for a Node from before IS-04 v1.1, which had no clocks.
     pub clocks: Option<Vec<Clock<'a>>>,
-    /// Interface names; `None` for a Node from before IS-04 v1.2.
-    pub interfaces: Option<Vec<&'a str>>,
+    /// `None` for a Node from before IS-04 v1.2.
+    pub interfaces: Option<Vec<Interface<'a>>>,
+    /// The IS-04 version the Node is known to be at, such as `v1.3`.
+    pub schema: Option<&'a str>,
+}
+
+/// A network interface a Node lists, with what LLDP says about it.
+#[derive(Debug)]
+pub(crate) struct Interface<'a> {
+    pub name: &'a str,
+    /// The LLDP chassis ID this Node sends: a MAC address or other text, or `None`
+    /// where LLDP is not used, which IS-04 writes as `null`. `None` outside when the
+    /// attribute is absent or malformed, which is noted as a problem.
+    pub chassis_id: Option<Option<&'a str>>,
+    /// The switch port this interface is plugged into, as LLDP from the switch names
+    /// it: chassis ID and port ID. `None` when not given, as before IS-04 v1.3.
+    pub attached: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Debug)]
@@ -375,6 +415,8 @@ pub(crate) struct Receiver<'a> {
     pub media_types: Option<Vec<&'a str>>,
     /// BCP-004-01 constraint sets, kept as JSON for [`crate::caps`].
     pub constraint_sets: Option<&'a [Value]>,
+    /// `caps.version`: when the constraint sets last changed.
+    pub caps_version: Option<&'a str>,
 }
 
 impl Receiver<'_> {
@@ -410,6 +452,7 @@ pub(crate) struct Model<'a> {
 impl<'a> Model<'a> {
     pub fn read(snapshot: &'a Snapshot) -> Self {
         let mut model = Self::default();
+        let at = Versions { version: snapshot.api_version.as_deref(), current: snapshot.current.as_ref() };
         for (index, value) in snapshot.nodes.iter().enumerate() {
             let mut f = Fields::new(value);
             let core = Core::read(Kind::Node, index, &mut f);
@@ -430,9 +473,28 @@ impl<'a> Model<'a> {
                     traceable: c.bool("traceable"),
                 }
             });
-            let interfaces = f.objects("interfaces", |i| i.required_str("name").unwrap_or_default());
+            let interfaces = f.objects("interfaces", |i| {
+                let chassis_id = i.required_nullable_str("chassis_id");
+                let chassis_id = match i.value("chassis_id") {
+                    Some(Value::Null) => Some(None),
+                    _ => chassis_id.map(Some),
+                };
+                if let Some(port_id) = i.required_str("port_id")
+                    && !is_mac(port_id)
+                {
+                    i.wrong("port_id", "a MAC address written lowercase with dashes, such as 00-1b-21-a1-b2-c3");
+                }
+                let attached = i
+                    .object("attached_network_device", |a| {
+                        let (chassis_id, port_id) = (a.required_str("chassis_id"), a.required_str("port_id"));
+                        chassis_id.zip(port_id)
+                    })
+                    .flatten();
+                Interface { name: i.required_str("name").unwrap_or_default(), chassis_id, attached }
+            });
+            at.require(&mut f, Kind::Node, value);
             model.add_problems(Kind::Node, index, f);
-            model.nodes.push(Node { core, clocks, interfaces });
+            model.nodes.push(Node { core, clocks, interfaces, schema: at.of(value) });
         }
         for (index, value) in snapshot.devices.iter().enumerate() {
             let mut f = Fields::new(value);
@@ -443,6 +505,7 @@ impl<'a> Model<'a> {
                 kind: c.required_str("type").unwrap_or_default(),
                 href: c.required_str("href").unwrap_or_default(),
             });
+            at.require(&mut f, Kind::Device, value);
             model.add_problems(Kind::Device, index, f);
             model.devices.push(Device { core, node_id, controls });
         }
@@ -458,6 +521,7 @@ impl<'a> Model<'a> {
                 channels: f.objects("channels", |_| ()).map(|c| c.len()),
             };
             f.array("parents");
+            at.require(&mut f, Kind::Source, value);
             model.add_problems(Kind::Source, index, f);
             model.sources.push(source);
         }
@@ -506,6 +570,7 @@ impl<'a> Model<'a> {
                     _ => {}
                 }
             }
+            at.require(&mut f, Kind::Flow, value);
             model.add_problems(Kind::Flow, index, f);
             model.flows.push(flow);
         }
@@ -526,6 +591,7 @@ impl<'a> Model<'a> {
                 hkep: f.bool("hkep"),
                 privacy: f.bool("privacy"),
             };
+            at.require(&mut f, Kind::Sender, value);
             model.add_problems(Kind::Sender, index, f);
             model.senders.push(sender);
         }
@@ -538,13 +604,14 @@ impl<'a> Model<'a> {
             let interface_bindings = f.strings("interface_bindings");
             f.require("subscription");
             let subscription = subscription(&mut f, "sender_id");
-            let (media_types, constraint_sets) = f
+            let (media_types, constraint_sets, caps_version) = f
                 .object("caps", |c| {
                     let media_types = c.strings("media_types");
                     let sets = c.value("constraint_sets").map(|_| c.array("constraint_sets"));
-                    (media_types, sets)
+                    (media_types, sets, c.str("version"))
                 })
                 .unwrap_or_default();
+            at.require(&mut f, Kind::Receiver, value);
             model.add_problems(Kind::Receiver, index, f);
             model.receivers.push(Receiver {
                 core,
@@ -555,6 +622,7 @@ impl<'a> Model<'a> {
                 subscription,
                 media_types,
                 constraint_sets,
+                caps_version,
             });
         }
         model.index();
@@ -648,6 +716,89 @@ impl<'a> Model<'a> {
     }
 }
 
+/// Which resources a snapshot knows to be at the IS-04 version it was read through.
+struct Versions<'a> {
+    version: Option<&'a str>,
+    current: Option<&'a BTreeSet<String>>,
+}
+
+impl<'a> Versions<'a> {
+    /// The IS-04 version a resource is known to be at.
+    fn of(&self, value: &Value) -> Option<&'a str> {
+        let id = value.get("id")?.as_str()?;
+        self.current?.contains(id).then_some(self.version?)
+    }
+
+    /// Notes each attribute the resource's IS-04 version requires that is absent,
+    /// where that version is known.
+    fn require(&self, f: &mut Fields<'_>, kind: Kind, value: &Value) {
+        let Some(version) = self.of(value) else {
+            return;
+        };
+        let Some(minor) = version.strip_prefix("v1.").and_then(|m| m.parse::<u32>().ok()) else {
+            return;
+        };
+        for key in required(kind, minor, value) {
+            f.require_at(key, version);
+        }
+    }
+}
+
+/// The attributes IS-04 v1.`minor` requires of a resource, from its schemas.
+fn required(kind: Kind, minor: u32, value: &Value) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = vec!["id", "version", "label"];
+    let since = |v: u32, more: &[&'static str], keys: &mut Vec<&'static str>| {
+        if minor >= v {
+            keys.extend_from_slice(more);
+        }
+    };
+    let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+    match kind {
+        Kind::Node => {
+            keys.extend(["href", "caps", "services"]);
+            since(1, &["api", "clocks", "description", "tags"], &mut keys);
+            since(2, &["interfaces"], &mut keys);
+        }
+        Kind::Device => {
+            keys.extend(["type", "node_id", "senders", "receivers"]);
+            since(1, &["controls", "description", "tags"], &mut keys);
+        }
+        Kind::Source => {
+            keys.extend(["description", "tags", "caps", "device_id", "parents", "format"]);
+            since(1, &["clock_name"], &mut keys);
+            if short_urn(text("format")) == "audio" {
+                since(1, &["channels"], &mut keys);
+            }
+        }
+        Kind::Flow => {
+            keys.extend(["description", "tags", "source_id", "parents", "format"]);
+            since(1, &["device_id"], &mut keys);
+            match short_urn(text("format")) {
+                "video" => since(1, &["frame_width", "frame_height", "colorspace"], &mut keys),
+                "audio" => since(1, &["sample_rate"], &mut keys),
+                "data" | "mux" => since(1, &["media_type"], &mut keys),
+                _ => {}
+            }
+            let media_type = text("media_type").to_ascii_lowercase();
+            if media_type == "video/raw" {
+                since(1, &["components"], &mut keys);
+            } else if media_type.starts_with("audio/l") {
+                since(1, &["bit_depth"], &mut keys);
+            }
+        }
+        Kind::Sender => {
+            keys.extend(["description", "device_id", "flow_id", "transport", "manifest_href"]);
+            since(1, &["tags"], &mut keys);
+            since(2, &["interface_bindings", "subscription"], &mut keys);
+        }
+        Kind::Receiver => {
+            keys.extend(["description", "tags", "device_id", "transport", "format", "caps", "subscription"]);
+            since(2, &["interface_bindings"], &mut keys);
+        }
+    }
+    keys
+}
+
 /// The last part of an NMOS URN: `video` for `urn:x-nmos:format:video`.
 pub(crate) fn short_urn(urn: &str) -> &str {
     urn.rsplit(':').next().unwrap_or(urn)
@@ -657,6 +808,13 @@ pub(crate) fn short_urn(urn: &str) -> &str {
 fn is_gmid(text: &str) -> bool {
     text.len() == 23
         && text.split('-').count() == 8
+        && text.split('-').all(|g| g.len() == 2 && g.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// True for a MAC address as IS-04 writes it: six lowercase hex pairs and dashes.
+pub(crate) fn is_mac(text: &str) -> bool {
+    text.len() == 17
+        && text.split('-').count() == 6
         && text.split('-').all(|g| g.len() == 2 && g.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 

@@ -115,6 +115,21 @@ pub(crate) fn transport_file_urls(snapshot: &Snapshot) -> Vec<(String, String)> 
         .collect()
 }
 
+/// Where each Sender's and Receiver's Connection API serves its `/active` parameters,
+/// keyed by `id`.
+#[cfg(feature = "client")]
+pub(crate) fn active_urls(snapshot: &Snapshot) -> Vec<(String, String)> {
+    let model = Model::read(snapshot);
+    let url = |core: &Core<'_>, device_id: Option<&str>, plural: &str| {
+        let id = core.id?;
+        let api = connection_apis(model.device(device_id?)?).into_iter().next()?;
+        Some((id.to_string(), format!("{}single/{plural}/{id}/active", api.href)))
+    };
+    let senders = model.senders.iter().filter_map(|s| url(&s.core, s.device_id, "senders"));
+    let receivers = model.receivers.iter().filter_map(|r| url(&r.core, r.device_id, "receivers"));
+    senders.chain(receivers).collect()
+}
+
 fn endpoint(model: &Model<'_>, core: &Core<'_>, device_id: Option<&str>) -> Endpoint {
     let device = device_id.and_then(|id| model.device(id));
     let node = model.node_of(device_id);
@@ -134,7 +149,7 @@ fn endpoint(model: &Model<'_>, core: &Core<'_>, device_id: Option<&str>) -> Endp
     }
 }
 
-fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
+pub(crate) fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
     let (flow, source) = model.flow_of(sender);
     Endpoint {
         transport: sender.transport.map(str::to_string),
@@ -146,7 +161,7 @@ fn sender_endpoint(model: &Model<'_>, sender: &Sender<'_>) -> Endpoint {
     }
 }
 
-fn receiver_endpoint(model: &Model<'_>, receiver: &Receiver<'_>) -> Endpoint {
+pub(crate) fn receiver_endpoint(model: &Model<'_>, receiver: &Receiver<'_>) -> Endpoint {
     Endpoint {
         transport: receiver.transport.map(str::to_string),
         format: receiver.format.map(str::to_string),

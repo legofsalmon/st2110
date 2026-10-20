@@ -17,6 +17,9 @@ pub const QUERY: &str = "_nmos-query._tcp";
 /// The service type Nodes advertise their Node API under.
 pub const NODE: &str = "_nmos-node._tcp";
 
+/// The service type IS-10 Authorization Servers advertise themselves under.
+pub const AUTH: &str = "_nmos-auth._tcp";
+
 /// Registries with a priority of 100 or more are for development (IS-04 §3).
 const DEVELOPMENT: u32 = 100;
 
@@ -28,6 +31,19 @@ pub enum ApiKind {
     Query,
     /// A Node's Node API.
     Node,
+    /// An IS-10 Authorization Server.
+    Auth,
+}
+
+impl ApiKind {
+    /// The DNS-SD service type it is advertised under.
+    pub fn service(self) -> &'static str {
+        match self {
+            Self::Query => QUERY,
+            Self::Node => NODE,
+            Self::Auth => AUTH,
+        }
+    }
 }
 
 /// An NMOS API, found by DNS-SD or given.
@@ -52,6 +68,10 @@ pub struct Api {
     /// `ver_snd` and the rest), which change when its resources do.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub counters: BTreeMap<String, String>,
+    /// An Authorization Server's `api_selector`: the path of its issuer identifier,
+    /// without the slashes at either end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }
 
 impl Api {
@@ -83,7 +103,21 @@ impl Api {
                 .filter(|(k, _)| k.starts_with("ver_"))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            selector: service
+                .txt
+                .get("api_selector")
+                .map(|s| s.trim().trim_matches('/').to_string())
+                .filter(|s| !s.is_empty()),
         })
+    }
+
+    /// An Authorization Server's issuer URL, from its address and `api_selector`, as
+    /// IS-10 Discovery forms its metadata URL from them.
+    pub fn issuer(&self) -> String {
+        match &self.selector {
+            Some(path) => format!("{}/{path}/", self.url),
+            None => format!("{}/", self.url),
+        }
     }
 
     /// A registry named on the command line or in the app, rather than found.
@@ -97,6 +131,7 @@ impl Api {
             auth: false,
             by: "given".into(),
             counters: BTreeMap::new(),
+            selector: None,
         }
     }
 
@@ -118,6 +153,13 @@ pub const MDNS: &str = "mDNS";
 /// then by priority, the lowest first, and at random among equals (step 4). The random
 /// order holds for the life of the program, so that it stays with one registry.
 pub fn by_preference<'a>(apis: impl IntoIterator<Item = &'a Api>) -> Vec<&'a Api> {
+    by_preference_given(apis, false)
+}
+
+/// The registries in the order to try them, as [`by_preference`] has it, for a client
+/// that can give an IS-10 token when `authorized`: then one that asks for authorization
+/// is as good as one that does not.
+pub fn by_preference_given<'a>(apis: impl IntoIterator<Item = &'a Api>, authorized: bool) -> Vec<&'a Api> {
     use std::hash::BuildHasher;
     static SHUFFLE: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
     let shuffle = SHUFFLE.get_or_init(std::hash::RandomState::new);
@@ -127,7 +169,7 @@ pub fn by_preference<'a>(apis: impl IntoIterator<Item = &'a Api>) -> Vec<&'a Api
     }
     registries.sort_by_key(|a| {
         let priority = a.priority.unwrap_or(DEVELOPMENT - 1);
-        (a.auth, priority >= DEVELOPMENT, priority, shuffle.hash_one(&a.url), a.url.clone())
+        (a.auth && !authorized, priority >= DEVELOPMENT, priority, shuffle.hash_one(&a.url), a.url.clone())
     });
     let mut seen = std::collections::HashSet::new();
     registries.retain(|a| seen.insert(a.url.clone()));
@@ -198,6 +240,12 @@ impl Reader {
         let client = match api.kind {
             ApiKind::Query => Client::Query(QueryClient::connect(&api.url, options)?),
             ApiKind::Node => Client::Node(NodeClient::connect(&api.url, options)?),
+            ApiKind::Auth => {
+                return Err(client::Error {
+                    url: api.url.clone(),
+                    message: "an Authorization Server lists no Senders".into(),
+                });
+            }
         };
         Ok(Self { client, fetched: HashMap::new() })
     }

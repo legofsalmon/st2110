@@ -2968,6 +2968,20 @@ section.details h3 { color: var(--dim); margin: var(--ds-space-3) 0 var(--ds-spa
 section.details ul { margin: var(--ds-space-half) 0 var(--ds-space-half) var(--ds-space-4); padding: 0; font: var(--ds-text-caption); }
 li.problem { color: var(--bad-ink); } li.warning { color: var(--warn-ink); }
 section.details .ds-disclosure { margin-top: var(--ds-space-2); }
+/* Sending: the open source's Sender, as its Connection API reads it back, and
+   the fields and buttons that change it. The fields are the design system's
+   (a label above, an example as the placeholder, the error under the field);
+   Stop and a move arm first, as they reach a live output. */
+.sending .state { font: var(--ds-text-body); margin: var(--ds-space-1) 0 var(--ds-space-2); }
+.sending .legs { display: flex; flex-wrap: wrap; gap: var(--ds-space-2) var(--ds-space-4); }
+.sending .ds-form-row { width: min(100%, 240px); }
+.sending .ds-field { font-family: var(--ds-font-mono); }
+.sending .actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2); margin: var(--ds-space-3) 0 var(--ds-space-1); }
+.sending .result { font: var(--ds-text-caption); }
+/* Armed, as the design system's danger button is: a move is not destructive at
+   rest, so only its armed press is drawn red. */
+.sending .ds-btn[data-armed='true'] { background: var(--bad); border-color: var(--bad); color: var(--ds-bad-on); }
+.sending .result.bad { color: var(--bad-ink); }
 pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-control); padding: var(--ds-space-2); overflow: auto; max-height: 260px; }
 /* Motion (the design system's motion.md): a notice, the open source's details
    and a new line in the log are small things arriving near where they were
@@ -3004,6 +3018,7 @@ pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-spa
   <button id="clear" class="ds-btn" title="Release every armed crosspoint (Esc)" hidden>Clear</button>
   <span id="mode-hint" class="hint"></span>
   <label class="ds-switch" title="Check each connection against the Receiver, and connect nothing"><input type="checkbox" role="switch" id="dry"> Check only</label>
+  <label class="ds-switch" id="group-switch" title="Take the rest of a receiver's group with it, such as a monitor's audio with its video, from the source's group (BCP-002-01)" hidden><input type="checkbox" role="switch" id="group"> With its group</label>
   <label class="ds-switch" title="Receive each source's stream on this machine to show its picture or sound"><input type="checkbox" role="switch" id="live"> Live previews</label>
   <span class="spacer"></span>
   <button id="refresh" class="ds-btn" title="Read the registry again">Refresh</button>
@@ -3182,12 +3197,23 @@ function name(resource) {
   return resource.label || resource.id.slice(0, 8);
 }
 
+// Taking a receiver's group with it is offered only where the registry has groups,
+// and each crosspoint's label says the group goes too.
+function grouping() { return !$("group-switch").hidden && $("group").checked; }
+
+function withGroup(r) {
+  if (!grouping() || !r.group) return "";
+  const rest = state.receivers.filter((o) => o.id !== r.id && o.group && o.group.key === r.group.key).length;
+  return rest ? `, with the rest of group ${r.group.name} (${rest} more)` : "";
+}
+
 function render() {
   if (!state) return;
   $("registry").textContent = state.registry;
   $("registry").title = state.auth ? `IS-10: ${state.auth}` : "";
   $("auth").hidden = !state.auth;
   $("demo").hidden = !state.demo;
+  $("group-switch").hidden = !state.receivers.some((r) => r.group);
   renderLevels();
   const shown = (format) => level === "all" || format === level;
   // Grouped by format, video first, and in label order within each, as the registry lists them.
@@ -3225,13 +3251,13 @@ function render() {
       if (!thumb) { thumb = el("img", { class: "thumb", alt: "" }); thumbs.set(r.id, thumb); }
       thumb.setAttribute("data-thumb", r.sender_id);
     } else thumbs.delete(r.id);
-    const tr = el("tr", {}, el("th", { class: "dst", title: r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
+    const tr = el("tr", {}, el("th", { class: "dst", title: r.group ? `${r.id}\nGroup ${r.group.name}: ${r.group.role}` : r.id }, thumb, name(r), where ? el("small", { text: where }) : null));
     columns.forEach((s, c) => {
       // The hover says what a click does in this mode, and the state it is in.
       const isArmed = armed.has(r.id) && armed.get(r.id) === s.id;
       let kind = "fit", label = salvo
-        ? (isArmed ? `${name(r)} from ${name(s)}, armed for the salvo: click to release` : `Arm ${name(r)} from ${name(s)} for the salvo`)
-        : `${$("dry").checked ? "Check" : "Connect"} ${name(r)} to ${name(s)}: click to ${$("dry").checked ? "check" : "take"} now`;
+        ? (isArmed ? `${name(r)} from ${name(s)}, armed for the salvo: click to release` : `Arm ${name(r)} from ${name(s)}${withGroup(r)} for the salvo`)
+        : `${$("dry").checked ? "Check" : "Connect"} ${name(r)} to ${name(s)}${withGroup(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
       if (r.current === s.i) { kind = "live"; label = `${name(r)} is taking ${name(s)}`; }
       else if (s.format && r.format && s.format !== r.format) { kind = "na"; label = ""; }
       else if (!fits.has(s.i)) { kind = "unfit"; label = `${name(r)} cannot take ${name(s)}: click for why`; }
@@ -3249,7 +3275,7 @@ function render() {
     const offArmed = armed.has(r.id) && armed.get(r.id) === null;
     const offTitle = !takes && !offArmed ? `${name(r)} is not taking a stream`
       : salvo ? (offArmed ? `Disconnecting ${name(r)} is armed for the salvo: click to release` : `Arm disconnecting ${name(r)} for the salvo`)
-      : `${$("dry").checked ? "Check disconnecting" : "Disconnect"} ${name(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
+      : `${$("dry").checked ? "Check disconnecting" : "Disconnect"} ${name(r)}${withGroup(r)}: click to ${$("dry").checked ? "check" : "take"} now`;
     const off = el("button", {
       class: "off", text: "off", title: offTitle, "aria-label": `Disconnect ${name(r)}`,
       onclick: () => click(r, null, takes ? "fit" : "idle"),
@@ -3320,9 +3346,9 @@ async function take(routes) {
     const outcome = await call("/api/take", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ routes, dry_run: $("dry").checked }),
+      body: JSON.stringify({ routes, dry_run: $("dry").checked, group: grouping() }),
     });
-    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections });
+    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections, notes: outcome.notes });
     if (outcome.succeeded && !$("dry").checked) for (const route of routes) armed.delete(route.receiver);
   } catch (e) {
     // Nothing is switched when the router answers with a refusal; when it cannot
@@ -3417,6 +3443,10 @@ function logEntry(e) {
     $("log").prepend(el("div", { class: "entry bad" }, stamp(e.at), (dry ? "Check only: " : "") + `Nothing was switched: ${e.error}`));
     return;
   }
+  // What of a group was left as it is shows under the connections that were made.
+  for (const note of [...(e.notes || [])].reverse()) {
+    $("log").prepend(el("div", { class: "entry warn" }, stamp(e.at), (dry ? "Check only: " : "") + note));
+  }
   for (const c of [...(e.connections || [])].reverse()) {
     const good = ["done", "scheduled", "planned"].includes(c.state);
     const soft = ["held", "rolled-back"].includes(c.state);
@@ -3496,6 +3526,7 @@ function statsLine(report) {
 function screenFor(screen, s, st) {
   const note = (text) => screen.replaceChildren(el("span", { class: "note", text }));
   if (!live) return note(state && state.previews === 0 ? "Previews are off (--previews 0)" : "Previews off");
+  if (s.enabled === false) return note("Off: it sends nothing");
   if (refused[s.id]) return note(refused[s.id]);
   if (!watched.includes(s.id)) return note(`Not previewed: at most ${state.previews} at once`);
   if (st && st.error) return note(st.error);
@@ -3536,13 +3567,14 @@ function showLive() {
     node.setAttribute("aria-expanded", String(opened === s.id));
     node.querySelector(".name").textContent = name(s);
     node.title = opened === s.id ? `${name(s)}: click to close its details` : `${name(s)}: click for details`;
-    node.querySelector(".where").textContent = to.length ? `to ${to.join(", ")}` : `${s.device || ""}${s.device ? " · " : ""}not routed`;
+    const off = s.enabled === false ? "off, sends nothing" : null;
+    node.querySelector(".where").textContent = to.length ? `to ${to.join(", ")}${off ? " · " + off : ""}` : `${s.device || ""}${s.device ? " · " : ""}${off || "not routed"}`;
     node.querySelector(".format").textContent = (st && st.report && st.report.stream) || s.summary || s.format || "";
     node.querySelector(".stats").textContent = live && st ? statsLine(st.report) : "";
     // Hollow while nothing is being received, so off is told by its shape too.
     const dot = node.querySelector(".ds-dot");
     const problems = st && st.report ? st.report.problems.length : 0;
-    dot.className = "ds-dot " + (!live || !st ? "ds-dot--off" : st.error ? "ds-dot--bad" : problems ? "ds-dot--warn" : st.report ? "ds-dot--ok" : "ds-dot--off");
+    dot.className = "ds-dot " + (!live || !st || s.enabled === false ? "ds-dot--off" : st.error ? "ds-dot--bad" : problems ? "ds-dot--warn" : st.report ? "ds-dot--ok" : "ds-dot--off");
     screenFor(node.querySelector(".screen"), s, st);
     node.classList.toggle("routed", to.length > 0);
     const title = node.querySelector(".title");
@@ -3567,7 +3599,8 @@ function showLive() {
 
 async function watch() {
   if (!live || document.hidden || !state) return;
-  watched = [...cards.keys()].slice(0, state.previews);
+  // A Sender that is off sends nothing to receive.
+  watched = [...cards.values()].filter((c) => c.sender.enabled !== false).map((c) => c.sender.id).slice(0, state.previews);
   try {
     const answer = await call("/api/watch", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -3648,6 +3681,7 @@ function renderDetails() {
   box.replaceChildren(
     el("div", { class: "details-head" }, el("h2", { text: snd.label || d.id }), el("span", { class: "spacer" }), close),
     facts(flowFacts),
+    el("h3", { class: "label", text: "Sending" }), renderSending(d),
     el("h3", { class: "label", text: "Received here" }), el("div", { id: "details-live" }),
     el("h3", { class: "label", text: "SDP file" }),
     d.sdp_error ? el("div", { class: "line", text: `Cannot be read: ${d.sdp_error}` }) : legs,
@@ -3657,11 +3691,188 @@ function renderDetails() {
   showDetailsLive();
 }
 
+// Sending: the open source's Sender turned on or off, or sent elsewhere, through its
+// Connection API. What it shows is what the Sender read back, not what was asked for;
+// after a change the details are read again. Stopping, and moving a Sender that is
+// on, reach a live output, so they arm first: the button turns red and says what
+// the next press does, and the arm time, leaving the button or Escape lets it go.
+// Starting happens at once. Check only checks the change and makes none.
+const ARM_MS = 3000;   // the design system's timing.arm
+let sendArm = null;    // the armed button and its timer
+let sending = false;   // a change is on its way
+
+function where(leg) {
+  if (!leg || leg.rtp_enabled === false || !leg.destination_ip || leg.destination_ip === "auto") return null;
+  const ip = leg.destination_ip.includes(":") ? `[${leg.destination_ip}]` : leg.destination_ip;
+  return Number.isInteger(leg.destination_port) ? `${ip}:${leg.destination_port}` : ip;
+}
+
+function disarmSend() {
+  if (!sendArm) return;
+  clearTimeout(sendArm.timer);
+  const { button } = sendArm;
+  sendArm = null;
+  button.removeAttribute("data-armed");
+  sendLabels();
+}
+
+// What each button says: what it does, and with Check only, that it only checks.
+function sendLabels() {
+  const box = document.querySelector(".sending");
+  if (!box || !details) return;
+  const dry = $("dry").checked;
+  const label = (details.sender && details.sender.label) || details.id;
+  const set = (button, text) => { if (button && !button.dataset.armed) button.firstChild.textContent = text; };
+  set(box.querySelector(".move"), dry ? "Check these destinations" : "Send to these destinations");
+  set(box.querySelector(".stop"), dry ? "Check stopping it" : "Stop sending");
+  set(box.querySelector(".start"), dry ? "Check starting it" : "Start sending");
+  const move = box.querySelector(".move");
+  if (move) {
+    const changed = [...box.querySelectorAll(".ds-field")].some((f) => f.value.trim() !== f.dataset.was);
+    move.disabled = !changed;
+    move.title = changed ? `${label} sends to what the fields say${details.receivers.length ? `; ${details.receivers.join(", ")} take it now` : ""}`
+      : "Change a destination above first";
+  }
+}
+
+function renderSending(d) {
+  const box = el("div", { class: "sending" });
+  const snd = d.sender || {};
+  if (!d.active) {
+    box.append(el("div", { class: "line", text: `Cannot read what it is doing now: ${d.active_error || "its Connection API did not answer"}. Reopen its details to try again.` }));
+    return box;
+  }
+  const unicast = (snd.transport || "").endsWith("rtp.ucast");
+  const on = d.active.master_enable === true;
+  const legs = d.active.transport_params || [];
+  const to = legs.map(where).filter(Boolean);
+  box.append(el("div", { class: "state", text: on ? (to.length ? `On, sending to ${to.join(" and ")}` : "On, with nowhere to send yet") : "Off: it sends nothing" }));
+  const fields = el("div", { class: "legs" });
+  const example = unicast ? "192.168.10.33:5004" : "239.10.1.1:5004";
+  legs.forEach((leg, i) => {
+    const id = `send-leg-${i}`;
+    const value = where(leg) || "";
+    const input = el("input", { class: "ds-field", id, value, placeholder: example, autocomplete: "off", spellcheck: "false", "aria-describedby": `${id}-error send-hint`, "data-was": value });
+    input.addEventListener("input", () => { input.removeAttribute("aria-invalid"); $(`${id}-error`).hidden = true; disarmSend(); sendLabels(); });
+    fields.append(el("div", { class: "ds-form-row" },
+      el("label", { class: "ds-label", for: id, text: legs.length > 1 ? `Leg ${i + 1} destination` : "Destination" }),
+      input, el("div", { class: "ds-error", id: `${id}-error`, hidden: "" })));
+  });
+  box.append(fields, el("div", { class: "ds-hint", id: "send-hint", text: (unicast
+    ? "The address and port of the Receiver it sends to. Taking it to a Receiver in the grid sets this for you."
+    : "A multicast group and its port.") + (legs.length > 1 ? " Leave a leg empty to stop sending on it." : "") }));
+  const button = (cls, text, armed, act) => {
+    const b = el("button", { class: `ds-btn ${cls}`, type: "button" }, el("span", { text }));
+    b.addEventListener("click", () => {
+      if (sending) return;
+      if (armed && !$("dry").checked && !b.dataset.armed) {
+        disarmSend();
+        b.dataset.armed = "true";
+        b.firstChild.textContent = armed;
+        sendArm = { button: b, timer: setTimeout(disarmSend, ARM_MS) };
+        return;
+      }
+      disarmSend();
+      act(b);
+    });
+    b.addEventListener("blur", () => { if (sendArm && sendArm.button === b) disarmSend(); });
+    b.addEventListener("keydown", (e) => { if (e.key === "Escape" && sendArm && sendArm.button === b) { e.stopPropagation(); disarmSend(); } });
+    return b;
+  };
+  const label = snd.label || d.id;
+  // The armed label says what the next press does, and who loses the stream by it.
+  const taking = d.receivers.length ? ` ${d.receivers.join(", ")} lose${d.receivers.length === 1 ? "s" : ""} it` : "";
+  const actions = el("div", { class: "actions" });
+  // While it is off, Start sends it to what the fields say.
+  if (legs.length && on) actions.append(button("move", "", `Move ${label}?${taking}`, (b) => changeSender(b, true, true)));
+  actions.append(on
+    ? button("ds-btn--danger stop", "", `Stop ${label}?${taking}`, (b) => changeSender(b, false, false))
+    : button("start", "", null, (b) => changeSender(b, true, true)));
+  box.append(actions, el("div", { class: "result", role: "status" }));
+  setTimeout(sendLabels);
+  return box;
+}
+
+// Sends the change: the fields' destinations when they were changed, else none, so
+// that a unicast Sender keeps the Receiver it was pointed at.
+async function changeSender(button, enable, withFields) {
+  const box = button.closest(".sending");
+  const inputs = [...box.querySelectorAll(".ds-field")];
+  const changed = withFields && inputs.some((f) => f.value.trim() !== f.dataset.was);
+  let destinations = [];
+  if (changed) {
+    const values = inputs.map((f) => f.value.trim());
+    const last = values.findLastIndex((v) => v !== "");
+    if (last < 0) {
+      showFieldError(inputs[0], "Give it somewhere to send, such as " + inputs[0].placeholder);
+      return;
+    }
+    const gap = values.slice(0, last).findIndex((v) => v === "");
+    if (gap >= 0) {
+      showFieldError(inputs[gap], `Leg ${gap + 1} needs a destination while a later leg has one`);
+      return;
+    }
+    destinations = values.slice(0, last + 1);
+  }
+  const result = box.querySelector(".result");
+  const dry = $("dry").checked;
+  sending = true;
+  button.setAttribute("aria-busy", "true");
+  result.className = "result";
+  result.textContent = "";
+  try {
+    const outcome = await call("/api/sender", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sender: details.id, enable, destinations, dry_run: dry }),
+    });
+    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections });
+    const said = [outcome.describe, ...outcome.problems, ...outcome.warnings].join(". ");
+    if (outcome.succeeded && !dry) {
+      // Read back what the Sender does now; the result stays in the log.
+      await refreshDetails();
+      const fresh = document.querySelector(".sending .result");
+      if (fresh) fresh.textContent = said;
+      return;
+    }
+    result.className = outcome.succeeded ? "result" : "result bad";
+    result.textContent = (dry ? "Check only: " : "") + said;
+  } catch (e) {
+    const leg = /^leg (\d+): (.*)$/.exec(e.message);
+    if (leg && inputs[leg[1] - 1]) showFieldError(inputs[leg[1] - 1], leg[2]);
+    else { result.className = "result bad"; result.textContent = `Nothing was changed: ${e.message}`; }
+  } finally {
+    sending = false;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+function showFieldError(input, message) {
+  input.setAttribute("aria-invalid", "true");
+  const error = $(`${input.id}-error`);
+  error.textContent = /[.?!]$/.test(message) ? message : message + ".";
+  error.hidden = false;
+  input.focus();
+}
+
+async function refreshDetails() {
+  const id = opened;
+  if (!id) return;
+  try {
+    const next = await call(`/api/stream?sender=${encodeURIComponent(id)}`);
+    if (opened === id) { details = next; renderDetails(); }
+  } catch (_) { /* the details keep what was last read */ }
+}
+
 function showDetailsLive() {
   const box = $("details-live");
   if (!box || !details) return;
   const st = liveStatus[details.id];
   const r = st && st.report;
+  const sender = state && state.senders.find((s) => s.id === details.id);
+  if (sender && sender.enabled === false) {
+    box.replaceChildren(el("div", { class: "line", text: "Off: it sends nothing to receive." }));
+    return;
+  }
   if (!live || !r) {
     box.replaceChildren(el("div", { class: "line", text: !live ? "Turn on live previews to receive this stream here." : (st && st.error) || refused[details.id] || "Waiting for the stream…" }));
     return;
@@ -3687,7 +3898,13 @@ $("live").onchange = () => {
 setInterval(watch, 3000);
 setInterval(poll, 500);
 
-$("dry").onchange = () => { renderSalvo(); render(); };
+$("dry").onchange = () => { disarmSend(); renderSalvo(); render(); sendLabels(); };
+// Off until turned on, and then kept in this browser: it reaches more outputs than the one clicked.
+try { $("group").checked = localStorage.getItem("st2110-router-group") === "on"; } catch (_) { /* not kept */ }
+$("group").onchange = () => {
+  try { localStorage.setItem("st2110-router-group", $("group").checked ? "on" : "off"); } catch (_) { /* not kept */ }
+  render();
+};
 $("mode-take").onclick = () => { salvo = false; armed.clear(); render(); renderSalvo(); };
 $("mode-salvo").onclick = () => { salvo = true; render(); renderSalvo(); };
 $("clear").onclick = () => { armed.clear(); render(); renderSalvo(); };

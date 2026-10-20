@@ -135,7 +135,7 @@ fn serves_the_page_and_the_demo_registry() {
 
     let state = router.get("/api/state");
     assert_eq!(state["demo"], true);
-    assert_eq!(state["senders"].as_array().unwrap().len(), 9);
+    assert_eq!(state["senders"].as_array().unwrap().len(), 10);
     assert_eq!(state["receivers"].as_array().unwrap().len(), 8);
     let routes = router.routes();
     assert_eq!(taking(&routes, "MON 1 video").as_deref(), Some("CAM 1 video"));
@@ -178,6 +178,55 @@ fn takes_one_route_and_a_salvo() {
     assert_eq!(taking(&routes, "MON 2 video"), None);
 }
 
+/// With `group`, a monitor's audio follows its video from the camera's group
+/// (BCP-002-01), and disconnects with it; what of a group is left as it is, says why.
+#[test]
+fn takes_a_monitors_group_from_a_cameras() {
+    let router = Router::start();
+    let state = router.get("/api/state");
+    let mon3 = state["receivers"].as_array().unwrap().iter().find(|r| r["label"] == "MON 3 audio").unwrap();
+    assert_eq!((&mon3["group"]["name"], &mon3["group"]["role"]), (&json!("Monitor 3"), &json!("Audio 1")));
+    let (status, grouped) = router
+        .post("/api/take", &json!({"routes": [{"receiver": "MON 3 video", "sender": "CAM 2 video"}], "group": true}));
+    assert_eq!((status, &grouped["succeeded"]), (200, &json!(true)), "{grouped:#}");
+    assert_eq!(grouped["activation"]["mode"], "activate_scheduled_absolute", "the two switch together");
+    let routes = router.routes();
+    assert_eq!(taking(&routes, "MON 3 video").as_deref(), Some("CAM 2 video"));
+    assert_eq!(taking(&routes, "MON 3 audio").as_deref(), Some("CAM 2 audio"));
+
+    let (_, off) =
+        router.post("/api/take", &json!({"routes": [{"receiver": "MON 3 audio", "sender": null}], "group": true}));
+    assert_eq!(off["connections"].as_array().unwrap().len(), 2, "{off:#}");
+    let routes = router.routes();
+    assert_eq!((taking(&routes, "MON 3 video"), taking(&routes, "MON 3 audio")), (None, None));
+
+    // The graphics Node gives no group, so the monitor's audio is left as it is.
+    let (_, gfx) = router
+        .post("/api/take", &json!({"routes": [{"receiver": "MON 4 video", "sender": "GFX 1 video"}], "group": true}));
+    assert_eq!(gfx["connections"].as_array().unwrap().len(), 1, "{gfx:#}");
+    assert!(gfx["notes"][0].as_str().unwrap().starts_with("MON 4 audio left as it is"), "{gfx:#}");
+    let log = router.get("/api/log");
+    assert!(log.to_string().contains("MON 4 audio left as it is"), "the log keeps it");
+}
+
+/// `st2110 connect --group` takes the same group, here only checked.
+#[test]
+fn connect_takes_a_group_too() {
+    let router = Router::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["connect", &format!("http://{}", router.address), "--receiver", "MON 3 video"])
+        .args(["--sender", "CAM 3 video", "--group", "--dry-run"])
+        .env("NO_COLOR", "1")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(text.contains("receiver \"MON 3 audio\""), "{text}");
+    assert!(text.contains("CAM 3 audio"), "{text}");
+}
+
 #[test]
 fn refuses_what_a_receiver_cannot_take_and_says_why() {
     let router = Router::start();
@@ -200,6 +249,55 @@ fn refuses_what_a_receiver_cannot_take_and_says_why() {
     ));
     assert_eq!(why["fits"], false);
     assert!(why["reason"].as_str().unwrap().contains("frame_height 270 is not one of 180"), "{why}");
+}
+
+#[test]
+fn turns_a_sender_off_and_sends_it_elsewhere() {
+    let router = Router::start();
+    let camera = router.sender("CAM 3 video");
+    let enabled = |router: &Router| {
+        let state = router.get("/api/state");
+        state["senders"].as_array().unwrap().iter().find(|s| s["id"] == camera.as_str()).unwrap()["enabled"].clone()
+    };
+    assert_eq!(enabled(&router), true);
+    let stream = router.get(&format!("/api/stream?sender={camera}"));
+    assert_eq!(stream["active"]["master_enable"], true, "{stream:#}");
+    assert_eq!(stream["active"]["transport_params"][0]["destination_ip"], "239.10.3.1", "{stream:#}");
+
+    let (status, off) = router.post("/api/sender", &json!({"sender": camera, "enable": false}));
+    assert_eq!(status, 200, "{off:#}");
+    assert_eq!(off["succeeded"], true, "{off:#}");
+    assert_eq!(off["state"], "done");
+    assert!(off["describe"].as_str().unwrap().ends_with(": off: done"), "{off:#}");
+    assert_eq!(enabled(&router), false);
+
+    // Turned on again, to other groups; a leg past the last one given is turned off.
+    let (status, moved) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["239.10.3.9:5006"]}));
+    assert_eq!(status, 200, "{moved:#}");
+    assert_eq!(moved["succeeded"], true, "{moved:#}");
+    let stream = router.get(&format!("/api/stream?sender={camera}"));
+    let legs = &stream["active"]["transport_params"];
+    assert_eq!(legs[0]["destination_ip"], "239.10.3.9", "{stream:#}");
+    assert_eq!(legs[0]["destination_port"], 5006);
+    assert_eq!(legs[1]["rtp_enabled"], false);
+    assert_eq!(enabled(&router), true);
+    // Both are in the log, as takes are.
+    assert_eq!(router.get("/api/log")["log"].as_array().unwrap().len(), 2);
+
+    // A unicast address on a multicast Sender is refused, and a bad one named.
+    let (_, refused) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["192.168.10.31:5004"]}));
+    assert_eq!(refused["state"], "refused", "{refused:#}");
+    let (status, bad) =
+        router.post("/api/sender", &json!({"sender": camera, "enable": true, "destinations": ["239.10"]}));
+    assert_eq!(status, 400);
+    assert!(bad["error"].as_str().unwrap().starts_with("leg 1: "), "{bad:#}");
+    // Only from the page.
+    let headers = [("Content-Type", "application/json"), ("Origin", "http://evil.example")];
+    let body = json!({"sender": camera, "enable": false}).to_string();
+    assert_eq!(router.request("POST", "/api/sender", &headers, &body).0, 403);
+    assert_eq!(enabled(&router), true);
 }
 
 #[test]
@@ -396,7 +494,10 @@ fn asks_for_is_10_tokens_with_demo_auth() {
     assert_eq!(taking(&router.routes(), "MON 1 video").as_deref(), Some("CAM 1 video"));
     let one = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
     assert_eq!(one["succeeded"], true, "{one:#}");
-    assert!(router.get("/api/state")["auth"].as_str().unwrap().contains("st2110-demo"));
+    // It registered itself for private_key_jwt, and publishes its key.
+    let auth = router.get("/api/state")["auth"].as_str().unwrap().to_string();
+    assert!(auth.contains("signing with its key"), "{auth}");
+    assert_eq!(router.get("/.well-known/jwks.json")["keys"][0]["alg"], "ES256");
     let mut socket = router.events();
     next(&mut socket, "state");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -431,6 +532,47 @@ fn asks_for_is_10_tokens_with_demo_auth() {
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
     );
+}
+
+/// `st2110 connect` with no registry named finds the demo's by unicast DNS-SD, and
+/// with --register finds its Authorization Server the same way, registers by RFC 7591
+/// with the initial access token, and keeps the registration for the next run.
+#[test]
+fn finds_the_demo_by_dns_sd_and_registers_with_its_authorization_server() {
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth"]);
+    let file = StateFile::new("clients");
+    let clients = file.0.with_file_name("clients.json");
+    let run = |more: &[&str], registration: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_st2110"))
+            .args(["connect", "--dns-server", &router.address, "--domain", "demo.test"])
+            .args(more)
+            .env("ST2110_REGISTRATION_TOKEN", registration)
+            .env("NO_COLOR", "1")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .output()
+            .expect("runs");
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (output.status.code(), text)
+    };
+    let register = ["--register", "--client-file", clients.to_str().unwrap()];
+    let (code, text) = run(&register, "demo-registration");
+    assert_eq!(code, Some(0), "{text}");
+    let base = format!("http://{}", router.address);
+    assert!(text.contains(&format!("Registry: {base} (st2110 demo registry, found by DNS in demo.test)")), "{text}");
+    assert!(text.contains(&format!("Authorization Server: {base}/ (")), "{text}");
+    assert!(text.contains("Registered with"), "{text}");
+    assert!(text.contains("receiver \"MON 4 video\""), "{text}");
+    let kept = std::fs::read_to_string(&clients).unwrap();
+    assert!(kept.contains("client_secret"), "{kept}");
+    // Kept, so not registered again.
+    let (code, text) = run(&register, "");
+    assert_eq!(code, Some(0), "{text}");
+    assert!(!text.contains("Registered with"), "{text}");
+    // Without the initial access token, the demo registers no one.
+    let (code, text) = run(&["--register", "--client-file", file.0.with_file_name("other.json").to_str().unwrap()], "");
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("invalid_token"), "{text}");
 }
 
 /// A state file of its own, removed when dropped.

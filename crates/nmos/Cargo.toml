@@ -10,7 +10,7 @@ publish.workspace = true
 
 [features]
 # An HTTP client for the IS-04 Query API and Senders' SDP files.
-client = ["dep:ureq", "dep:rustls", "dep:rustls-platform-verifier"]
+client = ["dep:ureq", "dep:rustls", "dep:rustls-platform-verifier", "dep:ring"]
 
 [dependencies]
 st2110-sdp = { workspace = true, features = ["serde"] }
@@ -20,6 +20,9 @@ ureq = { workspace = true, optional = true }
 # The same TLS as ureq's, for `wss://` subscriptions.
 rustls = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
+# The key an IS-10 client signs its private_key_jwt assertions with: already ureq's
+# cryptography, through rustls.
+ring = { workspace = true, optional = true }
 
 [lints]
 workspace = true

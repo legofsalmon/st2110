@@ -11,8 +11,15 @@
 //!   another program can keep it fresh.
 //! - [`Token::client_credentials`]: an IS-10 Authorization Server, found from its
 //!   RFC 8414 metadata, asked for one with the OAuth 2.0 Client Credentials grant and
-//!   the client's id and secret (`client_secret_basic`), and asked again when it is
-//!   half way to expiring, as IS-10 recommends, or when a server refuses it.
+//!   the client's id and secret (`client_secret_basic`) or an assertion signed with its
+//!   key (`private_key_jwt`, RFC 7523), and asked again when it is half way to
+//!   expiring, as IS-10 recommends, or when a server refuses it.
+//!
+//! A client that is not registered yet can register itself with [`register`], by OAuth
+//! 2.0 Dynamic Client Registration (RFC 7591), as IS-10 recommends for zero
+//! configuration: with an initial access token, or unauthenticated where the server
+//! allows it. [`SigningKey`] is the key a `private_key_jwt` client signs with, and
+//! publishes at its `jwks_uri`.
 //!
 //! A token is only sent over HTTPS, or to this machine: IS-10 and BCP-003-01 expect TLS,
 //! and a token sent in the clear can be read by anyone on the way.
@@ -22,7 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+use serde_json::{Value, json};
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -66,6 +75,9 @@ pub struct ClientCredentials {
     pub client_secret: String,
     /// The scopes to ask for, separated by spaces: [`SCOPES`] for a controller.
     pub scope: String,
+    /// The key to sign a `private_key_jwt` assertion with, instead of sending the
+    /// secret, for a client registered that way.
+    pub key: Option<SigningKey>,
 }
 
 impl fmt::Debug for ClientCredentials {
@@ -132,17 +144,7 @@ impl Token {
     /// Tokens from an IS-10 Authorization Server, by the Client Credentials grant.
     /// Nothing is asked of the server until the first token is wanted.
     pub fn client_credentials(credentials: ClientCredentials, timeout: Duration, env_proxy: bool) -> Self {
-        let proxy = if env_proxy { ureq::Proxy::try_from_env() } else { None };
-        let agent: Agent = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .proxy(proxy)
-            .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
-            .user_agent(concat!("st2110-nmos/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
-        Self::new(Source::Client { credentials, agent })
+        Self::new(Source::Client { credentials, agent: agent(timeout, env_proxy) })
     }
 
     fn new(source: Source) -> Self {
@@ -155,7 +157,8 @@ impl Token {
             Source::Fixed(_) => "a token given".into(),
             Source::File(path) => format!("the token in {}", path.display()),
             Source::Client { credentials, .. } => {
-                format!("tokens for {} from {}", credentials.client_id, credentials.server)
+                let by = if credentials.key.is_some() { ", signing with its key" } else { "" };
+                format!("tokens for {} from {}{by}", credentials.client_id, credentials.server)
             }
         }
     }
@@ -283,17 +286,31 @@ fn request(
     if !may_send_to(&token_endpoint) {
         return Err(error(format!("{token_endpoint}: secrets are sent over https:// only, or on this machine")));
     }
-    let basic = base64(
-        format!("{}:{}", form_encode(&credentials.client_id), form_encode(&credentials.client_secret)).as_bytes(),
-    );
-    let body = format!("grant_type=client_credentials&scope={}", form_encode(&credentials.scope));
-    let mut response = agent
+    let mut body = format!("grant_type=client_credentials&scope={}", form_encode(&credentials.scope));
+    let mut post = agent
         .post(&token_endpoint)
-        .header("Authorization", format!("Basic {basic}"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .send(body)
-        .map_err(|e| error(format!("{token_endpoint}: {e}")))?;
+        .header("Accept", "application/json");
+    match &credentials.key {
+        // RFC 7523 §2.2: the client authenticates with an assertion it signs, and sends
+        // no secret.
+        Some(key) => {
+            let assertion = key.assertion(&credentials.client_id, &token_endpoint)?;
+            body.push_str(&format!(
+                "&client_id={}&client_assertion_type={}&client_assertion={assertion}",
+                form_encode(&credentials.client_id),
+                form_encode(ASSERTION_TYPE)
+            ));
+        }
+        None => {
+            let basic = base64(
+                format!("{}:{}", form_encode(&credentials.client_id), form_encode(&credentials.client_secret))
+                    .as_bytes(),
+            );
+            post = post.header("Authorization", format!("Basic {basic}"));
+        }
+    }
+    let mut response = post.send(body).map_err(|e| error(format!("{token_endpoint}: {e}")))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
@@ -324,6 +341,267 @@ fn request(
     }
     let lifetime = reply.get("expires_in").and_then(Value::as_f64).filter(|s| *s > 0.0).map(Duration::from_secs_f64);
     Ok((value.to_string(), lifetime))
+}
+
+/// The agent every request to an Authorization Server is made with: no redirects, the
+/// platform's certificates, and `timeout` for each request.
+fn agent(timeout: Duration, env_proxy: bool) -> Agent {
+    let proxy = if env_proxy { ureq::Proxy::try_from_env() } else { None };
+    Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(proxy)
+        .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+        .user_agent(concat!("st2110-nmos/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+/// An Authorization Server's metadata (RFC 8414), from its issuer URL or its metadata
+/// URL.
+pub fn metadata(server: &str, timeout: Duration, env_proxy: bool) -> Result<Value, Error> {
+    let url = metadata_url(server)?;
+    get_json(&agent(timeout, env_proxy), &url)
+}
+
+/// A client's published keys, from its `jwks_uri`, as an Authorization Server reads
+/// them to check its assertions.
+pub fn get_jwks(url: &str, timeout: Duration) -> Result<Value, Error> {
+    get_json(&agent(timeout, false), url)
+}
+
+/// Sixteen random bytes in base64url: for a token, an assertion's `jti` or a name that
+/// no one can guess.
+pub fn random_id() -> Result<String, Error> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new().fill(&mut bytes).map_err(|_| error("no random number"))?;
+    Ok(base64url(&bytes))
+}
+
+/// RFC 7523's `client_assertion_type` for a signed JWT.
+pub const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/// How a client registers: what it asks to be, and how it will authenticate.
+#[derive(Clone, Debug)]
+pub struct Registration {
+    /// Its name, which IS-10 asks to be unique to each instance of the software.
+    pub client_name: String,
+    /// The scopes it will ask for, separated by spaces.
+    pub scope: String,
+    /// Where it publishes the public key of its [`SigningKey`], to register for
+    /// `private_key_jwt`; `None` registers for a secret (`client_secret_basic`).
+    pub jwks_uri: Option<String>,
+    /// The initial access token the server gave for registering (RFC 7591 §3), when it
+    /// asks for one.
+    pub initial_token: Option<String>,
+}
+
+/// What the server registered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Registered {
+    /// The client id it issued.
+    pub client_id: String,
+    /// The secret it issued, for a client registered for one.
+    pub client_secret: Option<String>,
+}
+
+impl fmt::Debug for Registered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registered").field("client_id", &self.client_id).finish_non_exhaustive()
+    }
+}
+
+/// Registers a client with the Authorization Server whose issuer or metadata URL is
+/// `server`, at the `registration_endpoint` its metadata gives (RFC 7591 §3), for the
+/// Client Credentials grant (IS-10 Behaviour: Clients, Client Registration).
+pub fn register(
+    server: &str,
+    registration: &Registration,
+    timeout: Duration,
+    env_proxy: bool,
+) -> Result<Registered, Error> {
+    let agent = agent(timeout, env_proxy);
+    let url = metadata_url(server)?;
+    if !may_send_to(&url) {
+        return Err(error(format!("{url}: clients register over https:// only, or on this machine")));
+    }
+    let metadata = get_json(&agent, &url)?;
+    let endpoint = metadata
+        .get("registration_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error(format!("{url}: the server offers no dynamic client registration")))?;
+    if !may_send_to(endpoint) {
+        return Err(error(format!("{endpoint}: clients register over https:// only, or on this machine")));
+    }
+    let method = if registration.jwks_uri.is_some() { "private_key_jwt" } else { "client_secret_basic" };
+    let methods = metadata.get("token_endpoint_auth_methods_supported").and_then(Value::as_array);
+    if methods.is_some_and(|m| !m.iter().any(|m| m.as_str() == Some(method))) {
+        return Err(error(format!("{url}: the server does not take {method} at its token endpoint")));
+    }
+    let mut body = json!({
+        "client_name": registration.client_name,
+        "scope": registration.scope,
+        "grant_types": ["client_credentials"],
+        "response_types": [],
+        "token_endpoint_auth_method": method,
+    });
+    if let Some(jwks_uri) = &registration.jwks_uri {
+        body["jwks_uri"] = json!(jwks_uri);
+        body["token_endpoint_auth_signing_alg"] = json!("ES256");
+    }
+    let mut post = agent.post(endpoint).header("Content-Type", "application/json").header("Accept", "application/json");
+    if let Some(token) = &registration.initial_token {
+        post = post.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = post.send(body.to_string()).map_err(|e| error(format!("{endpoint}: {e}")))?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(LIMIT)
+        .read_to_string()
+        .map_err(|e| error(format!("{endpoint}: reading the response: {e}")))?;
+    let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !(200..300).contains(&status) {
+        // RFC 7591 §3.2.2: `error`, and perhaps `error_description`.
+        let why = [reply.get("error"), reply.get("error_description")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(": ");
+        let why = if why.is_empty() { String::new() } else { format!(": {why}") };
+        return Err(error(format!("{endpoint}: HTTP {status}{why}")));
+    }
+    let client_id = reply
+        .get("client_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| error(format!("{endpoint}: no client_id in the response")))?;
+    let client_secret = reply.get("client_secret").and_then(Value::as_str).map(str::to_string);
+    if registration.jwks_uri.is_none() && client_secret.is_none() {
+        return Err(error(format!("{endpoint}: no client_secret in the response")));
+    }
+    Ok(Registered { client_id: client_id.to_string(), client_secret })
+}
+
+/// An ES256 (ECDSA P-256) key a `private_key_jwt` client signs its assertions with.
+/// Clones share it.
+#[derive(Clone)]
+pub struct SigningKey {
+    pair: Arc<EcdsaKeyPair>,
+    pkcs8: Arc<Vec<u8>>,
+}
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKey").field("kid", &self.kid()).finish_non_exhaustive()
+    }
+}
+
+impl SigningKey {
+    /// A new key.
+    pub fn generate() -> Result<Self, Error> {
+        let random = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random)
+            .map_err(|_| error("no key could be made"))?;
+        Self::from_pkcs8(pkcs8.as_ref())
+    }
+
+    /// The key kept as PKCS #8 bytes.
+    pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, Error> {
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8, &SystemRandom::new())
+            .map_err(|_| error("not an ECDSA P-256 key"))?;
+        Ok(Self { pair: Arc::new(pair), pkcs8: Arc::new(pkcs8.to_vec()) })
+    }
+
+    /// The key as PKCS #8 bytes, to keep.
+    pub fn pkcs8(&self) -> &[u8] {
+        &self.pkcs8
+    }
+
+    /// The public key as a JSON Web Key Set (RFC 7517), to publish at `jwks_uri`.
+    pub fn jwks(&self) -> Value {
+        let point = self.pair.public_key().as_ref();
+        json!({"keys": [{
+            "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": self.kid(),
+            "x": base64url(&point[1..33]), "y": base64url(&point[33..65]),
+        }]})
+    }
+
+    /// The key's id: the start of its public key, which is enough to tell keys apart.
+    pub fn kid(&self) -> String {
+        base64url(&self.pair.public_key().as_ref()[1..13])
+    }
+
+    /// A client assertion for the token endpoint `audience` (RFC 7523 §3), good for a
+    /// minute.
+    pub fn assertion(&self, client_id: &str, audience: &str) -> Result<String, Error> {
+        let random = SystemRandom::new();
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let header = json!({"alg": "ES256", "typ": "JWT", "kid": self.kid()});
+        let claims = json!({
+            "iss": client_id, "sub": client_id, "aud": audience,
+            "iat": now, "exp": now + 60, "jti": random_id()?,
+        });
+        let signed =
+            format!("{}.{}", base64url(header.to_string().as_bytes()), base64url(claims.to_string().as_bytes()));
+        let signature =
+            self.pair.sign(&random, signed.as_bytes()).map_err(|_| error("the assertion could not be signed"))?;
+        Ok(format!("{signed}.{}", base64url(signature.as_ref())))
+    }
+}
+
+/// Checks a client assertion as an Authorization Server does (RFC 7523 §3): signed
+/// with ES256 by a key in `jwks`, issued by and for `client_id`, for `audience`, and
+/// not expired. Gives its `jti`, for the server to refuse a second use.
+pub fn verify_assertion(assertion: &str, jwks: &Value, client_id: &str, audience: &str) -> Result<String, Error> {
+    let mut parts = assertion.split('.');
+    let (Some(header), Some(claims), Some(signature), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(error("the assertion is not a signed JWT"));
+    };
+    let decode = |part: &str| base64url_decode(part).ok_or_else(|| error("the assertion is not base64url"));
+    let header: Value =
+        serde_json::from_slice(&decode(header)?).map_err(|_| error("the assertion's header is not JSON"))?;
+    if header.get("alg").and_then(Value::as_str) != Some("ES256") {
+        return Err(error("the assertion is not signed with ES256"));
+    }
+    let kid = header.get("kid").and_then(Value::as_str);
+    let keys = jwks.get("keys").and_then(Value::as_array).into_iter().flatten();
+    let signed = &assertion[..assertion.len() - signature.len() - 1];
+    let signature = decode(signature)?;
+    let verified = keys.filter(|k| kid.is_none() || k.get("kid").and_then(Value::as_str) == kid).any(|k| {
+        let coordinate = |name: &str| k.get(name).and_then(Value::as_str).and_then(base64url_decode);
+        let (Some(x), Some(y)) = (coordinate("x"), coordinate("y")) else { return false };
+        let point = [&[4u8][..], &x, &y].concat();
+        ring::signature::UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
+            .verify(signed.as_bytes(), &signature)
+            .is_ok()
+    });
+    if !verified {
+        return Err(error("the assertion is not signed by the client's key"));
+    }
+    let claims: Value =
+        serde_json::from_slice(&decode(claims)?).map_err(|_| error("the assertion's claims are not JSON"))?;
+    let text = |name: &str| claims.get(name).and_then(Value::as_str);
+    if text("iss") != Some(client_id) || text("sub") != Some(client_id) {
+        return Err(error("the assertion is not the client's own"));
+    }
+    let audience_matches = match claims.get("aud") {
+        Some(Value::String(aud)) => aud == audience,
+        Some(Value::Array(auds)) => auds.iter().any(|a| a.as_str() == Some(audience)),
+        _ => false,
+    };
+    if !audience_matches {
+        return Err(error(format!("the assertion is not for {audience}")));
+    }
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if claims.get("exp").and_then(Value::as_u64).is_none_or(|exp| exp < now) {
+        return Err(error("the assertion has expired"));
+    }
+    text("jti").map(str::to_string).ok_or_else(|| error("the assertion has no jti"))
 }
 
 fn get_json(agent: &Agent, url: &str) -> Result<Value, Error> {
@@ -416,6 +694,19 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Base64url (RFC 4648 §5), unpadded, as JSON Web Tokens and Keys use it.
+pub fn base64url(bytes: &[u8]) -> String {
+    base64(bytes).trim_end_matches('=').replace('+', "-").replace('/', "_")
+}
+
+/// Decodes base64url, padded or not.
+pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    if text.contains(['+', '/']) {
+        return None;
+    }
+    base64_decode(&text.replace('-', "+").replace('_', "/"))
 }
 
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
@@ -513,5 +804,36 @@ mod tests {
         assert!(token.bearer().is_err());
         assert!(!format!("{token:?}").contains("second"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn encodes_base64url() {
+        assert_eq!(base64url(b"\xfb\xff"), "-_8");
+        assert_eq!(base64url_decode("-_8").as_deref(), Some(&b"\xfb\xff"[..]));
+        assert_eq!(base64url_decode("+/8"), None);
+    }
+
+    #[test]
+    fn signs_assertions_that_its_published_key_verifies() {
+        let key = SigningKey::generate().unwrap();
+        let again = SigningKey::from_pkcs8(key.pkcs8()).unwrap();
+        assert_eq!(key.kid(), again.kid());
+        let jwks = key.jwks();
+        assert_eq!(jwks["keys"][0]["crv"], "P-256");
+        let token = "https://auth.example/token";
+        let assertion = again.assertion("client-1", token).unwrap();
+        assert!(verify_assertion(&assertion, &jwks, "client-1", token).is_ok());
+        assert!(verify_assertion(&assertion, &jwks, "client-2", token).is_err(), "another client's");
+        assert!(verify_assertion(&assertion, &jwks, "client-1", "https://elsewhere/").is_err(), "for elsewhere");
+        let other = SigningKey::generate().unwrap().jwks();
+        assert!(verify_assertion(&assertion, &other, "client-1", token).is_err(), "another key");
+        let mut tampered = assertion.clone();
+        tampered.insert(assertion.find('.').unwrap() + 2, 'A');
+        assert!(verify_assertion(&tampered, &jwks, "client-1", token).is_err(), "tampered");
     }
 }

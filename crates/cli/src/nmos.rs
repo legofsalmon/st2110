@@ -65,7 +65,8 @@ fn load(target: &str, fetch: &Fetch) -> Result<Snapshot, String> {
             return Err(format!("--timeout {} is not a number of seconds above 0", fetch.timeout));
         }
         let token = fetch.auth.token(timeout, true)?;
-        let options = Options { timeout, fetch_sdp: fetch.sdp, token, ..Options::default() };
+        let options =
+            Options { timeout, fetch_sdp: fetch.sdp, fetch_active: true, token, versions: true, ..Options::default() };
         if lower.contains("/x-nmos/node") {
             let node = NodeClient::connect(target, &options).map_err(|e| e.to_string())?;
             return node.snapshot().map_err(|e| e.to_string());

@@ -44,21 +44,9 @@ pub(crate) struct DiscoverArgs {
     /// Do not look for NMOS Senders.
     #[arg(long, conflicts_with = "registry")]
     no_nmos: bool,
-    /// Where to ask by multicast DNS: its group, 224.0.0.251:5353, when omitted, or a
-    /// responder's own address and port.
-    #[arg(long, value_name = "ADDRESS:PORT")]
-    mdns: Option<SocketAddrV4>,
     /// Do not ask DNS servers for registries by unicast DNS-SD.
     #[arg(long)]
     no_dns: bool,
-    /// A DNS server to ask for registries, with its port when it is not 53; those the
-    /// system uses when omitted. Give it more than once for several.
-    #[arg(long, value_name = "ADDRESS", value_parser = dns_server)]
-    dns_server: Vec<SocketAddr>,
-    /// A domain to look for registries in, such as studio.example; the system's search
-    /// domains when omitted. Give it more than once for several.
-    #[arg(long, value_name = "DOMAIN")]
-    domain: Vec<String>,
     /// Save each stream's SDP file into this directory, named after the stream, to
     /// receive, view or check.
     #[arg(long, value_name = "DIRECTORY")]
@@ -69,10 +57,14 @@ pub(crate) struct DiscoverArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
+    /// Where to look for registries by DNS-SD, and the IS-10 token for those that ask
+    /// for one.
+    #[command(flatten)]
+    auth: crate::auth::Auth,
 }
 
 /// A DNS server's address, on port 53 unless it says otherwise.
-fn dns_server(text: &str) -> Result<SocketAddr, String> {
+pub(crate) fn dns_server(text: &str) -> Result<SocketAddr, String> {
     text.parse::<SocketAddr>()
         .or_else(|_| text.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
         .map_err(|_| format!("{text} is not an IP address, or an address and port"))
@@ -87,6 +79,7 @@ fn options(args: &DiscoverArgs) -> Result<Options, String> {
         return Err(format!("--timeout {} is not a number of seconds above 0", args.timeout));
     }
     let defaults = Options::default();
+    let look = &args.auth.look;
     Ok(Options {
         interfaces: args.interface.clone(),
         sap: match (args.no_sap, args.sap.is_empty()) {
@@ -96,11 +89,13 @@ fn options(args: &DiscoverArgs) -> Result<Options, String> {
         },
         nmos: !args.no_nmos,
         registry: args.registry.clone(),
-        mdns: Some(args.mdns.unwrap_or(MDNS)),
+        mdns: Some(look.mdns.unwrap_or(MDNS)),
         dns: !args.no_dns,
-        dns_servers: args.dns_server.clone(),
-        domains: (!args.domain.is_empty()).then(|| args.domain.clone()),
+        dns_servers: look.dns_server.clone(),
+        domains: (!look.domain.is_empty()).then(|| look.domain.clone()),
         timeout,
+        // Not to the web's proxy: the devices are on this network.
+        token: args.auth.token(timeout, false)?,
         ..defaults
     })
 }

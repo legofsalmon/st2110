@@ -73,6 +73,7 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("missing-parent", with(|v| v["devices"][1]["node_id"] = json!(UNREGISTERED))),
         ("unknown-reference", with(|v| v["senders"][1]["flow_id"] = json!(UNREGISTERED))),
         ("unknown-interface", with(|v| v["receivers"][0]["interface_bindings"] = json!(["eth0", "eth2"]))),
+        ("interface-lldp", with(|v| v["nodes"][0]["interfaces"][1]["chassis_id"] = Value::Null)),
         ("unknown-clock", with(|v| v["sources"][1]["clock_name"] = json!("clk1"))),
         ("ptp-unlocked", with(|v| v["nodes"][1]["clocks"][0]["locked"] = json!(false))),
         ("ptp-grandmasters", with(|v| v["nodes"][1]["clocks"][0]["gmid"] = json!("ac-de-48-ff-fe-00-11-22"))),
@@ -81,7 +82,17 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
             with(|v| replace_in(audio_sdp(v), "08-00-11-FF-FE-21-E1-B0", "AC-DE-48-FF-FE-00-11-22")),
         ),
         ("subscription-state", with(|v| v["senders"][0]["subscription"]["receiver_id"] = json!(VIDEO_RECEIVER))),
+        (
+            "active-subscription",
+            with(|v| v["active"] = json!({VIDEO_RECEIVER: {"master_enable": true, "sender_id": AUDIO_SENDER}})),
+        ),
         ("inactive-sender", with(|v| v["senders"][0]["subscription"]["active"] = json!(false))),
+        (
+            "constraint-sets",
+            with(|v| {
+                v["receivers"][1]["caps"].as_object_mut().unwrap().remove("version");
+            }),
+        ),
         ("receiver-caps", with(|v| v["receivers"][1]["caps"]["media_types"] = json!(["audio/L16"]))),
         (
             "manifest-href",
@@ -99,7 +110,79 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("transport-address", with(|v| v["senders"][1]["transport"] = json!("urn:x-nmos:transport:rtp.ucast"))),
         ("flow-sdp", with(|v| v["flows"][1]["bit_depth"] = json!(16))),
         ("sender-sdp", with(|v| v["senders"][0]["st2110_21_sender_type"] = json!("2110TPW"))),
+        ("group-hint", with(|v| v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Video:system"]}))),
+        ("asset-tags", with(|v| v["nodes"][0]["tags"] = json!({MANUFACTURER: ["Acme"]}))),
     ]
+}
+
+const GROUPHINT: &str = "urn:x-nmos:tag:grouphint/v1.0";
+const MANUFACTURER: &str = "urn:x-nmos:tag:asset:manufacturer/v1.0";
+
+/// The BCP-002-02 asset tags of a box, with a Function for a Device.
+fn asset(product: &str, serial: &str, function: Option<&str>) -> Value {
+    let mut tags = json!({
+        MANUFACTURER: ["Acme"],
+        "urn:x-nmos:tag:asset:product/v1.0": [product],
+        "urn:x-nmos:tag:asset:instance-id/v1.0": [serial],
+    });
+    if let Some(function) = function {
+        tags["urn:x-nmos:tag:asset:function/v1.0"] = json!([function]);
+    }
+    tags
+}
+
+#[test]
+fn group_hints_and_asset_tags() {
+    let found = |snapshot: &Snapshot| -> Vec<(String, String)> {
+        check(snapshot)
+            .findings
+            .iter()
+            .map(|f| (f.resource.as_ref().unwrap().label.clone(), f.message.clone()))
+            .collect()
+    };
+    // A camera's video and audio in one group, and the monitor's in another, each of
+    // the tag's forms; and boxes that say what they are.
+    let tagged = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Primary", "tally:left:node"]});
+        v["senders"][1]["tags"] = json!({GROUPHINT: ["CAM 1:Audio 1:device"]});
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["MON 1:Video:node"]});
+        v["receivers"][1]["tags"] = json!({GROUPHINT: [""]});
+        v["nodes"][0]["tags"] = asset("Camera Pro", "CP-1", None);
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", Some("Camera"));
+        v["nodes"][1]["tags"] = asset("Camera Pro", "CP-2", None);
+    });
+    assert_eq!(found(&tagged), []);
+    // Two Senders with one role in a group, and a Device without its Function.
+    let clash = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Audio 1"]});
+        v["senders"][1]["tags"] = json!({GROUPHINT: ["CAM 1:audio 1"]});
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", None);
+        v["devices"][1]["tags"] = asset("Camera Pro", "CP-1", Some("Monitor"));
+    });
+    let mut findings = found(&clash);
+    findings.sort();
+    assert_eq!(
+        findings,
+        [
+            ("CAM 1 audio".into(), "it has the same role in group CAM 1 as sender \"CAM 1 video\" (5e0d0001); roles tell a group's members apart".into()),
+            ("Camera 1".into(), "it gives asset tags, but no Function".into()),
+        ]
+    );
+    // The same role in groups of the same name on two Devices is two groups; and two
+    // Devices that both give a full set may not give the same one.
+    let apart = with(|v| {
+        v["senders"][0]["tags"] = json!({GROUPHINT: ["Box:Video"]});
+        v["receivers"][0]["tags"] = json!({GROUPHINT: ["Box:Video"]});
+        v["devices"][0]["tags"] = asset("Camera Pro", "CP-1", Some("Camera"));
+        v["devices"][1]["tags"] = asset("Camera Pro", "CP-1", Some("Monitor"));
+    });
+    assert_eq!(
+        found(&apart),
+        [(
+            "Monitor 1".into(),
+            "device \"Camera 1\" (de710001) gives the same Manufacturer, Product Name and Instance Identifier (Acme, Camera Pro, CP-1)".into()
+        )]
+    );
 }
 
 #[test]
@@ -312,6 +395,183 @@ fn messages_explain_the_mismatch() {
         ),
         "it binds to interface eth9, but its Node's interfaces are if0, if1, if2, if3, if4, if5, if6, if7, if8, \
          if9 and 5 more"
+    );
+}
+
+/// Every resource in the facility, read through IS-04 v1.3 and known to be at it.
+fn current(v: &mut Value) {
+    let ids: Vec<Value> = ["nodes", "devices", "sources", "flows", "senders", "receivers"]
+        .iter()
+        .flat_map(|kind| v[kind].as_array().unwrap().iter().map(|r| r["id"].clone()).collect::<Vec<_>>())
+        .collect();
+    v["current"] = Value::Array(ids);
+}
+
+#[test]
+fn resources_at_the_version_read_are_held_to_its_schema() {
+    // The facility is complete at v1.3.
+    let report = check(&with(current));
+    assert_eq!(report.findings, [], "{:#?}", report.findings);
+    let messages = |snapshot: &Snapshot| -> Vec<(&'static str, String)> {
+        check(snapshot).findings.into_iter().map(|f| (f.rule, f.message)).collect()
+    };
+    let missing = with(|v| {
+        current(v);
+        v["nodes"][0].as_object_mut().unwrap().remove("interfaces");
+        v["senders"][1].as_object_mut().unwrap().remove("tags");
+    });
+    assert_eq!(
+        messages(&missing),
+        [
+            ("resource-invalid", "`interfaces` is missing, which IS-04 v1.3 requires".to_string()),
+            ("resource-invalid", "`tags` is missing, which IS-04 v1.3 requires".to_string()),
+        ]
+    );
+    // Unknown versions are held only to what every version requires.
+    let unknown = with(|v| {
+        current(v);
+        v["current"].as_array_mut().unwrap().retain(|id| id != "a0de0001-0000-4000-8000-000000000001");
+        v["nodes"][0].as_object_mut().unwrap().remove("interfaces");
+    });
+    assert_eq!(messages(&unknown), []);
+    // An attribute every version requires is noted once, as it always was.
+    let label = with(|v| {
+        current(v);
+        v["senders"][1].as_object_mut().unwrap().remove("label");
+    });
+    assert_eq!(messages(&label), [("resource-invalid", "`label` is missing".to_string())]);
+    // Only a Node known to be at v1.3 is expected to say where its interfaces are plugged in.
+    let unattached = |known: bool| {
+        with(|v| {
+            if known {
+                current(v);
+            }
+            for i in 0..2 {
+                v["nodes"][1]["interfaces"][i].as_object_mut().unwrap().remove("attached_network_device");
+            }
+        })
+    };
+    assert_eq!(
+        messages(&unattached(true)),
+        [(
+            "interface-lldp",
+            "interfaces eth0, eth1 give no attached_network_device, so nothing says which switch port they are \
+             plugged into"
+                .to_string()
+        )]
+    );
+    assert_eq!(messages(&unattached(false)), []);
+}
+
+#[test]
+fn interfaces_are_read_as_lldp_has_them() {
+    let messages = |snapshot: &Snapshot| -> Vec<(&'static str, String)> {
+        check(snapshot).findings.into_iter().map(|f| (f.rule, f.message)).collect()
+    };
+    assert_eq!(
+        messages(&with(|v| v["nodes"][0]["interfaces"][0]["port_id"] = json!("C8:00:84:10:00:01"))),
+        [(
+            "resource-invalid",
+            "`interfaces[0].port_id` is not a MAC address written lowercase with dashes, such as 00-1b-21-a1-b2-c3"
+                .to_string()
+        )]
+    );
+    assert_eq!(
+        messages(&with(|v| v["nodes"][0]["interfaces"][0]["chassis_id"] = json!("C8:00:84:10:00:00"))),
+        [(
+            "interface-lldp",
+            "interface eth0 has chassis_id C8:00:84:10:00:00; IS-04 writes a MAC address lowercase with dashes"
+                .to_string()
+        )]
+    );
+    // A chassis ID that is not a MAC address may be any text.
+    assert_eq!(messages(&with(|v| v["nodes"][0]["interfaces"][0]["chassis_id"] = json!("cam1.studio"))), []);
+    assert_eq!(
+        messages(&with(|v| v["nodes"][0]["interfaces"][0]["attached_network_device"] = json!({"port_id": "1/1"}))),
+        [("resource-invalid", "`interfaces[0].attached_network_device.chassis_id` is missing".to_string())]
+    );
+}
+
+#[test]
+fn constraint_sets_say_something() {
+    let snapshot = with(|v| {
+        v["receivers"][0]["caps"]["constraint_sets"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"urn:x-nmos:cap:meta:label": "anything", "urn:x-nmos:cap:meta:priority": 1}));
+    });
+    let findings = check(&snapshot).findings;
+    let messages: Vec<(&str, &str)> = findings.iter().map(|f| (f.rule, f.message.as_str())).collect();
+    assert_eq!(
+        messages,
+        [(
+            "constraint-sets",
+            "constraint set 2 holds no parameter constraint, so it says nothing about what the Receiver takes"
+        )]
+    );
+}
+
+#[test]
+fn active_parameters_match_the_subscription() {
+    let messages = |active: Value| -> Vec<String> {
+        let snapshot = with(|v| v["active"] = active);
+        check(&snapshot).findings.into_iter().filter(|f| f.rule == "active-subscription").map(|f| f.message).collect()
+    };
+    let agreeing = json!({
+        VIDEO_RECEIVER: {"master_enable": true, "sender_id": VIDEO_SENDER, "transport_params": []},
+        VIDEO_SENDER: {"master_enable": true, "receiver_id": null},
+    });
+    assert_eq!(messages(agreeing), Vec::<String>::new());
+    assert_eq!(
+        messages(json!({VIDEO_SENDER: {"master_enable": false, "receiver_id": null}})),
+        ["subscription.active is true, but master_enable is false in its IS-05 /active"]
+    );
+    assert_eq!(
+        messages(json!({VIDEO_RECEIVER: {"master_enable": true, "sender_id": null}})),
+        [format!("subscription.sender_id is {VIDEO_SENDER}, but its IS-05 /active has sender_id null")]
+    );
+    assert_eq!(
+        messages(json!({VIDEO_RECEIVER: {"master_enable": true, "sender_id": AUDIO_SENDER}})),
+        [format!("subscription.sender_id is {VIDEO_SENDER}, but its IS-05 /active names {AUDIO_SENDER}")]
+    );
+}
+
+#[test]
+fn jpeg_xs_flows_match_profile_level_and_sublevel() {
+    let jxsv = |change: fn(&mut Value)| {
+        with(|v| {
+            let flow = &mut v["flows"][0];
+            flow["media_type"] = json!("video/jxsv");
+            flow["grain_rate"] = json!({"numerator": 60000, "denominator": 1001});
+            flow["profile"] = json!("High444.12");
+            flow["level"] = json!("2k-1");
+            flow["sublevel"] = json!("Sublev3bpp");
+            v["manifests"][VIDEO_SENDER]["sdp"] = json!(include_str!("../../sdp/tests/fixtures/jpeg-xs.sdp"));
+            change(v);
+        })
+    };
+    let flow_sdp = |snapshot: &Snapshot| -> Vec<String> {
+        check(snapshot).findings.into_iter().filter(|f| f.rule == "flow-sdp").map(|f| f.message).collect()
+    };
+    assert_eq!(flow_sdp(&jxsv(|_| {})), Vec::<String>::new());
+    assert_eq!(
+        flow_sdp(&jxsv(|v| v["flows"][0]["profile"] = json!("Main444.12"))),
+        ["its Flow's profile is Main444.12, but profile is High444.12"]
+    );
+    assert_eq!(
+        flow_sdp(&jxsv(|v| {
+            v["flows"][0].as_object_mut().unwrap().remove("sublevel");
+        })),
+        ["its Flow has no sublevel, which means Unrestricted, but sublevel is Sublev3bpp"]
+    );
+    assert_eq!(
+        flow_sdp(&jxsv(|v| replace_in(&mut v["manifests"][VIDEO_SENDER]["sdp"], " level=2k-1;", ""))),
+        ["its Flow's level is 2k-1, but its SDP file has no level"]
+    );
+    // The components describe JPEG XS as they do uncompressed video.
+    assert_eq!(
+        flow_sdp(&jxsv(|v| v["flows"][0]["components"][1]["width"] = json!(1920))),
+        ["its Flow's components are YCbCr-4:4:4, but sampling is YCbCr-4:2:2"]
     );
 }
 

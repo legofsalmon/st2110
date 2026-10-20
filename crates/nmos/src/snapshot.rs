@@ -1,6 +1,6 @@
 //! What was read from a registry, kept as the registry returned it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,11 @@ pub struct Snapshot {
     /// The Query API version they were read through, such as `v1.3`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// The `id` of each resource known to be at `api_version`, so held to that
+    /// version's schema; `None` when that is not known, as when a registry returned
+    /// resources of several versions without saying which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<BTreeSet<String>>,
     /// Node resources.
     pub nodes: Vec<Value>,
     /// Device resources.
@@ -39,6 +44,10 @@ pub struct Snapshot {
     /// its Device's Connection API serves it at a URL other than `manifest_href`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub transport_files: BTreeMap<String, Manifest>,
+    /// What each Sender's and Receiver's IS-05 `/active` returned, keyed by `id`,
+    /// where its Device advertises a Connection API and the read succeeded.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub active: BTreeMap<String, Value>,
 }
 
 /// The result of fetching one Sender's transport file.

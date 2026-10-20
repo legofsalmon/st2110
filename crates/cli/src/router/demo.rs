@@ -6,21 +6,29 @@
 //! Four cameras send video on an ST 2022-7 pair and stereo tone; a graphics machine
 //! sends a smaller picture on one leg. Three monitors take the cameras' video on two legs
 //! and audio, and a fourth takes only the graphics machine's size, so some crosspoints
-//! cannot be made.
+//! cannot be made. A PTZ camera sends unicast, to one Receiver at a time, and only
+//! Monitor 3's video, which takes unicast as well as multicast, can take it.
+//!
+//! Its Senders can be turned on and off and sent elsewhere through their Connection
+//! APIs too, and their `/transportfile` follows what each sends.
 //!
 //! The streams are real: [`super::signal::start`] sends each Sender's from this
 //! machine, on the loopback interface, so the router can show them. They are small
-//! pictures at 25 frames a second, so that a laptop carries them all with ease.
+//! pictures at 25 frames a second, so that a laptop carries them all with ease. A
+//! Sender's stream stops while it is off, and follows it to another group; the PTZ
+//! camera's unicast stream is not sent, since no Receiver's address is this machine's.
 //!
 //! Its Query API takes subscriptions, and pushes each change to them over a WebSocket,
 //! as a registry does. With `--demo-auth` it asks for IS-10 tokens too, and serves the
-//! Authorization Server to get them from: one client, [`CLIENT_ID`] with
-//! [`CLIENT_SECRET`], whose tokens last a minute. Its tokens are opaque strings it keeps
-//! a list of, where a real Authorization Server issues signed JWTs for each Resource
-//! Server to check for itself.
+//! Authorization Server to get them from, whose tokens last a minute: to [`CLIENT_ID`]
+//! with [`CLIENT_SECRET`], and to any client that registers by RFC 7591 with the initial
+//! access token [`INITIAL_TOKEN`], for a secret or for `private_key_jwt`, as the router
+//! itself does. Its tokens are opaque strings it keeps a list of, where a real
+//! Authorization Server issues signed JWTs for each Resource Server to check for itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -32,12 +40,19 @@ use st2110_sdp::Rational;
 use st2110_nmos::auth;
 
 use super::http::{Request, Response};
+use super::signal::Live;
 use crate::timing::now;
 
 const VIDEO: &str = "urn:x-nmos:format:video";
 const AUDIO: &str = "urn:x-nmos:format:audio";
 const MCAST: &str = "urn:x-nmos:transport:rtp.mcast";
+const UCAST: &str = "urn:x-nmos:transport:rtp.ucast";
+/// RTP of either kind: a Receiver that joins a group or takes a stream sent to it.
+const RTP: &str = "urn:x-nmos:transport:rtp";
 const GMID: &str = "08-00-11-FF-FE-21-E1-B0";
+/// The chassis of the leaf switch on each network: red for each Node's first
+/// interface, blue for its second.
+const LEAVES: [&str; 2] = ["c8-00-84-ee-00-0a", "c8-00-84-ee-00-0b"];
 
 /// A demo resource id: `prefix` names the type and `n` the resource.
 fn id(prefix: &str, n: u32) -> String {
@@ -53,6 +68,26 @@ fn core(id: &str, label: &str) -> Value {
     json!({"id": id, "version": "1790510437:0", "label": label, "description": label, "tags": {}})
 }
 
+/// A Sender's or Receiver's BCP-002-01 natural group and its role there.
+fn grouphint(group: &str, role: &str) -> Value {
+    json!({"tags": {st2110_nmos::groups::GROUPHINT: [format!("{group}:{role}")]}})
+}
+
+/// A Node's or Device's BCP-002-02 asset tags: what the box is and which one, and
+/// for a Device, what it does.
+fn asset(label: &str, n: u32, device: bool) -> Value {
+    let function = label.split(' ').next().unwrap_or(label);
+    let mut tags = json!({
+        "urn:x-nmos:tag:asset:manufacturer/v1.0": ["st2110 demo"],
+        "urn:x-nmos:tag:asset:product/v1.0": [format!("Demo {function}")],
+        "urn:x-nmos:tag:asset:instance-id/v1.0": [format!("DEMO-{n:04}")],
+    });
+    if device {
+        tags["urn:x-nmos:tag:asset:function/v1.0"] = json!([function]);
+    }
+    json!({"tags": tags})
+}
+
 fn merge(mut base: Value, more: Value) -> Value {
     if let (Some(base), Value::Object(more)) = (base.as_object_mut(), more) {
         base.extend(more);
@@ -60,13 +95,77 @@ fn merge(mut base: Value, more: Value) -> Value {
     base
 }
 
-/// One Receiver's IS-05 resources.
-struct Receiver {
+/// One Sender's or Receiver's IS-05 resources.
+struct Resources {
     constraints: Value,
     staged: Value,
     active: Value,
     /// When a scheduled activation is due.
     pending: Option<PtpTime>,
+}
+
+/// Which side of a connection: the Connection API's `senders` or `receivers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Sender,
+    Receiver,
+}
+
+impl Side {
+    fn plural(self) -> &'static str {
+        match self {
+            Self::Sender => "senders",
+            Self::Receiver => "receivers",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sender => "Sender",
+            Self::Receiver => "Receiver",
+        }
+    }
+
+    /// What a request may change besides the transport parameters.
+    fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Sender => &["receiver_id", "master_enable"],
+            Self::Receiver => &["sender_id", "master_enable", "transport_file"],
+        }
+    }
+
+    /// The parameter `auto` stands for an interface's address in.
+    fn interface(self) -> &'static str {
+        match self {
+            Self::Sender => "source_ip",
+            Self::Receiver => "interface_ip",
+        }
+    }
+}
+
+/// A Sender's IS-05 resources, as it sends `legs`: each leg from this machine to a
+/// group or address and port.
+fn sender_resources(legs: &[Leg], enabled: bool) -> Resources {
+    let constraints: Vec<Value> = legs
+        .iter()
+        .map(|_| {
+            json!({"source_ip": {"enum": ["auto", LOOPBACK.to_string()]}, "destination_ip": {}, "source_port": {"enum": [5004]},
+                   "destination_port": {"minimum": 5000, "maximum": 5999}, "rtp_enabled": {}})
+        })
+        .collect();
+    let params: Vec<Value> = legs
+        .iter()
+        .map(|leg| {
+            json!({"source_ip": LOOPBACK.to_string(), "destination_ip": leg.destination.ip().to_string(),
+                   "source_port": 5004, "destination_port": leg.destination.port(), "rtp_enabled": true})
+        })
+        .collect();
+    let active = json!({
+        "receiver_id": null, "master_enable": enabled,
+        "activation": {"mode": null, "requested_time": null, "activation_time": null},
+        "transport_params": params,
+    });
+    Resources { constraints: Value::Array(constraints), staged: active.clone(), active, pending: None }
 }
 
 fn idle(interfaces: &[String]) -> Value {
@@ -102,6 +201,21 @@ pub(crate) const CLIENT_ID: &str = "st2110-demo";
 /// Its secret: this is a demo, on this machine.
 pub(crate) const CLIENT_SECRET: &str = "demo-secret";
 
+/// The initial access token the demo Authorization Server asks for to register a client
+/// (RFC 7591 §3), as IS-10 has a server authenticate registrations for the Client
+/// Credentials grant.
+pub(crate) const INITIAL_TOKEN: &str = "demo-registration";
+
+/// Where the demo Authorization Server registers clients.
+const REGISTER_PATH: &str = "/x-nmos/auth/v1.0/register";
+
+/// A client registered with the demo Authorization Server, and how it authenticates.
+enum Client {
+    Secret(String),
+    /// `private_key_jwt`, with the keys at its `jwks_uri`.
+    Key(String),
+}
+
 /// How long a demo token lasts, short enough to see one renewed.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -127,10 +241,15 @@ pub(crate) struct Facility {
     tai_utc: i32,
     /// The registry's resources, by type: `nodes`, `devices` and so on.
     registry: BTreeMap<&'static str, Vec<Value>>,
-    receivers: BTreeMap<String, Receiver>,
+    receivers: BTreeMap<String, Resources>,
+    senders: BTreeMap<String, Resources>,
+    /// What each Sender's `/transportfile` serves, keyed by Sender `id`.
     sdp: BTreeMap<String, String>,
-    /// Each Sender's stream, keyed by Sender `id`: its label and description.
-    streams: BTreeMap<String, (String, Description)>,
+    /// Each Sender's stream, keyed by Sender `id`: its label and description, as it was
+    /// made, and what it is told to send now.
+    streams: BTreeMap<String, (String, Description, Arc<Live>)>,
+    /// How many times the Senders' SDP files have changed, for their `o=` versions.
+    edits: u64,
     /// The Query API's subscriptions, by `id`.
     subscriptions: BTreeMap<String, Value>,
     /// Changes to the registry not yet pushed to subscriptions: the resource type, and
@@ -138,6 +257,10 @@ pub(crate) struct Facility {
     changes: Vec<(&'static str, Value, Value)>,
     /// The tokens issued, with `--demo-auth`.
     tokens: Option<HashMap<String, Issued>>,
+    /// The clients registered with the Authorization Server, by id.
+    clients: HashMap<String, Client>,
+    /// The `jti` of each client assertion taken, so that none is taken twice.
+    assertions: HashSet<String>,
     /// Whether a Receiver changed since the facility was last kept.
     dirty: bool,
 }
@@ -146,6 +269,10 @@ pub(crate) struct Facility {
 struct Sending {
     label: String,
     description: Description,
+    /// The transport, multicast or unicast.
+    transport: &'static str,
+    /// Whether it is sending to start with.
+    enabled: bool,
 }
 
 /// Where the demo's streams go from: this machine's loopback interface.
@@ -188,11 +315,15 @@ impl Facility {
             tai_utc,
             registry: BTreeMap::new(),
             receivers: BTreeMap::new(),
+            senders: BTreeMap::new(),
             sdp: BTreeMap::new(),
             streams: BTreeMap::new(),
+            edits: 0,
             subscriptions: BTreeMap::new(),
             changes: Vec::new(),
             tokens: None,
+            clients: HashMap::from([(CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string()))]),
+            assertions: HashSet::new(),
             dirty: false,
         };
         for kind in ["nodes", "devices", "sources", "flows", "senders", "receivers"] {
@@ -208,6 +339,8 @@ impl Facility {
             let video = Sending {
                 description: description(&label, video(CAMERA.0, CAMERA.1), &[(&groups[0], 5004), (&groups[1], 5004)]),
                 label,
+                transport: MCAST,
+                enabled: true,
             };
             let label = format!("CAM {camera} audio");
             let audio = Sending {
@@ -217,6 +350,8 @@ impl Facility {
                     &[(&format!("239.10.{camera}.2"), 5006)],
                 ),
                 label,
+                transport: MCAST,
+                enabled: true,
             };
             facility.add_sender_node(base, node, &format!("Camera {camera}"), &[&red, &blue], &[video, audio]);
         }
@@ -224,6 +359,8 @@ impl Facility {
         let graphics = Sending {
             label: "GFX 1 video".into(),
             description: description("GFX 1 video", video(GRAPHICS.0, GRAPHICS.1), &[("239.10.41.1", 5004)]),
+            transport: MCAST,
+            enabled: true,
         };
         facility.add_sender_node(base, node, "Graphics 1", &["192.168.10.41"], &[graphics]);
         for monitor in 1..=4u32 {
@@ -233,6 +370,15 @@ impl Facility {
             let video = if monitor == 4 { vec![red.clone()] } else { vec![red.clone(), blue] };
             facility.add_monitor(base, node, monitor, &video, &red);
         }
+        // A PTZ camera that sends unicast, off until a Receiver is connected to it.
+        node += 1;
+        let ptz = Sending {
+            label: "PTZ 1 video".into(),
+            description: description("PTZ 1 video", video(CAMERA.0, CAMERA.1), &[("192.168.10.33", 5004)]),
+            transport: UCAST,
+            enabled: false,
+        };
+        facility.add_sender_node(base, node, "PTZ 1", &["192.168.10.51"], &[ptz]);
         // Monitors 1 and 2 are on cameras 1 and 2 already.
         let now = now(tai_utc).unwrap_or_else(|_| PtpTime::from_utc(0, 0).expect("the epoch"));
         for monitor in 1..=2u32 {
@@ -245,8 +391,8 @@ impl Facility {
                     "transport_file": {"data": sdp, "type": "application/sdp"},
                     "transport_params": facility.legs(&receiver, &sender),
                 });
-                facility.stage(&receiver, &body);
-                facility.activate(&receiver, now);
+                facility.stage(Side::Receiver, &receiver, &body);
+                facility.activate(Side::Receiver, &receiver, now);
                 debug_assert_eq!(facility.receivers[&receiver].active["sender_id"], json!(sender), "{kind}");
             }
         }
@@ -291,10 +437,18 @@ impl Facility {
         let ports: Vec<Value> = interfaces
             .iter()
             .enumerate()
-            .map(|(i, _)| json!({"chassis_id": format!("c8-00-84-10-{n:02x}-00"), "port_id": format!("c8-00-84-10-{n:02x}-{:02x}", i + 1), "name": format!("eth{i}")}))
+            .map(|(i, _)| {
+                // Each interface is plugged into port n of its network's leaf switch, as
+                // LLDP from that switch would say.
+                json!({
+                    "chassis_id": format!("c8-00-84-10-{n:02x}-00"), "port_id": format!("c8-00-84-10-{n:02x}-{:02x}", i + 1),
+                    "name": format!("eth{i}"),
+                    "attached_network_device": {"chassis_id": LEAVES[i % LEAVES.len()], "port_id": format!("Ethernet1/{n}")},
+                })
+            })
             .collect();
         self.registry.get_mut("nodes").expect("nodes").push(merge(
-            core(&node_id, label),
+            merge(core(&node_id, label), asset(label, n, false)),
             json!({
                 "href": format!("http://{host}/"), "hostname": hostname,
                 "api": {"versions": ["v1.3"], "endpoints": [{"host": host, "port": 80, "protocol": "http"}]},
@@ -305,7 +459,7 @@ impl Facility {
             }),
         ));
         self.registry.get_mut("devices").expect("devices").push(merge(
-            core(&device_id, label),
+            merge(core(&device_id, label), asset(label, n, true)),
             json!({
                 "type": "urn:x-nmos:device:generic", "node_id": node_id, "senders": [], "receivers": [],
                 "controls": [{"href": format!("{base}/node/{n}/x-nmos/connection/v1.1/"), "type": "urn:x-nmos:control:sr-ctrl/v1.1"}],
@@ -356,17 +510,27 @@ impl Facility {
             let mut sender = merge(
                 core(&sender_id, &s.label),
                 json!({
-                    "caps": {}, "flow_id": flow_id, "transport": MCAST, "device_id": device_id,
+                    "caps": {}, "flow_id": flow_id, "transport": s.transport, "device_id": device_id,
                     "manifest_href": format!("{base}/node/{n}/x-nmos/connection/v1.1/single/senders/{sender_id}/transportfile"),
-                    "interface_bindings": bindings, "subscription": {"receiver_id": null, "active": true},
+                    "interface_bindings": bindings, "subscription": {"receiver_id": null, "active": s.enabled},
                 }),
             );
             if matches!(s.description.media, Media::Video(_)) {
-                sender["st2110_21_sender_type"] = json!("2110TPN");
+                // The demo sends a millisecond's packets at a time, which only the wide
+                // sender model allows; its SDP says the same.
+                sender["st2110_21_sender_type"] = json!("2110TPW");
+            }
+            // A camera's video and audio are one natural group, as BCP-002-01 has a
+            // Node say; the graphics Node says nothing, as many do not.
+            if !label.starts_with("Graphics") {
+                let role = if matches!(s.description.media, Media::Video(_)) { "Video" } else { "Audio 1" };
+                sender = merge(sender, grouphint(label, role));
             }
             self.registry.get_mut("senders").expect("senders").push(sender);
-            self.sdp.insert(sender_id.clone(), s.description.sdp(u64::from(k)));
-            self.streams.insert(sender_id, (s.label.clone(), s.description.clone()));
+            self.senders.insert(sender_id.clone(), sender_resources(&s.description.legs, s.enabled));
+            let live = Arc::new(Live::new(None));
+            self.streams.insert(sender_id.clone(), (s.label.clone(), s.description.clone(), live));
+            self.send(&sender_id);
         }
     }
 
@@ -405,16 +569,19 @@ impl Facility {
             let k = u32::try_from(self.registry["receivers"].len()).expect("a few receivers") + 1;
             let receiver_id = id("7ecf", k);
             let bindings: Vec<String> = (0..interfaces.len()).map(|i| format!("eth{i}")).collect();
+            // Monitor 3's video takes the PTZ camera's unicast too.
+            let transport = if monitor == 3 && format == VIDEO { RTP } else { MCAST };
+            let role = if format == VIDEO { "Video" } else { "Audio 1" };
             self.registry.get_mut("receivers").expect("receivers").push(merge(
-                core(&receiver_id, &label),
+                merge(core(&receiver_id, &label), grouphint(&format!("Monitor {monitor}"), role)),
                 json!({
-                    "device_id": device_id, "transport": MCAST, "interface_bindings": bindings,
+                    "device_id": device_id, "transport": transport, "interface_bindings": bindings,
                     "subscription": {"sender_id": null, "active": false}, "format": format, "caps": caps,
                 }),
             ));
             self.receivers.insert(
                 receiver_id,
-                Receiver {
+                Resources {
                     constraints: constraints(&interfaces),
                     staged: idle(&interfaces),
                     active: idle(&interfaces),
@@ -424,9 +591,43 @@ impl Facility {
         }
     }
 
-    /// Each Sender's label and the stream it sends, for [`super::signal::start`].
-    pub(crate) fn streams(&self) -> Vec<(String, Description)> {
+    /// Each Sender's label, the stream it sends, and what it is told to send now, for
+    /// [`super::signal::start`].
+    pub(crate) fn streams(&self) -> Vec<(String, Description, Arc<Live>)> {
         self.streams.values().cloned().collect()
+    }
+
+    /// Makes a Sender's SDP file and stream follow its `/active` endpoint: where each leg
+    /// goes, and whether it sends at all.
+    fn send(&mut self, id: &str) {
+        let (Some(resources), Some((_, made, live))) = (self.senders.get(id), self.streams.get(id)) else {
+            return;
+        };
+        let active = &resources.active;
+        let legs: Vec<Leg> = active["transport_params"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .zip(&made.legs)
+            .filter(|(params, _)| params["rtp_enabled"] != false)
+            .filter_map(|(params, leg)| {
+                let ip = params["destination_ip"].as_str()?.parse::<Ipv4Addr>().ok()?;
+                let port = params["destination_port"].as_u64().and_then(|p| u16::try_from(p).ok())?;
+                Some(Leg { destination: SocketAddrV4::new(ip, port), ..*leg })
+            })
+            .collect();
+        let sending = active["master_enable"] == true && !legs.is_empty();
+        // Only multicast goes out on the loopback interface; a unicast address is not this
+        // machine's.
+        let streamed = legs.iter().all(|leg| leg.destination.ip().is_multicast());
+        live.set((sending && streamed).then(|| legs.clone()));
+        // The file says where it sends when on, and still does while it is off; with
+        // every leg off it keeps the last.
+        if !legs.is_empty() {
+            self.edits += 1;
+            let description = Description { legs, ..made.clone() };
+            self.sdp.insert(id.to_string(), description.sdp(self.edits));
+        }
     }
 
     /// Whether a request is for the facility, rather than the router.
@@ -437,7 +638,7 @@ impl Facility {
     /// Answers a request for the registry, a Connection API or the Authorization Server.
     pub(crate) fn answer(&mut self, request: &Request) -> Response {
         self.settle();
-        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH {
+        if request.path.starts_with(METADATA_PATH) || request.path == TOKEN_PATH || request.path == REGISTER_PATH {
             return self.authorization_server(request);
         }
         if let Err(refused) = self.authorized(request) {
@@ -486,48 +687,60 @@ impl Facility {
                 None => error(404, "Not Found", "no such Sender"),
             };
         }
-        if rest == "bulk/receivers" {
-            if method != "POST" {
-                return error(405, "Method Not Allowed", "");
-            }
-            let Some(items) = body.as_array() else {
-                return error(400, "Bad Request", "a bulk request is an array");
-            };
-            self.dirty = true;
-            let results = items
-                .iter()
-                .map(|item| {
-                    let id = item["id"].as_str().unwrap_or_default();
-                    let (code, response) = if self.receivers.contains_key(id) {
-                        self.stage(id, &item["params"])
-                    } else {
-                        error(404, "Not Found", "no such Receiver")
-                    };
-                    let mut result = json!({"id": id, "code": code});
-                    if code >= 400 {
-                        result["error"] = response["error"].clone();
-                        result["debug"] = response["debug"].clone();
-                    }
-                    result
-                })
-                .collect();
-            return (200, Value::Array(results));
-        }
-        let Some((id, resource)) = rest.strip_prefix("single/receivers/").and_then(|r| r.split_once('/')) else {
-            return error(404, "Not Found", path);
-        };
-        let Some(receiver) = self.receivers.get(id) else {
-            return error(404, "Not Found", "no such Receiver");
-        };
-        match (method, resource) {
-            ("GET", "constraints") => (200, receiver.constraints.clone()),
-            ("GET", "staged") => (200, receiver.staged.clone()),
-            ("GET", "active") => (200, receiver.active.clone()),
-            ("PATCH", "staged") => {
+        for side in [Side::Sender, Side::Receiver] {
+            if rest == format!("bulk/{}", side.plural()) {
+                if method != "POST" {
+                    return error(405, "Method Not Allowed", "");
+                }
+                let Some(items) = body.as_array() else {
+                    return error(400, "Bad Request", "a bulk request is an array");
+                };
                 self.dirty = true;
-                self.stage(id, body)
+                let results = items
+                    .iter()
+                    .map(|item| {
+                        let id = item["id"].as_str().unwrap_or_default();
+                        let (code, response) = if self.side(side).contains_key(id) {
+                            self.stage(side, id, &item["params"])
+                        } else {
+                            error(404, "Not Found", &format!("no such {}", side.name()))
+                        };
+                        let mut result = json!({"id": id, "code": code});
+                        if code >= 400 {
+                            result["error"] = response["error"].clone();
+                            result["debug"] = response["debug"].clone();
+                        }
+                        result
+                    })
+                    .collect();
+                return (200, Value::Array(results));
             }
-            _ => error(405, "Method Not Allowed", ""),
+            let Some((id, resource)) =
+                rest.strip_prefix(&format!("single/{}/", side.plural())).and_then(|r| r.split_once('/'))
+            else {
+                continue;
+            };
+            let Some(resources) = self.side(side).get(id) else {
+                return error(404, "Not Found", &format!("no such {}", side.name()));
+            };
+            return match (method, resource) {
+                ("GET", "constraints") => (200, resources.constraints.clone()),
+                ("GET", "staged") => (200, resources.staged.clone()),
+                ("GET", "active") => (200, resources.active.clone()),
+                ("PATCH", "staged") => {
+                    self.dirty = true;
+                    self.stage(side, id, body)
+                }
+                _ => error(405, "Method Not Allowed", ""),
+            };
+        }
+        error(404, "Not Found", path)
+    }
+
+    fn side(&mut self, side: Side) -> &mut BTreeMap<String, Resources> {
+        match side {
+            Side::Sender => &mut self.senders,
+            Side::Receiver => &mut self.receivers,
         }
     }
 
@@ -564,26 +777,28 @@ impl Facility {
     /// Carries out the scheduled activations that are due.
     pub(crate) fn settle(&mut self) {
         let now = self.now();
-        let due: Vec<(String, PtpTime)> = self
-            .receivers
-            .iter()
-            .filter_map(|(id, r)| r.pending.filter(|&due| due <= now).map(|due| (id.clone(), due)))
-            .collect();
-        for (id, due) in due {
-            self.activate(&id, due);
+        for side in [Side::Sender, Side::Receiver] {
+            let due: Vec<(String, PtpTime)> = self
+                .side(side)
+                .iter()
+                .filter_map(|(id, r)| r.pending.filter(|&due| due <= now).map(|due| (id.clone(), due)))
+                .collect();
+            for (id, due) in due {
+                self.activate(side, &id, due);
+            }
         }
     }
 
     /// What a `PATCH` to `/staged` does.
-    fn stage(&mut self, id: &str, body: &Value) -> (u16, Value) {
+    fn stage(&mut self, side: Side, id: &str, body: &Value) -> (u16, Value) {
         let now = self.now();
-        let receiver = self.receivers.get_mut(id).expect("a known Receiver");
+        let resources = self.side(side).get_mut(id).expect("a known Sender or Receiver");
         let mode = body.get("activation").map(|a| &a["mode"]);
-        if receiver.pending.is_some() && mode != Some(&Value::Null) {
+        if resources.pending.is_some() && mode != Some(&Value::Null) {
             return error(423, "Locked", "an activation is scheduled");
         }
         if let Some(params) = body.get("transport_params") {
-            let legs = receiver.constraints.as_array().cloned().unwrap_or_default();
+            let legs = resources.constraints.as_array().cloned().unwrap_or_default();
             let Some(params) = params.as_array().filter(|p| p.len() == legs.len()) else {
                 return error(400, "Invalid transport_params", "one entry per leg");
             };
@@ -600,25 +815,33 @@ impl Facility {
                     if !allowed || !in_range {
                         return error(400, "Constraint violation", &format!("leg {leg}: {name} {value}"));
                     }
+                    // The demo's streams go to IPv4 addresses.
+                    if name == "destination_ip" && value.as_str().and_then(|v| v.parse::<Ipv4Addr>().ok()).is_none() {
+                        return error(
+                            400,
+                            "Constraint violation",
+                            &format!("leg {leg}: the demo sends to IPv4 addresses only, not {value}"),
+                        );
+                    }
                 }
             }
-            let staged = receiver.staged["transport_params"].as_array_mut().expect("legs");
+            let staged = resources.staged["transport_params"].as_array_mut().expect("legs");
             for (staged, params) in staged.iter_mut().zip(params) {
                 for (name, value) in params.as_object().into_iter().flatten() {
                     staged[name] = value.clone();
                 }
             }
         }
-        for field in ["sender_id", "master_enable", "transport_file"] {
-            if let Some(value) = body.get(field) {
-                receiver.staged[field] = value.clone();
+        for field in side.fields() {
+            if let Some(value) = body.get(*field) {
+                resources.staged[*field] = value.clone();
             }
         }
         let requested = body["activation"]["requested_time"].as_str().and_then(PtpTime::parse);
         match mode.and_then(Value::as_str) {
             Some("activate_immediate") => {
-                self.activate(id, now);
-                let mut response = self.receivers[id].staged.clone();
+                self.activate(side, id, now);
+                let mut response = self.side(side)[id].staged.clone();
                 response["activation"] =
                     json!({"mode": "activate_immediate", "requested_time": null, "activation_time": tai(now)});
                 (200, response)
@@ -632,95 +855,110 @@ impl Facility {
                 } else {
                     now.add_nanos(requested.nanos()).unwrap_or(now)
                 };
-                receiver.pending = Some(due);
-                receiver.staged["activation"] = json!({
+                resources.pending = Some(due);
+                resources.staged["activation"] = json!({
                     "mode": mode, "requested_time": body["activation"]["requested_time"], "activation_time": tai(due),
                 });
-                (202, receiver.staged.clone())
+                (202, resources.staged.clone())
             }
             Some(other) => error(400, "Bad Request", &format!("no activation mode {other}")),
             None => {
                 if mode.is_some() {
-                    receiver.pending = None;
-                    receiver.staged["activation"] =
+                    resources.pending = None;
+                    resources.staged["activation"] =
                         json!({"mode": null, "requested_time": null, "activation_time": null});
                 }
-                (200, receiver.staged.clone())
+                (200, resources.staged.clone())
             }
         }
     }
 
-    fn activate(&mut self, id: &str, at: PtpTime) {
-        let receiver = self.receivers.get_mut(id).expect("a known Receiver");
-        let mut active = receiver.staged.clone();
-        let legs = receiver.constraints.as_array().cloned().unwrap_or_default();
+    fn activate(&mut self, side: Side, id: &str, at: PtpTime) {
+        let resources = self.side(side).get_mut(id).expect("a known Sender or Receiver");
+        let mut active = resources.staged.clone();
+        let legs = resources.constraints.as_array().cloned().unwrap_or_default();
+        let interface = side.interface();
         for (leg, constraints) in active["transport_params"].as_array_mut().into_iter().flatten().zip(&legs) {
-            if leg["interface_ip"] == "auto" {
-                leg["interface_ip"] = constraints["interface_ip"]["enum"][1].clone();
+            if leg[interface] == "auto" {
+                leg[interface] = constraints[interface]["enum"][1].clone();
             }
         }
         active["activation"] = json!({
-            "mode": receiver.staged["activation"]["mode"].as_str().unwrap_or("activate_immediate"),
-            "requested_time": receiver.staged["activation"]["requested_time"],
+            "mode": resources.staged["activation"]["mode"].as_str().unwrap_or("activate_immediate"),
+            "requested_time": resources.staged["activation"]["requested_time"],
             "activation_time": tai(at),
         });
-        receiver.active = active;
-        receiver.pending = None;
-        receiver.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
-        let subscription =
-            json!({"sender_id": receiver.active["sender_id"], "active": receiver.active["master_enable"]});
-        self.register(id, subscription, at);
+        resources.active = active;
+        resources.pending = None;
+        resources.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
         self.dirty = true;
+        self.registered(side, id, at);
     }
 
-    /// Tells the registry what a Receiver takes now, as its Node would.
-    fn register(&mut self, id: &str, subscription: Value, at: PtpTime) {
-        if let Some(registered) =
-            self.registry.get_mut("receivers").and_then(|list| list.iter_mut().find(|r| r["id"] == id))
-        {
+    /// Tells the registry what a Sender sends or a Receiver takes now, as its Node would,
+    /// and has a Sender's stream follow.
+    fn registered(&mut self, side: Side, id: &str, at: PtpTime) {
+        let active = &self.side(side)[id].active;
+        let enabled = active["master_enable"] == true;
+        let subscription = match side {
+            // A Sender names its Receiver only while active (IS-04 v1.3 Behaviour: Nodes).
+            Side::Sender => json!({
+                "receiver_id": if enabled { active["receiver_id"].clone() } else { Value::Null },
+                "active": enabled,
+            }),
+            Side::Receiver => json!({"sender_id": active["sender_id"], "active": active["master_enable"]}),
+        };
+        if side == Side::Sender {
+            self.send(id);
+        }
+        self.register(side.plural(), id, subscription, at);
+    }
+
+    /// Tells the registry a resource's new subscription, as its Node would.
+    fn register(&mut self, kind: &'static str, id: &str, subscription: Value, at: PtpTime) {
+        if let Some(registered) = self.registry.get_mut(kind).and_then(|list| list.iter_mut().find(|r| r["id"] == id)) {
             let pre = registered.clone();
             registered["subscription"] = subscription;
             registered["version"] = json!(tai(at));
-            self.changes.push(("receivers", pre, registered.clone()));
+            self.changes.push((kind, pre, registered.clone()));
         }
     }
 
-    /// Each Receiver's staged and active parameters, to keep for the next run.
+    /// Each Sender's and Receiver's staged and active parameters, to keep for the next run.
     pub(crate) fn export(&self) -> Value {
-        let receivers: serde_json::Map<String, Value> = self
-            .receivers
-            .iter()
-            .map(|(id, r)| (id.clone(), json!({"staged": r.staged, "active": r.active})))
-            .collect();
-        json!({"receivers": receivers})
+        let kept = |map: &BTreeMap<String, Resources>| -> serde_json::Map<String, Value> {
+            map.iter().map(|(id, r)| (id.clone(), json!({"staged": r.staged, "active": r.active}))).collect()
+        };
+        json!({"receivers": kept(&self.receivers), "senders": kept(&self.senders)})
     }
 
-    /// Puts back what [`Facility::export`] kept: each Receiver takes what it took. What
-    /// was scheduled and not yet due is not scheduled again.
+    /// Puts back what [`Facility::export`] kept: each Receiver takes what it took, and
+    /// each Sender sends where it sent. What was scheduled and not yet due is not
+    /// scheduled again.
     pub(crate) fn restore(&mut self, kept: &Value) {
         let now = self.now();
-        let ids: Vec<String> = self.receivers.keys().cloned().collect();
-        for id in ids {
-            let Some(saved) = kept["receivers"].get(&id) else { continue };
-            let legs = self.receivers[&id].constraints.as_array().map_or(0, Vec::len);
-            let fits = |v: &Value| v["transport_params"].as_array().is_some_and(|p| p.len() == legs);
-            if !fits(&saved["staged"]) || !fits(&saved["active"]) {
-                continue;
+        for side in [Side::Sender, Side::Receiver] {
+            let ids: Vec<String> = self.side(side).keys().cloned().collect();
+            for id in ids {
+                let Some(saved) = kept[side.plural()].get(&id) else { continue };
+                let legs = self.side(side)[&id].constraints.as_array().map_or(0, Vec::len);
+                let fits = |v: &Value| v["transport_params"].as_array().is_some_and(|p| p.len() == legs);
+                if !fits(&saved["staged"]) || !fits(&saved["active"]) {
+                    continue;
+                }
+                let resources = self.side(side).get_mut(&id).expect("a known Sender or Receiver");
+                resources.staged = saved["staged"].clone();
+                resources.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
+                resources.active = saved["active"].clone();
+                resources.pending = None;
+                self.registered(side, &id, now);
             }
-            let receiver = self.receivers.get_mut(&id).expect("a known Receiver");
-            receiver.staged = saved["staged"].clone();
-            receiver.staged["activation"] = json!({"mode": null, "requested_time": null, "activation_time": null});
-            receiver.active = saved["active"].clone();
-            receiver.pending = None;
-            let subscription =
-                json!({"sender_id": receiver.active["sender_id"], "active": receiver.active["master_enable"]});
-            self.register(&id, subscription, now);
         }
         self.changes.clear();
         self.dirty = false;
     }
 
-    /// Whether a Receiver changed since this was last asked.
+    /// Whether a Sender or Receiver changed since this was last asked.
     pub(crate) fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
@@ -840,24 +1078,124 @@ impl Facility {
         }
     }
 
-    /// The demo Authorization Server: its metadata, and its token endpoint.
+    /// Registers a client (RFC 7591 §2 and §3.2.1), for the demo Authorization Server's
+    /// registration endpoint and for the router itself, which needs no HTTP for it.
+    pub(crate) fn register_client(&mut self, asked: &Value) -> Result<Value, (u16, Value)> {
+        let refuse = |error: &str, description: &str| (400, json!({"error": error, "error_description": description}));
+        let text = |name: &str| asked.get(name).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+        let name =
+            text("client_name").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a client_name"))?;
+        let scope = text("scope").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a scope"))?;
+        if scope.split_whitespace().any(|s| s != "query" && s != "connection") {
+            return Err(refuse("invalid_client_metadata", "this demo's scopes are query and connection"));
+        }
+        let grants = asked.get("grant_types").and_then(Value::as_array);
+        if grants.is_some_and(|g| g.iter().any(|g| g.as_str() != Some("client_credentials"))) {
+            return Err(refuse("invalid_client_metadata", "this demo registers clients for client_credentials only"));
+        }
+        let method = text("token_endpoint_auth_method").unwrap_or("client_secret_basic");
+        let client = match method {
+            "client_secret_basic" => Client::Secret(random_token()),
+            "private_key_jwt" => match text("jwks_uri") {
+                Some(uri) => Client::Key(uri.to_string()),
+                None => {
+                    return Err(refuse("invalid_client_metadata", "private_key_jwt needs a jwks_uri, as IS-10 asks"));
+                }
+            },
+            other => return Err(refuse("invalid_client_metadata", &format!("this demo does not take {other}"))),
+        };
+        // IS-10: at least 20 characters, unique to each client.
+        let client_id = format!("demo-{}", random_token());
+        let mut issued = json!({
+            "client_id": client_id, "client_id_issued_at": 0, "client_name": name, "scope": scope,
+            "grant_types": ["client_credentials"], "token_endpoint_auth_method": method,
+        });
+        match &client {
+            Client::Secret(secret) => {
+                issued["client_secret"] = json!(secret);
+                issued["client_secret_expires_at"] = json!(0);
+            }
+            Client::Key(uri) => issued["jwks_uri"] = json!(uri),
+        }
+        self.clients.insert(client_id, client);
+        Ok(issued)
+    }
+
+    /// The client a token request comes from, by its Basic credentials or its signed
+    /// assertion (RFC 7523 §2.2).
+    fn client_of(&mut self, request: &Request, form: &HashMap<String, String>) -> Result<String, &'static str> {
+        if let Some((id, secret)) = request.header("Authorization").and_then(auth::basic_credentials) {
+            return match self.clients.get(&id) {
+                Some(Client::Secret(kept)) if *kept == secret => Ok(id),
+                _ => Err("the client id or secret is not one this demo issued"),
+            };
+        }
+        let (Some(id), Some(assertion)) = (form.get("client_id"), form.get("client_assertion")) else {
+            return Err("give the client's id and secret, or a signed client_assertion");
+        };
+        if form.get("client_assertion_type").map(String::as_str) != Some(auth::ASSERTION_TYPE) {
+            return Err("the client_assertion_type is not a JWT bearer assertion");
+        }
+        let Some(Client::Key(jwks_uri)) = self.clients.get(id) else {
+            return Err("the client is not registered here for private_key_jwt");
+        };
+        // The client's keys, fetched as a real server would; the router serves its own.
+        let jwks =
+            auth::get_jwks(jwks_uri, Duration::from_secs(2)).map_err(|_| "the client's jwks_uri does not answer")?;
+        let audience = format!("{}{TOKEN_PATH}", self.base);
+        let jti = auth::verify_assertion(assertion, &jwks, id, &audience)
+            .map_err(|_| "the client_assertion does not verify")?;
+        if !self.assertions.insert(jti) {
+            return Err("the client_assertion was used before");
+        }
+        Ok(id.clone())
+    }
+
+    /// The demo Authorization Server: its metadata, its registration endpoint and its
+    /// token endpoint.
     fn authorization_server(&mut self, request: &Request) -> Response {
         let base = self.base.clone();
-        let Some(tokens) = &mut self.tokens else {
+        if self.tokens.is_none() {
             return Response::error(404, "this demo asks for no tokens: run the router with --demo-auth for them");
-        };
+        }
         if request.path.starts_with(METADATA_PATH) {
             return Response::json(
                 200,
                 &json!({
                     "issuer": format!("{base}/"),
                     "token_endpoint": format!("{base}{TOKEN_PATH}"),
+                    "registration_endpoint": format!("{base}{REGISTER_PATH}"),
                     "grant_types_supported": ["client_credentials"],
-                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
+                    "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
                     "response_types_supported": ["none"],
                     "scopes_supported": ["query", "connection"],
                 }),
             );
+        }
+        if request.path == REGISTER_PATH {
+            if request.method != "POST" {
+                return Response::json(
+                    405,
+                    &json!({"error": "invalid_request", "error_description": "register with POST"}),
+                );
+            }
+            let token = request.header("Authorization").and_then(auth::bearer_token);
+            if token != Some(INITIAL_TOKEN) {
+                let mut response = Response::json(
+                    401,
+                    &json!({"error": "invalid_token", "error_description": format!("register with the initial access token {INITIAL_TOKEN}")}),
+                );
+                response
+                    .headers
+                    .push(("WWW-Authenticate", "Bearer realm=\"st2110 demo\", error=\"invalid_token\"".into()));
+                return response;
+            }
+            let asked: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            return match self.register_client(&asked) {
+                Ok(issued) => Response::json(201, &issued),
+                Err((status, body)) => Response::json(status, &body),
+            };
         }
         let oauth_error = |status: u16, error: &str, description: &str| {
             let mut response = Response::json(status, &json!({"error": error, "error_description": description}));
@@ -869,15 +1207,17 @@ impl Facility {
         if request.method != "POST" {
             return oauth_error(405, "invalid_request", "ask for a token with POST");
         }
-        let credentials = request.header("Authorization").and_then(auth::basic_credentials);
-        if credentials.as_ref().is_none_or(|(id, secret)| id != CLIENT_ID || secret != CLIENT_SECRET) {
-            return oauth_error(401, "invalid_client", "the client id or secret is not this demo's");
-        }
         let form: HashMap<String, String> = String::from_utf8_lossy(&request.body)
             .split('&')
             .filter_map(|pair| pair.split_once('='))
             .map(|(name, value)| (auth::form_decode(name), auth::form_decode(value)))
             .collect();
+        if let Err(why) = self.client_of(request, &form) {
+            return oauth_error(401, "invalid_client", why);
+        }
+        let Some(tokens) = &mut self.tokens else {
+            return oauth_error(404, "invalid_request", "this demo asks for no tokens");
+        };
         if form.get("grant_type").map(String::as_str) != Some("client_credentials") {
             return oauth_error(400, "unsupported_grant_type", "this demo issues tokens by client_credentials only");
         }

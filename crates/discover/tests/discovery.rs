@@ -418,3 +418,40 @@ fn hears_multicast_over_loopback() {
     let described: Vec<String> = list.streams[1].by.iter().map(Origin::describe).collect();
     assert_eq!(described, ["NMOS Node Camera 1", "SAP from 127.0.0.1"]);
 }
+
+/// One look for a kind of API: unicast DNS-SD first, multicast DNS only when that finds
+/// none, and an Authorization Server's issuer from its `api_selector`.
+#[test]
+fn finds_one_kind_of_api_by_unicast_dns_sd_first() {
+    use st2110_discover::find::{Look, by_priority, find};
+    let txt = vec!["api_proto=http", "api_ver=v1.0", "pri=10", "api_selector=/x-nmos/auth/v1.0/"];
+    let unicast = Advertised::new("Auth", "_nmos-auth._tcp.studio.test", "auth.studio.test", 4000, txt);
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dns_server = server.local_addr().unwrap();
+    answer(server, unicast, Answers::Dns, Arc::new(AtomicBool::new(false)));
+    let txt = vec!["api_proto=http", "api_ver=v1.0", "pri=0"];
+    let multicast = Advertised::new("Nearby", "_nmos-auth._tcp.local", "nearby.local", 4001, txt);
+    let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let SocketAddr::V4(mdns) = responder.local_addr().unwrap() else { unreachable!() };
+    answer(responder, multicast, Answers::Mdns, Arc::new(AtomicBool::new(false)));
+
+    let look = Look {
+        dns_servers: vec![dns_server],
+        domains: Some(vec!["studio.test".into()]),
+        mdns: Some(mdns),
+        listen: Duration::from_secs(5),
+        ..Look::default()
+    };
+    let seen = find(ApiKind::Auth, &look);
+    assert_eq!(seen.looked, ["DNS in studio.test"], "multicast DNS is not asked: {seen:?}");
+    let [server] = &by_priority(&seen.apis)[..] else { panic!("{seen:?}") };
+    assert_eq!(server.issuer(), "http://127.0.0.1:4000/x-nmos/auth/v1.0/");
+    assert_eq!(server.priority, Some(10));
+
+    // In a domain with none, it asks by multicast DNS.
+    let seen = find(ApiKind::Auth, &Look { domains: Some(vec!["empty.test".into()]), ..look });
+    assert_eq!(seen.looked, ["DNS in empty.test", "multicast DNS"]);
+    let [server] = &seen.apis[..] else { panic!("{seen:?}") };
+    assert_eq!((server.issuer().as_str(), server.by.as_str()), ("http://127.0.0.1:4001/", "mDNS"));
+    assert!(seen.problems.is_empty(), "{seen:?}");
+}

@@ -12,7 +12,7 @@
 //! # Ok::<_, st2110_nmos::client::Error>(())
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::auth;
 use crate::check::is_http;
-use crate::routing::transport_file_urls;
+use crate::routing::{active_urls, transport_file_urls};
 use crate::{Kind, Manifest, Snapshot};
 
 /// The IS-04 versions this client reads, oldest first.
@@ -46,6 +46,10 @@ pub struct Options {
     pub page_size: usize,
     /// Whether to fetch each RTP Sender's SDP file from its `manifest_href`.
     pub fetch_sdp: bool,
+    /// Whether to read each Sender's and Receiver's IS-05 `/active` parameters from its
+    /// Device's Connection API, so the check can compare them with the registry's
+    /// `subscription` ([`Snapshot::active`]).
+    pub fetch_active: bool,
     /// Requests to make at once when fetching SDP files.
     pub parallel: usize,
     /// Whether to use the proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names
@@ -54,6 +58,11 @@ pub struct Options {
     /// The IS-10 access token to send, where the registry and the Nodes ask for one. It
     /// is sent only over HTTPS, or to this machine ([`auth::may_send_to`]).
     pub token: Option<auth::Token>,
+    /// Whether a snapshot learns which resources are at the version it reads through,
+    /// so the check holds them to that version's schema ([`Snapshot::current`]). Where
+    /// the registry returns older resources too, that takes a second read of each
+    /// collection, without them.
+    pub versions: bool,
 }
 
 impl Default for Options {
@@ -62,9 +71,11 @@ impl Default for Options {
             timeout: Duration::from_secs(5),
             page_size: 100,
             fetch_sdp: true,
+            fetch_active: false,
             parallel: 16,
             env_proxy: true,
             token: None,
+            versions: false,
         }
     }
 }
@@ -271,6 +282,12 @@ impl Http {
 
     /// Fetches transport files, several at once, in the order of `urls`.
     fn fetch(&self, urls: &[&str]) -> Vec<Manifest> {
+        self.each(urls, |url| self.manifest(url))
+    }
+
+    /// Calls `read` with each URL, several at once, and returns what each returned in
+    /// the order of `urls`.
+    fn each<T: Send>(&self, urls: &[&str], read: impl Fn(&str) -> T + Sync) -> Vec<T> {
         let next = AtomicUsize::new(0);
         let fetched = Mutex::new(Vec::with_capacity(urls.len()));
         std::thread::scope(|scope| {
@@ -279,37 +296,52 @@ impl Http {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(url) = urls.get(i) else { break };
-                        let manifest = self.manifest(url);
-                        fetched.lock().expect("no fetch panics while holding the lock").push((i, manifest));
+                        let result = read(url);
+                        fetched.lock().expect("no fetch panics while holding the lock").push((i, result));
                     }
                 });
             }
         });
         let mut fetched = fetched.into_inner().expect("no fetch panics while holding the lock");
         fetched.sort_unstable_by_key(|(i, _)| *i);
-        fetched.into_iter().map(|(_, manifest)| manifest).collect()
+        fetched.into_iter().map(|(_, result)| result).collect()
     }
 
     /// Reads every resource with `list` and, unless [`Options::fetch_sdp`] is off, each
     /// RTP Sender's SDP file: from its `manifest_href`, and from its Connection API's
     /// `/transportfile` too where that is another URL.
+    ///
+    /// `list` returns each collection and, where it read older resources too, the ids
+    /// of those at `version`.
     fn snapshot(
         &self,
         base: &str,
         version: &str,
-        list: impl Fn(Kind) -> Result<Vec<Value>, Error>,
+        list: impl Fn(Kind) -> Result<(Vec<Value>, Option<HashSet<String>>), Error>,
     ) -> Result<Snapshot, Error> {
+        let mut current = self.options.versions.then(BTreeSet::new);
+        let mut read = |kind: Kind| -> Result<Vec<Value>, Error> {
+            let (resources, at_version) = list(kind)?;
+            if let Some(current) = &mut current {
+                match at_version {
+                    Some(ids) => current.extend(ids),
+                    None => current.extend(resources.iter().filter_map(|r| Some(r.get("id")?.as_str()?.to_string()))),
+                }
+            }
+            Ok(resources)
+        };
         let mut snapshot = Snapshot {
             source: Some(base.to_string()),
             api_version: Some(version.to_string()),
-            nodes: list(Kind::Node)?,
-            devices: list(Kind::Device)?,
-            sources: list(Kind::Source)?,
-            flows: list(Kind::Flow)?,
-            senders: list(Kind::Sender)?,
-            receivers: list(Kind::Receiver)?,
+            nodes: read(Kind::Node)?,
+            devices: read(Kind::Device)?,
+            sources: read(Kind::Source)?,
+            flows: read(Kind::Flow)?,
+            senders: read(Kind::Sender)?,
+            receivers: read(Kind::Receiver)?,
             ..Snapshot::default()
         };
+        snapshot.current = current;
         if self.options.fetch_sdp {
             let manifests = manifest_urls(&snapshot.senders);
             let transport_files = transport_file_urls(&snapshot);
@@ -318,6 +350,13 @@ impl Http {
             let split = manifests.len();
             snapshot.manifests = manifests.into_iter().map(|(id, _)| id).zip(fetched.by_ref().take(split)).collect();
             snapshot.transport_files = transport_files.into_iter().map(|(id, _)| id).zip(fetched).collect();
+        }
+        if self.options.fetch_active {
+            let urls = active_urls(&snapshot);
+            let read: Vec<&str> = urls.iter().map(|(_, url)| url.as_str()).collect();
+            let fetched = self.each(&read, |url| self.json::<Value>(url, "the IS-05 active parameters").ok());
+            snapshot.active =
+                urls.into_iter().zip(fetched).filter_map(|((id, _), active)| Some((id, active?))).collect();
         }
         Ok(snapshot)
     }
@@ -372,14 +411,35 @@ impl QueryClient {
     /// order. Resources registered at older IS-04 versions are included where the
     /// registry supports downgrade queries.
     pub fn list(&self, kind: Kind) -> Result<Vec<Value>, Error> {
+        self.read(kind, true).map(|(resources, _)| resources)
+    }
+
+    /// Lists every resource of one type as [`list`](Self::list) does and, where that
+    /// included older resources, the ids of those at this client's version, which a
+    /// second read without downgrade returns.
+    fn versions(&self, kind: Kind) -> Result<(Vec<Value>, Option<HashSet<String>>), Error> {
+        let (resources, downgraded) = self.read(kind, true)?;
+        if !downgraded || !self.http.options.versions {
+            return Ok((resources, None));
+        }
+        let (current, _) = self.read(kind, false)?;
+        let ids = current.iter().filter_map(|r| Some(r.get("id")?.as_str()?.to_string())).collect();
+        Ok((resources, Some(ids)))
+    }
+
+    /// Reads a collection, with a downgrade query where `downgrade` allows it and the
+    /// registry implements one; says whether it did.
+    fn read(&self, kind: Kind, downgrade: bool) -> Result<(Vec<Value>, bool), Error> {
         let collection = format!("{}{}/", self.base, kind.plural());
         // A registry answers 501 to paging or downgrade queries it does not implement,
         // without saying which, so try each combination in turn: paging, downgrade.
         // IS-04 v1.0 has neither, and its registries may read unknown parameters as
         // filters that match nothing.
         let v1_0 = self.version == "v1.0";
+        let allowed = downgrade;
         let mut attempts = [(true, true), (false, true), (true, false), (false, false)]
             .into_iter()
+            .filter(|&(_, downgrade)| allowed || !downgrade)
             .filter(|&attempt| !v1_0 || attempt == (false, false));
         let (mut paging, mut downgrade) = attempts.next().expect("at least one attempt");
         let first = |paging: bool| if paging { Page::After("0:0".into()) } else { Page::First };
@@ -425,7 +485,7 @@ impl QueryClient {
             }
             // Without X-Paging-Limit the registry is not paging: that was everything.
             if !response.paged || empty {
-                return Ok(resources);
+                return Ok((resources, downgrade));
             }
             if resources.len() == before {
                 return Err(error(&url, "the registry's paging cursors do not advance: a page held nothing new"));
@@ -436,7 +496,7 @@ impl QueryClient {
                 (Page::After(since), _, Some(until)) if until != since => Page::After(until),
                 (Page::First, Some(since), _) => Page::UpTo(since),
                 (Page::UpTo(until), Some(since), _) if since != until => Page::UpTo(since),
-                _ => return Ok(resources),
+                _ => return Ok((resources, downgrade)),
             };
         }
         Err(error(&collection, "the registry's paging cursors never reached the end of the collection"))
@@ -532,7 +592,7 @@ impl QueryClient {
     /// Sender's SDP file: from its `manifest_href`, and from its Connection API's
     /// `/transportfile` too where that is another URL.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        self.http.snapshot(&self.base, &self.version, |kind| self.list(kind))
+        self.http.snapshot(&self.base, &self.version, |kind| self.versions(kind))
     }
 }
 
@@ -649,8 +709,9 @@ impl NodeClient {
     }
 
     /// Reads the Node, its resources and, unless [`Options::fetch_sdp`] is off, each
-    /// RTP Sender's SDP file, as [`QueryClient::snapshot`] reads a registry.
+    /// RTP Sender's SDP file, as [`QueryClient::snapshot`] reads a registry. A Node
+    /// API serves only its own version, so every resource is at it.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        self.http.snapshot(&self.base, &self.version, |kind| self.list(kind))
+        self.http.snapshot(&self.base, &self.version, |kind| Ok((self.list(kind)?, None)))
     }
 }
