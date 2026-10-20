@@ -31,7 +31,7 @@ Every finding cites the clause behind it.
 
 | Crate | What it is |
 |---|---|
-| [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 94 rules. No dependencies; `serde` is an optional feature. |
+| [`crates/sdp`](crates/sdp) (`st2110-sdp`) | RFC 8866 parser, ST 2110 stream model and the linter's 98 rules. No dependencies; `serde` is an optional feature. |
 | [`crates/nmos`](crates/nmos) (`st2110-nmos`) | IS-04 resource model, BCP-004-01 capability matching, the registry checker's 21 rules, and the crosspoint matrix of which Senders each Receiver can take. The Query API client is the optional `client` feature. |
 | [`crates/connect`](crates/connect) (`st2110-connect`) | IS-05 connection planning: an SDP file's streams as a Receiver's legs, its constraints, the request that connects it and the check of what it shows after. The Connection API client and the controller that makes salvos and rolls them back are the optional `client` feature. |
 | [`crates/ptp`](crates/ptp) (`st2110-ptp`) | IEEE 1588 message decoder, the ST 2059-2 profile's 20 rules, and ST 2059-1 arithmetic: alignment points, RTP timestamps and daily-jam time code. `serde` is an optional feature. |
@@ -321,7 +321,7 @@ bars.sdp: arrived whole
 - `st2110 send video [FORMAT]` sends EBU colour bars, with a box that moves along the black strip beneath them, as ST 2110-20 video. FORMAT is 1080p50 unless it names another, such as 2160p59.94 or 1280x720p25; video is progressive. `--sampling`, `--depth`, `--colorimetry`, `--tcs`, `--range` and `--packing` choose the rest. `st2110 send audio` sends a 1 kHz tone at −18 dBFS as ST 2110-30 audio; `--channels`, `--sample-rate`, `--bits`, `--packet-time`, `--tone` and `--level` choose it. A packet holds a whole number of samples, so at 44.1 kHz `--packet-time 1` gives 44 of them, 997.7 µs, which the SDP file writes as `a=ptime:1` and a receiver rounds back to 44.
 - Each frame starts at its alignment point counted from the SMPTE Epoch, with its RTP timestamp, as ST 2059-1 gives them. Its packets go at the ST 2110-21 read times of the sender type that `--sender-type` declares, from the default read offset and a little ahead of each read, so that the virtual receiver buffer neither runs dry nor overflows. Unless it says `narrow`, `narrow-linear` or `wide`, that is `wide` below 900 000 packets a second and `narrow-linear` from there, where ST 2110-21 defines no wide sender. Each audio packet goes as its last sample falls due.
 - `--to` gives the destination, a multicast group or a unicast address; give it twice for the two legs of an ST 2022-7 pair, which carry the same packets. `--interface` gives the address to send from, once for every leg or once for each; otherwise the routing table picks. `--ttl` sets the multicast time to live and `--dscp` the DSCP, AF41 by default, as AES67 marks media.
-- It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it.
+- It writes the SDP file before it sends, to standard output or to `--sdp`, with `a=group:DUP` for a pair and a source filter for each multicast leg. `st2110 lint` finds no errors in it. Audio's says `TSMODE=SAMP`, as its timestamps are the sampling instants, with the packet time as `TSDELAY`.
 - `--sap` announces the stream by SAP as well, as AES67 devices do, for `st2110 discover` and ST 2110 Viewer to find: to 239.255.255.255:9875, or `--sap=ADDRESS:PORT`, as it starts and every 30 s after, withdrawing the announcement when `--duration` ends. A sender stopped with Ctrl-C cannot withdraw it, so listeners mark the stream as maybe stopped 90 s later.
 - It times packets by the system clock, taking TAI to be 37 s ahead of it (`--tai-utc` changes that). On a machine whose clock `phc2sys` keeps to PTP, name the grandmaster with `--clock <grandmaster>:<domain>` or `--clock traceable`, and its streams line up with every other sender's. Otherwise the SDP file names this machine's MAC address as `localmac`, which only Linux can find; elsewhere give `--clock`.
 - `--duration` sends for that many seconds, and without it the sender runs until it is stopped. With `--pcap FILE` it writes the packets into a capture instead, as fast as it can make them, each at the time it would have gone out, on UTC as a capture made with the system clock is. `st2110 pcap` measures such a capture, and `st2110 receive --pcap` reads it.
@@ -417,12 +417,12 @@ Severities follow the standards' own words. An **error** breaks a "shall" (or an
 | ST 2110-20, -21 | Required parameters and their values, the `SSN` edition rule, interlace and PsF, pixel groups, block packing, `TP`, default `TROFF`, RFC 4175 look-alikes |
 | RP 2110-24 | SD width, height and pixel aspect ratio |
 | ST 2110-22 | `b=AS`, `TP`, frame rate, JPEG XS `packetmode` (VSF TR-08) |
-| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels, packet size against the standard UDP limit (-30) or `MAXUDP` (-31), `channel-order`, AM824 channel pairs |
-| ST 2110-40, -41, -43 | ANC `SSN`/`TM`/`exactframerate`, `DID_SDID`, `VPID_Code`; FMX `SSN` and `DIT`; TTML clock and `codecs` |
+| ST 2110-30, -31 | Sampling rate, `ptime`, conformance levels (the -31 X levels at 44.1 and 96 kHz too), packet size against the standard UDP limit (-30) or `MAXUDP` (-31), `channel-order`, AM824 channel pairs |
+| ST 2110-40, -41, -43 | The media type on the `m=` line; ANC `SSN`/`TM`/`exactframerate`, `DID_SDID` (and embedded audio or EDH in it), `VPID_Code`; FMX `SSN`, `DIT` and the audio clock of MGA metadata (ST 2127-2); TTML clock and `codecs` |
 
 It follows the editions current on pub.smpte.org in September 2026: ST 2110-10:2022, -20:2022, -21:2022, -22:2022, -30:2025, -31:2022, -40:2023, -41:2024 (whose SSN the 2026 edition keeps), -43:2021, RP 2110-23:2019, RP 2110-24:2023 and ST 2022-7:2019.
 
-It reads SDP only, so it cannot confirm that a sender does what its SDP says; `st2110 pcap` checks that in a capture. It also leaves out the interlaced `TROFF` defaults, which ST 2110-21:2022 Table 1 misprints for 525 and 625 lines, and the ST 2110-31 levels at 44.1 and 96 kHz.
+It reads SDP only, so it cannot confirm that a sender does what its SDP says; `st2110 pcap` checks that in a capture. It also leaves out the interlaced `TROFF` defaults, which ST 2110-21:2022 Table 1 misprints for 525 and 625 lines.
 
 ### NMOS registries
 
@@ -546,6 +546,7 @@ let stream = Description {
     legs: vec![Leg { destination: "239.10.1.1:5004".parse()?, source: Some("192.168.10.21".parse()?) }],
     clock: Some(Clock::Traceable),
     ttl: 32,
+    rtp_offset: 0,
 };
 std::fs::write("bars.sdp", stream.sdp(1))?;
 let mut transmitter = Transmitter::new(&stream.legs, &["192.168.10.21".parse().ok()], 32, 34, 37)?;

@@ -171,6 +171,7 @@ fn description(name: &str, media: Media, groups: &[(&str, u16)]) -> Description 
             .collect(),
         clock: Clock::parse(&format!("{GMID}:127")).ok(),
         ttl: 1,
+        rtp_offset: 0,
     }
 }
 

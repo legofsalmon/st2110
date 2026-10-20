@@ -284,6 +284,7 @@ mod tests {
             legs: vec![Leg { destination: "239.1.1.1:5004".parse().unwrap(), source: None }],
             clock: Some(Clock::Traceable),
             ttl: 32,
+            rtp_offset: 0,
         }
     }
 

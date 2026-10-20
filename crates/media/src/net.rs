@@ -449,6 +449,7 @@ mod tests {
             legs: vec![Leg { destination, source: None }],
             clock: Some(Clock::Traceable),
             ttl: 32,
+            rtp_offset: 0,
         };
         socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let mut session = Session::new(&stream).unwrap();

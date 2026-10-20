@@ -48,7 +48,15 @@ fn stream(media: Media, legs: usize) -> Description {
         .take(legs)
         .map(|(to, source)| Leg { destination: to.parse().unwrap(), source: Some(source) })
         .collect();
-    Description { name: "test".into(), media, payload_type: 96, legs, clock: Some(Clock::Traceable), ttl: 32 }
+    Description {
+        name: "test".into(),
+        media,
+        payload_type: 96,
+        legs,
+        clock: Some(Clock::Traceable),
+        ttl: 32,
+        rtp_offset: 0,
+    }
 }
 
 fn video(legs: usize) -> Description {

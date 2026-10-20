@@ -324,6 +324,7 @@ fn prepare(signal: &Signal) -> Result<Ready<'_>, String> {
         legs: args.to.iter().map(|&destination| Leg { destination, source: None }).collect(),
         clock: Some(clock),
         ttl: args.ttl,
+        rtp_offset: 0,
     };
     let transmitter = if args.pcap.is_some() {
         for (leg, interface) in description.legs.iter_mut().zip(&interfaces) {
