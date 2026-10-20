@@ -38,12 +38,20 @@
         {
           "chassis_id": "c8-00-84-10-00-00",
           "port_id": "c8-00-84-10-00-01",
-          "name": "eth0"
+          "name": "eth0",
+          "attached_network_device": {
+            "chassis_id": "a4-6c-2a-00-0a-00",
+            "port_id": "Ethernet1/1"
+          }
         },
         {
           "chassis_id": "c8-00-84-10-00-00",
           "port_id": "c8-00-84-10-00-02",
-          "name": "eth1"
+          "name": "eth1",
+          "attached_network_device": {
+            "chassis_id": "a4-6c-2a-00-0b-00",
+            "port_id": "Ethernet1/1"
+          }
         }
       ]
     },
@@ -83,12 +91,20 @@
         {
           "chassis_id": "c8-00-84-10-01-00",
           "port_id": "c8-00-84-10-01-01",
-          "name": "eth0"
+          "name": "eth0",
+          "attached_network_device": {
+            "chassis_id": "a4-6c-2a-00-0a-00",
+            "port_id": "Ethernet1/2"
+          }
         },
         {
           "chassis_id": "c8-00-84-10-01-00",
           "port_id": "c8-00-84-10-01-02",
-          "name": "eth1"
+          "name": "eth1",
+          "attached_network_device": {
+            "chassis_id": "a4-6c-2a-00-0b-00",
+            "port_id": "Ethernet1/2"
+          }
         }
       ]
     }

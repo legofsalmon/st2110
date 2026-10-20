@@ -41,6 +41,8 @@ rules! {
         "A Flow's Source, a Sender's Flow and the resource each subscription names are registered.";
     UNKNOWN_INTERFACE = "unknown-interface", Warning, "IS-04 v1.3 schemas",
         "Each of a Sender's or Receiver's `interface_bindings` is one of its Node's `interfaces`.";
+    INTERFACE_LLDP = "interface-lldp", Info, "IS-04 v1.3 schemas: Node",
+        "Each of a Node's `interfaces` gives the LLDP `chassis_id` it sends, as a lowercase MAC address with dashes where it is one, and at IS-04 v1.3 the switch port it is plugged into (`attached_network_device`), so a controller can tell where each stream enters the network.";
     UNKNOWN_CLOCK = "unknown-clock", Warning, "IS-04 v1.3 schemas",
         "A Source's `clock_name` is one of its Node's `clocks`.";
 
@@ -55,8 +57,12 @@ rules! {
     // Connections.
     SUBSCRIPTION_STATE = "subscription-state", Error, "IS-04 v1.3 Behaviour: Nodes",
         "A subscription names a Sender or Receiver only while it is active, and a Sender names a Receiver only while it pushes a unicast stream to it.";
+    ACTIVE_SUBSCRIPTION = "active-subscription", Warning, "IS-05 v1.1 Interoperability: IS-04 · IS-04 v1.3 Behaviour: Nodes",
+        "A Sender's or Receiver's `subscription` in the registry says what its IS-05 `/active` does: `active` is `master_enable`, and the Receiver or Sender it names is the `receiver_id` or `sender_id` there while enabled, otherwise none.";
     INACTIVE_SENDER = "inactive-sender", Warning, "IS-04 v1.3 Behaviour: Nodes",
         "An active Receiver's Sender is active too, so the stream it expects is on the network.";
+    CONSTRAINT_SETS = "constraint-sets", Warning, "BCP-004-01 v1.0: Receiver Capabilities",
+        "A Receiver with `caps.constraint_sets` also gives `caps.version`, and each constraint set holds at least one parameter constraint besides the `urn:x-nmos:cap:meta:` attributes.";
     RECEIVER_CAPS = "receiver-caps", Warning, "BCP-004-01 v1.0 · IS-04 v1.3 schemas",
         "A Receiver takes a stream its `caps` accept: its format and media type, and at least one enabled constraint set.";
 

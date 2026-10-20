@@ -100,6 +100,20 @@ impl Registry {
         let transport_file = path
             .strip_prefix("/x-nmos/connection/v1.1/single/senders/")
             .and_then(|rest| rest.strip_suffix("/transportfile"));
+        // Each Connection API says what the registry does, except for the audio Sender.
+        let active = path
+            .strip_prefix("/x-nmos/connection/v1.1/single/")
+            .and_then(|rest| rest.strip_suffix("/active"))
+            .and_then(|rest| rest.split_once('/'));
+        if let Some((collection, id)) = active {
+            let Some(item) = facility[collection].as_array().unwrap().iter().find(|item| item["id"] == id) else {
+                return (404, String::new(), String::new());
+            };
+            let peer = if collection == "senders" { "receiver_id" } else { "sender_id" };
+            let enabled = id != AUDIO_SENDER;
+            let body = json!({"master_enable": enabled, peer: item["subscription"][peer], "transport_params": []});
+            return (200, String::new(), body.to_string());
+        }
         if let Some(id) = path.strip_prefix("/sdp/").or(transport_file) {
             let sdp = facility["manifests"][id]["sdp"].as_str();
             return match sdp {
@@ -144,6 +158,62 @@ impl Registry {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+#[test]
+fn reads_the_active_parameters() {
+    let (registry, port) = Registry::start();
+    let options = Options { fetch_active: true, ..options() };
+    let client = QueryClient::connect(&format!("http://127.0.0.1:{port}"), &options).expect("connects");
+    let snapshot = client.snapshot().expect("reads");
+    assert_eq!(snapshot.active.len(), 4, "two Senders and two Receivers");
+    assert_eq!(snapshot.active[VIDEO_SENDER]["master_enable"], json!(true));
+    let active = |id: &str| format!("/x-nmos/connection/v1.1/single/senders/{id}/active");
+    assert!(registry.requests().contains(&active(AUDIO_SENDER)));
+    let findings: Vec<(&str, String)> = check(&snapshot)
+        .findings
+        .into_iter()
+        .map(|f| (f.rule, f.message))
+        .filter(|(r, _)| r.contains("active"))
+        .collect();
+    assert_eq!(
+        findings,
+        [(
+            "active-subscription",
+            "subscription.active is true, but master_enable is false in its IS-05 /active".into()
+        )]
+    );
+}
+
+#[test]
+fn learns_which_resources_are_at_the_version_read() {
+    // A registry that holds a v1.2 Node beside a v1.3 one, and returns it only to a
+    // downgrade query.
+    let facility: Value = serde_json::from_str(FACILITY).unwrap();
+    let nodes = facility["nodes"].clone();
+    let first = nodes[0]["id"].as_str().unwrap().to_string();
+    let (port, requests) = serve(move |_, target| {
+        let path = target.split_once('?').map_or(target, |(path, _)| path);
+        match path {
+            "/x-nmos/query/" => (200, String::new(), json!(["v1.3/"]).to_string()),
+            "/x-nmos/query/v1.3/nodes/" if param(target, "query.downgrade").is_some() => {
+                (200, String::new(), nodes.to_string())
+            }
+            "/x-nmos/query/v1.3/nodes/" => (200, String::new(), json!([nodes[0]]).to_string()),
+            _ => (200, String::new(), "[]".into()),
+        }
+    });
+    let versions = Options { versions: true, ..options() };
+    let client = QueryClient::connect(&format!("http://127.0.0.1:{port}"), &versions).expect("connects");
+    let snapshot = client.snapshot().expect("reads");
+    assert_eq!(snapshot.nodes.len(), 2);
+    let current: Vec<&str> = snapshot.current.iter().flatten().map(String::as_str).collect();
+    assert_eq!(current, [first.as_str()]);
+    let plain = requests.lock().unwrap().iter().filter(|t| t.starts_with("/x-nmos/query/v1.3/nodes/")).count();
+    assert_eq!(plain, 2, "one read with downgrade, one without");
+    // Without asking, nothing is known and nothing is read twice.
+    let client = QueryClient::connect(&format!("http://127.0.0.1:{port}"), &options()).expect("connects");
+    assert_eq!(client.snapshot().expect("reads").current, None);
 }
 
 fn options() -> Options {

@@ -132,6 +132,10 @@ export interface Snapshot {
   manifests?: Record<string, Manifest>;
   /** What each Sender's Connection API serves at /transportfile, where manifest_href names another URL. */
   transport_files?: Record<string, Manifest>;
+  /** The id of each resource known to be at api_version, so held to that version's schema. */
+  current?: string[];
+  /** What each Sender's and Receiver's Connection API serves at /active, by id. */
+  active?: Record<string, object>;
 }
 
 export type ResourceKind = "node" | "device" | "source" | "flow" | "sender" | "receiver";
