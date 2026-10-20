@@ -16,8 +16,8 @@
 //! An audio Node, Audio 1, has an IS-08 Channel Mapping API ([`crate::node::mapping`]):
 //! an 8-channel Input fed by its Receiver, AUD 1 in, and a stereo tone, and two Outputs,
 //! a stereo Monitor that takes either and an 8-channel Program that takes only the
-//! Receiver's channels. With `--demo-auth` it asks for a token with the `connection`
-//! scope, where a real Device would ask for `channelmapping`.
+//! Receiver's channels. With `--demo-auth` it asks for a token with the
+//! `channelmapping` scope, as IS-10 has a Device do.
 //!
 //! The streams are real: [`super::signal::start`] sends each Sender's from this
 //! machine, on the loopback interface, so the router can show them. They are small
@@ -27,15 +27,21 @@
 //!
 //! Its Query API takes subscriptions, and pushes each change to them over a WebSocket,
 //! as a registry does. Its Registration API takes other Nodes, such as `st2110 send
-//! --nmos`, and forgets one 12 seconds after its last heartbeat. With `--demo-auth` it asks for IS-10 tokens too, and serves the
-//! Authorization Server to get them from, whose tokens last a minute: to [`CLIENT_ID`]
-//! with [`CLIENT_SECRET`], and to any client that registers by RFC 7591 with the initial
-//! access token [`INITIAL_TOKEN`], for a secret or for `private_key_jwt`, as the router
-//! itself does. Its tokens are opaque strings it keeps a list of, where a real
-//! Authorization Server issues signed JWTs for each Resource Server to check for itself.
-//! It signs people in too, for `st2110 router --sign-in`, by the Authorization Code grant
-//! with PKCE, to the public client [`SIGN_IN_CLIENT_ID`]: it approves at once, where a
-//! real server asks who they are, and gives a refresh token with each access token.
+//! --nmos`, and forgets one 12 seconds after its last heartbeat. With `--demo-auth` it
+//! asks for IS-10 tokens too, and serves the Authorization Server to get them from,
+//! whose tokens last a minute: to [`CLIENT_ID`] with [`CLIENT_SECRET`], and to any client
+//! that registers by RFC 7591 with the initial access token [`INITIAL_TOKEN`], for a
+//! secret or for `private_key_jwt`, as the router itself does. Its tokens are JWTs as
+//! IS-10 v1.0.1 has them, signed with a key it makes when it starts and publishes at its
+//! `jwks_uri`, so that a Resource Server such as `st2110 receive --nmos --require-token`
+//! checks them for itself, as the demo's own APIs do: for any audience (`aud` `*`), where
+//! a real server names the facility's hosts, and with an `x-nmos-<scope>` claim that
+//! reads and writes everything for each scope granted. It signs with ES256, where IS-10
+//! has a server sign with RSA, since `ring` cannot make RSA keys; Resource Servers here
+//! take either. It signs people in too, for `st2110 router --sign-in`, by the
+//! Authorization Code grant with PKCE, to the public client [`SIGN_IN_CLIENT_ID`]: it
+//! approves at once, where a real server asks who they are, and gives a refresh token
+//! with each access token.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -48,6 +54,7 @@ use st2110_media::format::{AudioFormat, VideoFormat};
 use st2110_ptp::PtpTime;
 use st2110_sdp::Rational;
 
+use st2110_nmos::access::{self, Refusal};
 use st2110_nmos::auth;
 
 use super::signal::Live;
@@ -185,8 +192,15 @@ struct Refresh {
     scopes: Vec<String>,
 }
 
-/// The scopes the demo Authorization Server issues tokens for.
-const SCOPES: [&str; 3] = ["query", "connection", "registration"];
+/// The scopes the demo Authorization Server issues tokens for: the APIs of IS-04, IS-05,
+/// IS-08 and IS-12.
+const SCOPES: [&str; 6] = ["query", "registration", "node", "connection", "channelmapping", "ncp"];
+
+/// What a client asking for other scopes is told.
+const SCOPES_ARE: &str = "this demo's scopes are query, registration, node, connection, channelmapping and ncp";
+
+/// Where it publishes the keys it signs tokens with (RFC 8414 `jwks_uri`).
+const JWKS_PATH: &str = "/x-nmos/auth/v1.0/jwks";
 
 /// How long a demo token lasts, short enough to see one renewed.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
@@ -203,12 +217,6 @@ const EXPIRY: Duration = Duration::from_secs(12);
 
 /// Where the Query API's subscriptions are heard.
 pub(crate) const WS_PATH: &str = "/x-nmos/query/v1.3/ws/";
-
-/// A token the demo Authorization Server issued.
-struct Issued {
-    scopes: Vec<String>,
-    expires: Instant,
-}
 
 /// The registry, and every Node's Connection API.
 pub(crate) struct Facility {
@@ -233,8 +241,8 @@ pub(crate) struct Facility {
     /// Changes to the registry not yet pushed to subscriptions: the resource type, and
     /// the resource before and after.
     changes: Vec<(&'static str, Value, Value)>,
-    /// The tokens issued, with `--demo-auth`.
-    tokens: Option<HashMap<String, Issued>>,
+    /// The key the Authorization Server signs its tokens with, with `--demo-auth`.
+    signer: Option<auth::SigningKey>,
     /// The clients registered with the Authorization Server, by id.
     clients: HashMap<String, Client>,
     /// The `jti` of each client assertion taken, so that none is taken twice.
@@ -307,7 +315,7 @@ impl Facility {
             edits: 0,
             subscriptions: BTreeMap::new(),
             changes: Vec::new(),
-            tokens: None,
+            signer: None,
             clients: HashMap::from([
                 (CLIENT_ID.to_string(), Client::Secret(CLIENT_SECRET.to_string())),
                 (SIGN_IN_CLIENT_ID.to_string(), Client::Public),
@@ -395,15 +403,16 @@ impl Facility {
         facility
     }
 
-    /// Asks for IS-10 tokens on the Query and Connection APIs, and hands them out.
-    pub(crate) fn with_auth(mut self) -> Self {
-        self.tokens = Some(HashMap::new());
-        self
+    /// Asks for IS-10 tokens on the Query, Registration, Connection and Channel Mapping
+    /// APIs, and hands them out, signed with a key of its own.
+    pub(crate) fn with_auth(mut self) -> Result<Self, auth::Error> {
+        self.signer = Some(auth::SigningKey::generate()?);
+        Ok(self)
     }
 
     /// The Authorization Server's issuer URL, with `--demo-auth`.
     pub(crate) fn auth_server(&self) -> Option<String> {
-        self.tokens.as_ref().map(|_| format!("{}/", self.base))
+        self.signer.as_ref().map(|_| format!("{}/", self.base))
     }
 
     /// What a Receiver's legs take from an SDP file, for setting up the demo.
@@ -690,7 +699,7 @@ impl Facility {
     pub(crate) fn answer(&mut self, request: &Request) -> Response {
         self.settle();
         if request.path.starts_with(METADATA_PATH)
-            || [TOKEN_PATH, REGISTER_PATH, AUTHORIZE_PATH].contains(&request.path.as_str())
+            || [TOKEN_PATH, REGISTER_PATH, AUTHORIZE_PATH, JWKS_PATH].contains(&request.path.as_str())
         {
             return self.authorization_server(request);
         }
@@ -1009,7 +1018,7 @@ impl Facility {
         if body["persist"] == true {
             return error(400, "Bad Request", "the demo registry keeps no persistent subscriptions");
         }
-        let authorization = self.tokens.is_some();
+        let authorization = self.signer.is_some();
         // The same request has the same subscription (IS-04 Query API: Subscriptions).
         if let Some(existing) = self.subscriptions.values().find(|s| s["resource_path"] == path) {
             return (200, existing.clone());
@@ -1085,40 +1094,42 @@ impl Facility {
     /// with the refusal when it does not (IS-10 v1.0 Behaviour: Resource Servers). A
     /// WebSocket may carry it as `access_token` in the query, as IS-10 allows.
     pub(crate) fn authorized(&mut self, request: &Request) -> Result<(), Response> {
-        let Some(tokens) = &mut self.tokens else {
+        let Some(signer) = &self.signer else {
             return Ok(());
         };
-        let scope = if request.path.starts_with("/x-nmos/query") {
-            "query"
-        } else if request.path.starts_with("/x-nmos/registration") {
-            "registration"
-        } else if request.path.starts_with("/node/") {
-            "connection"
-        } else {
+        // Each Node's APIs are under `/node/<n>`; the registry's are at the root. Each API
+        // asks for its own scope, as IS-10 has it: the Channel Mapping API
+        // `channelmapping`, not `connection`.
+        let path = match request.path.strip_prefix("/node/").and_then(|rest| rest.split_once('/')) {
+            Some((_, rest)) => format!("/{rest}"),
+            None => request.path.clone(),
+        };
+        let Some((api, rest)) = access::api_path(&path) else {
             return Ok(());
         };
-        let now = Instant::now();
-        tokens.retain(|_, issued| issued.expires > now);
+        let write = access::writes(&request.method);
         let from_query = request.path.starts_with(WS_PATH).then(|| request.param("access_token")).flatten();
         let token = request.header("Authorization").and_then(auth::bearer_token).map(str::to_string).or(from_query);
-        let refuse = |status: u16, error: &str, why: &str| {
-            let mut response = Response::error(status, why);
-            response.headers.push((
-                "WWW-Authenticate",
-                format!("Bearer realm=\"st2110 demo\", error=\"{error}\", scope=\"{scope}\""),
-            ));
-            Err(response)
+        let checked = match token {
+            None => Err(Refusal {
+                description: "this demo asks for an IS-10 token: run the router with --demo-auth".into(),
+                ..Refusal::missing()
+            }),
+            Some(token) => access::verify_signature(&token, &signer.jwks())
+                .and_then(|claims| {
+                    let issuer = format!("{}/", self.base);
+                    access::check_claims(claims, &issuer, &[host_of(&self.base)], access::unix_now())
+                })
+                .and_then(|claims| match claims.permits(api, write, rest) {
+                    true => Ok(()),
+                    false => Err(Refusal::insufficient(api, write, rest)),
+                }),
         };
-        match token.as_deref().map(|t| tokens.get(t)) {
-            None => {
-                refuse(401, "invalid_request", "this demo asks for an IS-10 token: run the router with --demo-auth")
-            }
-            Some(None) => refuse(401, "invalid_token", "the token has expired, or was never issued here"),
-            Some(Some(issued)) if !issued.scopes.iter().any(|s| s == scope) => {
-                refuse(403, "insufficient_scope", &format!("the token's scopes do not include {scope}"))
-            }
-            Some(Some(_)) => Ok(()),
-        }
+        checked.map_err(|refusal| {
+            let mut response = Response::error(refusal.status, refusal.description.clone());
+            response.headers.push(("WWW-Authenticate", refusal.challenge("st2110 demo", Some(api))));
+            response
+        })
     }
 
     /// Registers a client (RFC 7591 §2 and §3.2.1), for the demo Authorization Server's
@@ -1130,7 +1141,7 @@ impl Facility {
             text("client_name").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a client_name"))?;
         let scope = text("scope").ok_or_else(|| refuse("invalid_client_metadata", "IS-10 asks for a scope"))?;
         if scope.split_whitespace().any(|s| !SCOPES.contains(&s)) {
-            return Err(refuse("invalid_client_metadata", "this demo's scopes are query, connection and registration"));
+            return Err(refuse("invalid_client_metadata", SCOPES_ARE));
         }
         let grants = asked.get("grant_types").and_then(Value::as_array);
         if grants.is_some_and(|g| g.iter().any(|g| g.as_str() != Some("client_credentials"))) {
@@ -1207,8 +1218,11 @@ impl Facility {
     /// token endpoint.
     fn authorization_server(&mut self, request: &Request) -> Response {
         let base = self.base.clone();
-        if self.tokens.is_none() {
+        let Some(signer) = &self.signer else {
             return Response::error(404, "this demo asks for no tokens: run the router with --demo-auth for them");
+        };
+        if request.path == JWKS_PATH {
+            return Response::json(200, &signer.jwks());
         }
         if request.path.starts_with(METADATA_PATH) {
             return Response::json(
@@ -1218,6 +1232,7 @@ impl Facility {
                     "authorization_endpoint": format!("{base}{AUTHORIZE_PATH}"),
                     "token_endpoint": format!("{base}{TOKEN_PATH}"),
                     "registration_endpoint": format!("{base}{REGISTER_PATH}"),
+                    "jwks_uri": format!("{base}{JWKS_PATH}"),
                     "grant_types_supported": ["client_credentials", "authorization_code", "refresh_token"],
                     "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt", "none"],
                     "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
@@ -1280,14 +1295,10 @@ impl Facility {
                 return oauth_error(400, "unauthorized_client", "a public client gets tokens by signing someone in");
             }
             Some("client_credentials") => {
-                let asked = form.get("scope").map_or("query connection", String::as_str);
+                let asked = form.get("scope").map_or(auth::SCOPES, String::as_str);
                 let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
                 if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
-                    return oauth_error(
-                        400,
-                        "invalid_scope",
-                        "this demo's scopes are query, connection and registration",
-                    );
+                    return oauth_error(400, "invalid_scope", SCOPES_ARE);
                 }
                 (scopes, false)
             }
@@ -1333,12 +1344,26 @@ impl Facility {
                 );
             }
         };
-        let Some(tokens) = &mut self.tokens else {
+        let Some(signer) = &self.signer else {
             return oauth_error(404, "invalid_request", "this demo asks for no tokens");
         };
-        let token = random_token();
-        tokens.retain(|_, issued| issued.expires > now);
-        tokens.insert(token.clone(), Issued { scopes: scopes.clone(), expires: now + TOKEN_LIFETIME });
+        // IS-10 v1.0.1 Access Tokens: who it acts for, the client, the scopes, and for
+        // each scope a private claim of the paths it may read and write.
+        let issued_at = access::unix_now();
+        let mut claims = json!({
+            "iss": format!("{base}/"),
+            "sub": if public { "demo operator" } else { client.as_str() },
+            "aud": ["*"],
+            "client_id": client, "scope": scopes.join(" "), "jti": random_token(),
+            "iat": issued_at, "nbf": issued_at, "exp": issued_at + TOKEN_LIFETIME.as_secs(),
+        });
+        for scope in &scopes {
+            claims[format!("x-nmos-{scope}")] = json!({"read": ["*"], "write": ["*"]});
+        }
+        let token = match signer.sign(&claims) {
+            Ok(token) => token,
+            Err(e) => return oauth_error(500, "server_error", &e.message),
+        };
         let mut body = json!({
             "access_token": token, "token_type": "Bearer",
             "expires_in": TOKEN_LIFETIME.as_secs(), "scope": scopes.join(" "),
@@ -1391,10 +1416,10 @@ impl Facility {
         if request.param("code_challenge_method").as_deref() != Some("S256") || challenge.len() != 43 {
             return refuse("invalid_request", "this demo asks for PKCE, by S256");
         }
-        let asked = request.param("scope").unwrap_or_else(|| "query connection".into());
+        let asked = request.param("scope").unwrap_or_else(|| auth::SCOPES.into());
         let scopes: Vec<String> = asked.split_whitespace().map(str::to_string).collect();
         if scopes.is_empty() || scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
-            return refuse("invalid_scope", "this demo's scopes are query, connection and registration");
+            return refuse("invalid_scope", SCOPES_ARE);
         }
         let code = random_token();
         let now = Instant::now();
@@ -1436,6 +1461,13 @@ impl Control for Facility {
     fn touched(&mut self) {
         self.dirty = true;
     }
+}
+
+/// The host of a URL such as `http://127.0.0.1:8110`: the demo's own name, as its tokens'
+/// audience.
+fn host_of(base: &str) -> String {
+    let authority = base.split_once("://").map_or(base, |(_, rest)| rest).split('/').next().unwrap_or_default();
+    authority.rsplit_once(':').map_or(authority, |(host, _)| host).to_string()
 }
 
 /// A token no one can guess ahead, for the demo: the standard library's random hash keys.

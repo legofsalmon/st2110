@@ -61,13 +61,15 @@ impl Ids {
 }
 
 /// Where the Node is: its address, the port its APIs are on, its name, and its network
-/// interfaces, each a name and a MAC address.
+/// interfaces, each a name and a MAC address; and whether its APIs ask for an IS-10
+/// token.
 #[derive(Clone, Debug)]
 pub(crate) struct Place {
     pub host: Ipv4Addr,
     pub port: u16,
     pub hostname: String,
     pub interfaces: Vec<(String, String)>,
+    pub authorization: bool,
 }
 
 impl Place {
@@ -111,7 +113,7 @@ pub(crate) fn node(ids: &Ids, place: &Place, version: &str, label: &str, referen
         json!({
             "href": format!("{}/", place.base()), "hostname": place.hostname,
             "api": {"versions": ["v1.3"], "endpoints": [
-                {"host": place.host.to_string(), "port": place.port, "protocol": "http", "authorization": false},
+                {"host": place.host.to_string(), "port": place.port, "protocol": "http", "authorization": place.authorization},
             ]},
             "caps": {}, "services": [], "clocks": [clock(reference)], "interfaces": interfaces,
         }),
@@ -126,11 +128,12 @@ pub(crate) fn device(ids: &Ids, place: &Place, version: &str, label: &str) -> Va
             "type": "urn:x-nmos:device:generic", "node_id": ids.node, "senders": [], "receivers": [],
             "controls": [{
                 "href": format!("{}/x-nmos/connection/{CONNECTION_VERSION}/", place.base()),
-                "type": format!("urn:x-nmos:control:sr-ctrl/{CONNECTION_VERSION}"), "authorization": false,
+                "type": format!("urn:x-nmos:control:sr-ctrl/{CONNECTION_VERSION}"),
+                "authorization": place.authorization,
             }, {
                 // IS-12 v1.0.1: the Device's control model, with its status monitor.
                 "href": format!("ws://{}:{}{}/", place.host, place.port, super::ncp::PATH),
-                "type": st2110_nmos::ncp::CONTROL_TYPE, "authorization": false,
+                "type": st2110_nmos::ncp::CONTROL_TYPE, "authorization": place.authorization,
             }],
         }),
     )
@@ -278,6 +281,7 @@ mod tests {
             port: 8080,
             hostname: "studio-mac".into(),
             interfaces: vec![("en0".into(), "02-00-c0-a8-0a-15".into())],
+            authorization: false,
         }
     }
 

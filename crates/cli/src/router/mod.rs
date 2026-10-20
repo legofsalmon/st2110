@@ -216,7 +216,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         (None, true) => {
             let base = format!("http://{local}");
             let facility = Facility::new(&base, args.tai_utc);
-            let facility = if args.demo_auth { facility.with_auth() } else { facility };
+            let facility = if args.demo_auth { facility.with_auth().map_err(|e| e.message)? } else { facility };
             (format!("{base}/x-nmos/query/v1.3/"), Some(facility))
         }
         _ => return Err(Failure::Usage("give a registry's Query API URL, or --demo".into())),

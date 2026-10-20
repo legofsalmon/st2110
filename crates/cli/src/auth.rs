@@ -127,7 +127,7 @@ impl Auth {
 
 impl Auth {
     /// The Authorization Server named, or found by DNS-SD.
-    fn server(&self, timeout: Duration) -> Result<String, String> {
+    pub(crate) fn server(&self, timeout: Duration) -> Result<String, String> {
         match &self.auth {
             Some(server) => {
                 auth::metadata_url(server).map_err(|e| format!("--auth: {e}"))?;
