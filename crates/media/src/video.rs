@@ -11,6 +11,10 @@ use crate::rtp;
 const ESN: usize = 2;
 const SRD: usize = 6;
 
+/// IP datagrams under this many octets come only at the end of a field or frame in
+/// general packing mode (ST 2110-20:2022 §6.3.2).
+const SHORT_DATAGRAM: usize = 1000;
+
 /// Octets in a block of block packing mode (ST 2110-20:2022 §6.3.3), and blocks a packet.
 const BLOCK: usize = 180;
 const BLOCKS: usize = 7;
@@ -34,7 +38,10 @@ pub struct Segment {
 /// How a format's frames are cut into packets, the same for every frame.
 ///
 /// General packing splits each row evenly into as few packets as the standard UDP size
-/// limit allows, or puts up to three whole rows in a packet when they are short. Block
+/// limit allows, or puts up to three whole rows in a packet when they are short. Where
+/// that would leave an IP datagram under 1000 octets before the end of a field or frame, which
+/// ST 2110-20:2022 §6.3.2 asks senders to avoid, it fills every packet instead, running
+/// on from row to row, so only the last can be short. Block
 /// packing fills every packet but the frame's last with seven 180-octet blocks,
 /// running on from row to row, with a header for each row a packet touches.
 ///
@@ -152,6 +159,13 @@ fn cut(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
 }
 
 fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
+    let packets = even(format, group);
+    let last = packets.len().saturating_sub(1);
+    if packets[..last].iter().all(|p| datagram(p) >= SHORT_DATAGRAM) { packets } else { filled(format, group) }
+}
+
+/// Each row split evenly into as few packets as fit, or up to three whole rows a packet.
+fn even(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     let row = format.row_bytes();
     let height = format.frame_bytes() / row;
     let octets = group.octets as usize;
@@ -178,6 +192,38 @@ fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
         }
     }
     packets
+}
+
+/// Every packet filled with as many whole pixel groups as fit, running on from row to
+/// row with up to three row headers.
+fn filled(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
+    let row = format.row_bytes();
+    let total = format.frame_bytes();
+    let octets = group.octets as usize;
+    let mut packets = Vec::new();
+    let mut at = 0;
+    while at < total {
+        let mut segments = Vec::new();
+        let mut used = ESN;
+        while at < total && segments.len() < 3 {
+            let room = PAYLOAD_LIMIT.saturating_sub(used + SRD) / octets * octets;
+            if room == 0 {
+                break;
+            }
+            let to = ((at / row + 1) * row).min(at + room);
+            segments.push(segment(format, group, at, to));
+            used += SRD + to - at;
+            at = to;
+        }
+        packets.push(segments);
+    }
+    packets
+}
+
+/// Octets of the IP datagram that carries a packet's segments, behind IPv4, UDP and RTP
+/// headers of 20, 8 and 12 octets.
+fn datagram(segments: &[Segment]) -> usize {
+    20 + 8 + 12 + ESN + SRD * segments.len() + segments.iter().map(|s| usize::from(s.length)).sum::<usize>()
 }
 
 fn block(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
@@ -638,6 +684,38 @@ mod tests {
     }
 
     #[test]
+    fn general_packing_fills_packets_rather_than_send_short_ones() {
+        // 640 wide: 1600 octets a row, which split evenly would make datagrams of 848.
+        let layout = Layout::new(&format(640, 360)).unwrap();
+        assert_eq!(
+            layout.segments(1),
+            [
+                Segment { row: 0, offset: 572, length: 170, second_field: false, start: 1430 },
+                Segment { row: 1, offset: 0, length: 1255, second_field: false, start: 1600 }
+            ]
+        );
+        assert_eq!(layout.payload_len(1), PAYLOAD_LIMIT - 1);
+        for (width, scan, sampling) in [
+            (640, Scan::Progressive, Sampling::YCbCr422),
+            (320, Scan::Progressive, Sampling::YCbCr422),
+            (320, Scan::Interlaced, Sampling::YCbCr422),
+            (640, Scan::Progressive, Sampling::YCbCr420),
+            (1280, Scan::Segmented, Sampling::Rgb),
+        ] {
+            let mut f = format(width, 360);
+            (f.scan, f.sampling) = (scan, sampling);
+            let layout = Layout::new(&f).unwrap();
+            let ends = [layout.second_field().map(|s| s - 1), Some(layout.packets() - 1)];
+            for i in (0..layout.packets()).filter(|i| !ends.contains(&Some(*i))) {
+                assert!(datagram(layout.segments(i)) >= 1000, "{width} {scan:?} {sampling:?}: packet {i}");
+            }
+            assert!((0..layout.packets()).all(|i| layout.payload_len(i) <= PAYLOAD_LIMIT));
+            let total: usize = layout.segments.iter().map(|s| usize::from(s.length)).sum();
+            assert_eq!(total, f.frame_bytes());
+        }
+    }
+
+    #[test]
     fn block_packing_fills_packets_with_seven_blocks() {
         let mut f = format(1920, 1080);
         f.packing = Packing::Block;
@@ -828,7 +906,7 @@ mod tests {
 
     #[test]
     fn missing_and_late_packets_are_counted() {
-        let f = format(320, 24);
+        let f = format(560, 24);
         let frame = frame_of(&f);
         let first = packets(&f, &frame, 0, u32::MAX - 3);
         let second = packets(&f, &frame, 1800, (u32::MAX - 3).wrapping_add(first.len() as u32));
@@ -882,7 +960,7 @@ mod tests {
 
     #[test]
     fn a_lost_first_packet_counts_as_missing_once_a_frame_came_whole() {
-        let f = format(320, 24);
+        let f = format(560, 24);
         let frame = frame_of(&f);
         let one = packets(&f, &frame, 0, 100);
         let two = packets(&f, &frame, 1800, 100 + one.len() as u32);
@@ -900,7 +978,8 @@ mod tests {
     #[test]
     fn overlapping_packets_leave_a_frame_short() {
         // A faulty sender writes packet 1's row header as packet 0's, so row 1 never comes.
-        let f = format(320, 8);
+        // 560 wide: one 1400-octet row a packet.
+        let f = format(560, 8);
         let frame = frame_of(&f);
         let mut all = packets(&f, &frame, 0, 0);
         let header = all[0][12 + 2..12 + 8].to_vec();

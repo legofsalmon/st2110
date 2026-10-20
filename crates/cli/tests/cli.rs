@@ -775,7 +775,7 @@ fn send_writes_a_capture_the_analyser_and_linter_pass() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         stderr(&output),
-        format!("st2110: sent 10 frames of 320x180p50 YCbCr-4:2:2 10-bit (1800 packets) on 2 legs into {pcap}\n")
+        format!("st2110: sent 10 frames of 320x180p50 YCbCr-4:2:2 10-bit (1020 packets) on 2 legs into {pcap}\n")
     );
     let text = std::fs::read_to_string(&sdp).unwrap();
     assert!(text.contains("a=group:DUP primary secondary\r\n"), "{text}");
@@ -819,10 +819,10 @@ fn receive_merges_two_legs_that_each_lost_packets() {
     let output = with_stdin_bytes(&["receive", &sdp, "--pcap", "-", "--png", &png], &lossy);
     let text = stdout(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
-    assert!(text.contains("  leg 1 239.10.1.1:5004 from 192.0.2.1: 1620 packets, 180 lost\n"), "{text}");
-    assert!(text.contains("  merged: 1800 packets in 0.200 s, 59.1 Mb/s of RTP, none lost\n"), "{text}");
-    assert!(text.contains("  video: 10 frames, all whole, 180 packets a frame"), "{text}");
-    assert!(text.contains("note: leg 2 (239.10.2.1:5004 from 192.0.2.1) lost 180 packets\n"), "{text}");
+    assert!(text.contains("  leg 1 239.10.1.1:5004 from 192.0.2.1: 918 packets, 102 lost\n"), "{text}");
+    assert!(text.contains("  merged: 1020 packets in 0.200 s, 58.9 Mb/s of RTP, none lost\n"), "{text}");
+    assert!(text.contains("  video: 10 frames, all whole, 102 packets a frame"), "{text}");
+    assert!(text.contains("note: leg 2 (239.10.2.1:5004 from 192.0.2.1) lost 102 packets\n"), "{text}");
     assert!(text.ends_with(": arrived whole\n"), "{text}");
     let picture = std::fs::read(&png).unwrap();
     assert_eq!(picture[..8], [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
