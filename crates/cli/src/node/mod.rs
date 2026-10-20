@@ -10,9 +10,12 @@
 //! ends. An IS-10 token is sent where the registry asks for one; the Node's own APIs
 //! ask for none.
 //!
-//! Where DNS-SD finds no registry, the Node API still serves the resources, for a
-//! controller that is told where it is, and DNS-SD is asked again every 30 seconds.
-//! The Node does not advertise itself by multicast DNS for peer-to-peer discovery.
+//! Where there is no registry to register with, none found by DNS-SD or none that
+//! answers, the Node advertises its Node API by multicast DNS for peer-to-peer
+//! discovery (IS-04 v1.3 Discovery: Peer to Peer), with the version counters that
+//! tell a controller when to read it again, and DNS-SD is asked again every 30
+//! seconds; once registered, it says goodbye. Its Node API also takes IS-04's
+//! deprecated `/target`, as an IS-05 immediate activation.
 //!
 //! An activation through IS-05 changes the running stream: a Sender sends to the new
 //! destination, or stops and starts with `master_enable` ([`sending`]), and a Receiver
@@ -37,6 +40,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use st2110_connect::client::ConnectionClient;
+use st2110_connect::{Activation, Constraints, Plan};
+use st2110_discover::nmos::{self as discovery, Counters};
+use st2110_discover::responder::{self, Instance, Responder};
 use st2110_media::describe::{Clock, Description};
 use st2110_nmos::Kind;
 use st2110_nmos::auth::SCOPES;
@@ -72,8 +79,9 @@ const TICK: Duration = Duration::from_millis(10);
 pub(crate) struct NodeArgs {
     /// Run as an NMOS Node: serve an IS-04 Node API and an IS-05 Connection API for the
     /// Sender or Receiver, and register it with the registry at --nmos=URL, or with the
-    /// one DNS-SD finds when no URL is given. A controller can then move the stream, or
-    /// turn it off and on.
+    /// one DNS-SD finds when no URL is given; with no registry, advertise it by multicast
+    /// DNS for controllers to find peer to peer. A controller can then move the stream,
+    /// or turn it off and on.
     #[arg(
         long,
         value_name = "URL",
@@ -182,11 +190,22 @@ struct State {
     addresses: Vec<Ipv4Addr>,
     /// Where a Sender's monitor reads its counts.
     watch: Option<Watch>,
+    /// The version counters advertised peer to peer.
+    counters: Counters,
+    /// The multicast DNS responder that advertises the Node while there is no registry
+    /// to register with.
+    advertising: Option<Responder>,
 }
 
 impl State {
     fn endpoint_resource(&mut self) -> &mut Value {
         &mut self.resources.last_mut().expect("a Sender or Receiver").1
+    }
+
+    /// The text pairs the Node advertises peer to peer: it serves IS-04 v1.3 over HTTP,
+    /// and asks for no token.
+    fn txt(&self) -> Vec<(String, String)> {
+        self.counters.txt("http", &["v1.3"], false)
     }
 }
 
@@ -221,6 +240,13 @@ impl Control for State {
         resource["subscription"] = subscription;
         resource["version"] = json!(tai(at));
         self.changed = true;
+        self.counters.bump(match side {
+            Side::Sender => Kind::Sender,
+            Side::Receiver => Kind::Receiver,
+        });
+        if let Some(responder) = &self.advertising {
+            responder.set_txt(self.txt());
+        }
     }
 
     fn transport_file(&self, id: &str) -> Option<String> {
@@ -391,6 +417,8 @@ impl Node {
             ncp: model,
             addresses: addresses.to_vec(),
             watch: None,
+            counters: Counters::default(),
+            advertising: None,
         };
         let shared =
             Arc::new(Shared { state: Mutex::new(state), wake: Condvar::new(), sessions: ncp::Sessions::default() });
@@ -421,7 +449,16 @@ impl Node {
         });
         let ticking = shared.clone();
         thread::spawn(move || tick(&ticking));
-        let registrar = Registrar { shared: shared.clone(), finder, options, said: String::new() };
+        let advert = Instance {
+            service: discovery::NODE.into(),
+            name: label.clone(),
+            host: format!("{}-nmos-{port}", responder::host_label(&name)),
+            port,
+            address: host,
+            txt: Vec::new(),
+        };
+        let mdns = args.auth.look.mdns.filter(|a| a.ip().is_multicast()).unwrap_or(st2110_discover::MDNS);
+        let registrar = Registrar { shared: shared.clone(), finder, options, said: String::new(), advert, mdns };
         let registering = Some(thread::spawn(move || registrar.run()));
         Ok(Self {
             shared,
@@ -534,6 +571,14 @@ fn answer(shared: &Shared, request: &Request) -> Response {
     };
     let method = request.method.as_str();
     let path = request.path.trim_end_matches('/');
+    if let Some(id) = under(path, "/x-nmos/node/v1.3/receivers")
+        .and_then(|rest| rest.strip_suffix("/target"))
+        .map(|id| id.trim_matches('/'))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        let (status, body) = target(shared, method, id, &body);
+        return Response::json(status, &body);
+    }
     let mut state = shared.lock();
     let read = |list: Value| if method == "GET" { (200, list) } else { error(405, "Method Not Allowed", "") };
     let (status, body) = match path {
@@ -560,9 +605,6 @@ fn under<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 /// The Node API (IS-04 v1.3 APIs: Node API).
 fn node_api(state: &State, method: &str, rest: &str) -> (u16, Value) {
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-    if let ["receivers", _, "target"] = parts.as_slice() {
-        return error(501, "Not Implemented", "connect this Receiver through its IS-05 Connection API");
-    }
     if method != "GET" {
         return error(405, "Method Not Allowed", "the Node API only reads");
     }
@@ -583,6 +625,59 @@ fn node_api(state: &State, method: &str, rest: &str) -> (u16, Value) {
     }
 }
 
+/// IS-04's `/target` (IS-04 v1.3 APIs: Node API, which deprecates it in favour of
+/// IS-05): given a Sender, the Receiver takes its stream, as an IS-05 immediate
+/// activation of the Sender's transport file, from its `manifest_href`, would have it,
+/// and given `{}` it takes none. The Sender comes back with 202 (Accepted).
+fn target(shared: &Shared, method: &str, id: &str, body: &Value) -> (u16, Value) {
+    if method != "POST" {
+        return error(405, "Method Not Allowed", "a Receiver's target is POSTed");
+    }
+    let constraints = {
+        let mut state = shared.lock();
+        let side = state.side;
+        match state.endpoints(Side::Receiver).get(id) {
+            Some(endpoint) if side == Side::Receiver => endpoint.constraints.clone(),
+            _ => return error(404, "Not Found", "no such Receiver"),
+        }
+    };
+    let Some(sender) = body.as_object() else {
+        return error(400, "Bad Request", "the target is a Sender, or {} to take none");
+    };
+    let request = if sender.is_empty() {
+        json!({"sender_id": null, "master_enable": false, "activation": Activation::Immediate.to_json()})
+    } else {
+        let Some(sender_id) = sender.get("id").and_then(Value::as_str) else {
+            return error(400, "Bad Request", "the Sender has no id");
+        };
+        let Some(href) = sender.get("manifest_href").and_then(Value::as_str) else {
+            return error(400, "Bad Request", "the Sender has no manifest_href to read its SDP file from");
+        };
+        // Fetched without holding the Node, which goes on answering meanwhile.
+        let client = ConnectionClient::new(&st2110_connect::client::Options {
+            timeout: TIMEOUT,
+            ..st2110_connect::client::Options::default()
+        });
+        let sdp = match client.transport_file(href) {
+            Ok(reply) if reply.is_success() => reply.body.as_str().unwrap_or_default().to_string(),
+            Ok(reply) => return error(500, "Internal Server Error", &format!("{href}: {}", reply.error())),
+            Err(e) => return error(500, "Internal Server Error", &e.to_string()),
+        };
+        let plan = Constraints::from_json(&constraints)
+            .and_then(|constraints| Plan::connect(&sdp, Some(sender_id), &constraints, Activation::Immediate));
+        match plan {
+            Ok(plan) if plan.problems.is_empty() => plan.request,
+            Ok(plan) => return error(400, "Bad Request", &plan.problems.join("; ")),
+            Err(e) => return error(400, "Bad Request", &format!("the Sender's SDP file at {href}: {e}")),
+        }
+    };
+    let (status, response) = connection::stage(&mut *shared.lock(), Side::Receiver, id, &request);
+    if status >= 300 {
+        return (status, response);
+    }
+    (202, body.clone())
+}
+
 /// Where the registry is: named, or to be found by DNS-SD.
 enum Finder {
     Given(String),
@@ -596,6 +691,9 @@ struct Registrar {
     options: Options,
     /// What it said last, so that it says each thing once.
     said: String,
+    /// How it advertises the Node peer to peer, and where.
+    advert: Instance,
+    mdns: SocketAddrV4,
 }
 
 /// A registry registered with, and how it was found.
@@ -633,6 +731,7 @@ impl Registrar {
                 (state.stopping, changed)
             };
             if stopping {
+                self.unadvertise();
                 let registered = registry?;
                 self.withdraw(&registered.client);
                 return Some(registered.client.base().to_string());
@@ -643,10 +742,12 @@ impl Registrar {
                         self.say(format!("NMOS: registered with {} ({})", found.client.base(), found.how));
                         registry = Some(found);
                         due = Instant::now() + HEARTBEAT;
+                        self.unadvertise();
                     }
                     Err((message, wait)) => {
                         self.say(message);
                         due = Instant::now() + wait;
+                        self.advertise();
                     }
                 }
                 continue;
@@ -681,6 +782,40 @@ impl Registrar {
                 self.say(format!("NMOS: lost the registry at {base} ({why}); looking for one again"));
                 due = Instant::now();
             }
+        }
+    }
+
+    /// Advertises the Node peer to peer, unless it already is (IS-04 v1.3 Discovery:
+    /// Peer to Peer, for a Node that finds no registry).
+    fn advertise(&mut self) {
+        let shared = self.shared.clone();
+        // Held until the responder is in place, so that no change to the counters is missed.
+        let mut state = shared.lock();
+        if state.advertising.is_some() {
+            return;
+        }
+        let advert = Instance { txt: state.txt(), ..self.advert.clone() };
+        let name = advert.full_name();
+        match Responder::start(advert, self.mdns) {
+            Ok(responder) => {
+                state.advertising = Some(responder);
+                drop(state);
+                eprintln!(
+                    "NMOS: with no registry, the Node advertises itself peer to peer by multicast DNS, as {name}"
+                );
+            }
+            Err(e) => {
+                drop(state);
+                self.say(format!("NMOS: cannot advertise the Node by multicast DNS: {e}"));
+            }
+        }
+    }
+
+    /// Stops advertising the Node peer to peer, saying goodbye.
+    fn unadvertise(&self) {
+        let responder = self.shared.lock().advertising.take();
+        if let Some(responder) = responder {
+            responder.stop();
         }
     }
 
@@ -746,11 +881,22 @@ impl Registrar {
 /// Whether a Node API answers at `api`: for tests.
 #[cfg(test)]
 fn get(api: &str) -> std::io::Result<String> {
+    send("GET", api, None)
+}
+
+/// A request to a Node's APIs, and the whole response: for tests.
+#[cfg(test)]
+fn send(method: &str, url: &str, body: Option<&Value>) -> std::io::Result<String> {
     use std::io::{Read, Write};
-    let rest = api.strip_prefix("http://").unwrap_or(api);
+    let rest = url.strip_prefix("http://").unwrap_or(url);
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let mut stream = TcpStream::connect(host)?;
-    write!(stream, "GET /{path} HTTP/1.1\r\nHost: {host}\r\n\r\n")?;
+    let body = body.map(Value::to_string).unwrap_or_default();
+    write!(stream, "{method} /{path} HTTP/1.1\r\nHost: {host}\r\n")?;
+    if !body.is_empty() {
+        write!(stream, "Content-Type: application/json\r\nContent-Length: {}\r\n", body.len())?;
+    }
+    write!(stream, "\r\n{body}")?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
@@ -793,7 +939,8 @@ mod tests {
             }
         }
         // A registry no one answers at, so that nothing is registered.
-        let args = NodeArgs { nmos: Some("http://127.0.0.1:9".into()), ..NodeArgs::default() };
+        let mut args = NodeArgs { nmos: Some("http://127.0.0.1:9".into()), ..NodeArgs::default() };
+        args.auth.look.mdns = Some(test_group());
         let mut node = Node::start(
             &args,
             &Offer::Sender(&description),
@@ -833,6 +980,163 @@ mod tests {
         let heard = std::iter::from_fn(|| ncp.next_change().ok().flatten()).find(|n| n.property == delay).unwrap();
         assert_eq!((heard.oid, heard.value), (4, json!(0)));
         ncp.close();
+        assert_eq!(node.finish(), None, "never registered");
+    }
+
+    const SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.10.21\r\ns=CAM 1\r\nt=0 0\r\n\
+        m=audio 5004 RTP/AVP 97\r\nc=IN IP4 239.1.1.1/32\r\na=source-filter: incl IN IP4 239.1.1.1 192.168.10.21\r\n\
+        a=rtpmap:97 L24/48000/2\r\na=ptime:1\r\na=ts-refclk:localmac=02-00-00-00-00-01\r\na=mediaclk:direct=0\r\n";
+
+    /// Serves `SDP` at every path, as a Sender's `manifest_href`; gives the port.
+    fn serve_sdp() -> u16 {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    SDP.len()
+                );
+                let _ = stream.write_all(format!("{head}{SDP}").as_bytes());
+            }
+        });
+        port
+    }
+
+    /// Whether multicast sent over loopback comes back to this machine; some sandboxes
+    /// do not deliver it.
+    fn multicast_loops(group: SocketAddrV4) -> bool {
+        let heard = || -> std::io::Result<bool> {
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, group.port()))?;
+            socket.join_multicast_v4(group.ip(), &Ipv4Addr::LOCALHOST)?;
+            socket.set_multicast_loop_v4(true)?;
+            socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+            // Sent from a loopback address, it goes out on loopback.
+            let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+            sender.set_multicast_loop_v4(true)?;
+            sender.send_to(b"loop", group)?;
+            let mut buffer = [0u8; 16];
+            Ok(socket.recv_from(&mut buffer).is_ok_and(|(n, _)| &buffer[..n] == b"loop"))
+        };
+        heard().unwrap_or(false)
+    }
+
+    /// A Receiver's Node, as `st2110 receive --nmos` starts one on loopback, and what
+    /// it is told to receive.
+    fn receiver_node(args: &NodeArgs) -> (Node, Arc<Tuning>) {
+        let addresses = [Ipv4Addr::LOCALHOST; 2];
+        let constraints = addresses
+            .iter()
+            .map(|a| {
+                json!({"source_ip": {}, "multicast_ip": {}, "interface_ip": {"enum": ["auto", a.to_string()]},
+                       "destination_port": {"minimum": 1, "maximum": 65535}, "rtp_enabled": {}})
+            })
+            .collect();
+        let named: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        let tuning = Arc::new(Tuning::default());
+        let node = Node::start(
+            args,
+            &Offer::Receiver { video: false, legs: 2 },
+            &addresses,
+            Endpoint::idle_receiver(&named, constraints),
+            Box::new(Receiving::new(tuning.clone(), true)),
+            37,
+        )
+        .unwrap();
+        (node, tuning)
+    }
+
+    /// A multicast DNS group of the test's own, on a free port, for the Node to
+    /// advertise itself at rather than the network's.
+    fn test_group() -> SocketAddrV4 {
+        let port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), port)
+    }
+
+    #[test]
+    fn a_target_connects_the_receiver_as_is05_would() {
+        let mut args = NodeArgs { nmos: Some("http://127.0.0.1:9".into()), ..NodeArgs::default() };
+        args.auth.look.mdns = Some(test_group());
+        let (mut node, tuning) = receiver_node(&args);
+        let receivers = get(&format!("{}receivers/", node.api)).unwrap();
+        let id = receivers.split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let target = format!("{}receivers/{id}/target", node.api);
+        let sender = json!({"id": "5e0d0001-0000-4000-8000-000000000001", "label": "CAM 1",
+                            "manifest_href": format!("http://127.0.0.1:{}/sdp", serve_sdp())});
+        let response = send("POST", &target, Some(&sender)).unwrap();
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        assert!(response.contains("\"label\":\"CAM 1\""), "the Sender comes back: {response}");
+        let tuned = tuning.take().expect("a stream to receive");
+        assert_eq!(tuned.sender_id.as_deref(), Some("5e0d0001-0000-4000-8000-000000000001"));
+        assert_eq!(tuned.description.legs.len(), 1, "the second leg is off");
+        assert_eq!(tuned.description.legs[0].destination.to_string(), "239.1.1.1:5004");
+        let resource = get(&format!("{}receivers/{id}", node.api)).unwrap();
+        assert!(resource.contains("\"subscription\":{\"active\":true,\"sender_id\":\"5e0d0001"), "{resource}");
+        let active = node.api.replace("node/v1.3", "connection/v1.2") + &format!("single/receivers/{id}/active");
+        let active = get(&active).unwrap();
+        assert!(active.contains("\"master_enable\":true") && active.contains("239.1.1.1"), "{active}");
+
+        // `{}` takes none.
+        let response = send("POST", &target, Some(&json!({}))).unwrap();
+        assert!(response.starts_with("HTTP/1.1 202") && response.ends_with("{}"), "{response}");
+        assert!(tuning.take().is_none());
+        let resource = get(&format!("{}receivers/{id}", node.api)).unwrap();
+        assert!(resource.contains("\"subscription\":{\"active\":false,\"sender_id\":null"), "{resource}");
+
+        // Asked wrongly.
+        let status = |response: std::io::Result<String>| response.unwrap()[9..12].to_string();
+        assert_eq!(status(get(&target)), "405");
+        assert_eq!(status(send("POST", &target.replace(&id, "nobody"), Some(&sender))), "404");
+        assert_eq!(status(send("POST", &target, Some(&json!({"id": "x"})))), "400");
+        let nowhere = json!({"id": "x", "manifest_href": "http://127.0.0.1:9/sdp"});
+        assert_eq!(status(send("POST", &target, Some(&nowhere))), "500");
+        assert_eq!(node.finish(), None, "never registered");
+    }
+
+    #[test]
+    fn advertises_itself_by_multicast_dns_when_there_is_no_registry() {
+        use st2110_discover::find::{Look, find};
+        use st2110_discover::nmos::ApiKind;
+        let group = test_group();
+        if !multicast_loops(group) {
+            eprintln!("skipped: multicast sent over loopback does not come back on this machine");
+            return;
+        }
+        // No registry to be found: a DNS server that is not there, and nothing
+        // advertised in the test's group.
+        let mut args =
+            NodeArgs { nmos: Some(String::new()), label: Some("Test monitor".into()), ..NodeArgs::default() };
+        args.auth.look.mdns = Some(group);
+        args.auth.look.dns_server = vec!["127.0.0.1:9".parse().unwrap()];
+        args.auth.look.domain = vec!["nowhere.test".into()];
+        let (mut node, _tuning) = receiver_node(&args);
+        let look = Look { dns: false, mdns: Some(group), listen: Duration::from_secs(15), ..Look::default() };
+        let found = |ver_rcv: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let seen = find(ApiKind::Node, &look);
+                if let [api] = &seen.apis[..]
+                    && api.counters.get("ver_rcv").is_some_and(|v| v == ver_rcv)
+                {
+                    return api.clone();
+                }
+                assert!(Instant::now() < deadline, "not found with ver_rcv {ver_rcv}: {seen:?}");
+            }
+        };
+        let api = found("0");
+        assert_eq!(format!("{}/x-nmos/node/v1.3/", api.url), node.api);
+        assert_eq!((api.name.as_str(), api.versions.clone(), api.auth), ("Test monitor", vec!["v1.3".into()], false));
+        assert_eq!(api.counters.len(), 6, "{:?}", api.counters);
+
+        // A change to the Receiver goes up its counter, and is announced.
+        let receivers = get(&format!("{}receivers/", node.api)).unwrap();
+        let id = receivers.split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let response = send("POST", &format!("{}receivers/{id}/target", node.api), Some(&json!({}))).unwrap();
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        assert_eq!(found("1").counters["ver_slf"], "0");
         assert_eq!(node.finish(), None, "never registered");
     }
 }

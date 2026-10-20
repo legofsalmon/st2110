@@ -16,6 +16,8 @@ pub const TXT: u16 = 16;
 pub const AAAA: u16 = 28;
 /// A service's host and port (RFC 2782).
 pub const SRV: u16 = 33;
+/// Every type of record a name has, in a question.
+pub const ANY: u16 = 255;
 /// The EDNS(0) pseudo-record (RFC 6891), which offers room for a larger response.
 pub const OPT: u16 = 41;
 

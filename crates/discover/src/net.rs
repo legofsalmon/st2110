@@ -50,7 +50,7 @@ pub fn interfaces() -> Vec<Interface> {
 
 /// A UDP socket that shares its port with others on the machine, as the system's own
 /// multicast DNS responder and other listeners do.
-fn shared(port: u16) -> io::Result<Socket> {
+pub(crate) fn shared(port: u16) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     #[cfg(all(
@@ -64,7 +64,7 @@ fn shared(port: u16) -> io::Result<Socket> {
 
 /// Joins `group` on each of `interfaces`, or on the one the system picks when there are
 /// none. Fails only when it joins nowhere.
-fn join(socket: &Socket, group: Ipv4Addr, interfaces: &[Ipv4Addr]) -> io::Result<()> {
+pub(crate) fn join(socket: &Socket, group: Ipv4Addr, interfaces: &[Ipv4Addr]) -> io::Result<()> {
     if interfaces.is_empty() {
         return socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED);
     }

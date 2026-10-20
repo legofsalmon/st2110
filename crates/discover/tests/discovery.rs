@@ -478,3 +478,74 @@ fn finds_a_system_api() {
     assert_eq!((api.kind, api.url.as_str(), api.priority), (ApiKind::System, "http://127.0.0.1:4100", Some(20)));
     assert_eq!(api.versions, ["v1.0"]);
 }
+
+/// Whether multicast sent over loopback comes back to this machine, as Linux and macOS
+/// deliver it; some sandboxes do not.
+fn multicast_loops(group: SocketAddrV4) -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let heard = || -> std::io::Result<bool> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into())?;
+        socket.join_multicast_v4(group.ip(), &Ipv4Addr::LOCALHOST)?;
+        socket.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+        socket.set_multicast_loop_v4(true)?;
+        socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let socket: UdpSocket = socket.into();
+        socket.send_to(b"loop", group)?;
+        let mut buffer = [0u8; 16];
+        Ok(socket.recv_from(&mut buffer).is_ok_and(|(n, _)| &buffer[..n] == b"loop"))
+    };
+    heard().unwrap_or(false)
+}
+
+/// The multicast DNS responder, on loopback: a Node it advertises is found by browsing,
+/// with its text pairs; a second responder that wants the same name takes another; a
+/// changed counter is heard; and a goodbye takes the first out of the list.
+#[test]
+fn advertises_a_node_that_browsing_finds() {
+    use st2110_discover::find::{Look, find};
+    use st2110_discover::responder::{Instance, Responder};
+    let mdns = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), free_udp_port());
+    if !multicast_loops(mdns) {
+        eprintln!("skipped: multicast sent over loopback does not come back on this machine");
+        return;
+    }
+    let node = serve(camera_node);
+    let txt = |ver_snd: &str| {
+        vec![("api_proto".into(), "http".into()), ("api_ver".into(), "v1.3".into()), ("ver_snd".into(), ver_snd.into())]
+    };
+    let instance = Instance {
+        service: "_nmos-node._tcp".into(),
+        name: "Camera 1".into(),
+        host: "camera-1".into(),
+        port: node,
+        address: Ipv4Addr::LOCALHOST,
+        txt: txt("0"),
+    };
+    let first = Responder::start(instance.clone(), mdns).unwrap();
+    let look = Look { dns: false, mdns: Some(mdns), listen: Duration::from_secs(5), ..Look::default() };
+    let seen = find(ApiKind::Node, &look);
+    let [api] = &seen.apis[..] else { panic!("{seen:?}") };
+    assert_eq!((api.name.as_str(), api.url.clone()), ("Camera 1", format!("http://127.0.0.1:{node}")));
+    assert_eq!(api.counters["ver_snd"], "0");
+
+    // Another responder wants the name, and takes the next one.
+    let second = Responder::start(Instance { port: node + 1, ..instance }, mdns).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while second.name() == "Camera 1" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!((first.name().as_str(), second.name().as_str()), ("Camera 1", "Camera 1 (2)"));
+
+    // A changed counter is announced, and heard by a browser.
+    first.set_txt(txt("1"));
+    let (discovery, changed) = start(Options { nmos: true, mdns: Some(mdns), ..nowhere() });
+    let counted =
+        |l: &List| l.apis.iter().any(|a| a.name == "Camera 1" && a.counters.get("ver_snd").is_some_and(|v| v == "1"));
+    let list = wait_for(&discovery, &changed, |l| counted(l) && l.apis.iter().any(|a| a.name == "Camera 1 (2)"));
+    assert_eq!(list.apis.iter().filter(|a| a.kind == ApiKind::Node).count(), 2, "{list:#?}");
+    // Its goodbye takes it out of the list.
+    first.stop();
+    wait_for(&discovery, &changed, |l| !l.apis.iter().any(|a| a.name == "Camera 1"));
+}

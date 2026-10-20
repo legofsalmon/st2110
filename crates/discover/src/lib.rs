@@ -23,6 +23,10 @@
 //! A stream that SAP and NMOS both describe, going to the same destinations, is listed
 //! once, with both.
 //!
+//! The other way round, [`responder`] advertises a service by multicast DNS, as a Node
+//! that finds no registry advertises its Node API for controllers to find it peer to
+//! peer.
+//!
 //! ```no_run
 //! use std::time::Duration;
 //! use st2110_discover::{Discovery, Options};
@@ -43,6 +47,7 @@ pub mod find;
 pub mod net;
 pub mod nmos;
 pub mod resolv;
+pub mod responder;
 pub mod sap;
 
 use std::collections::{BTreeMap, HashMap};
