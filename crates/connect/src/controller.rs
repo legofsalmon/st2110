@@ -43,7 +43,7 @@ use st2110_ptp::{PtpTime, TAI_UTC_2017};
 use st2110_sdp::Rational;
 
 use crate::client::{ConnectionClient, Reply, bulk, single};
-use crate::{Activation, Constraints, Plan, tai};
+use crate::{Activation, Constraints, Destination, Plan, SenderChange, SenderPlan, tai};
 
 /// Receivers to read at once while connections are prepared.
 const AT_ONCE: usize = 16;
@@ -229,6 +229,8 @@ struct Job {
     /// What the Receiver's `/active` endpoint showed before, to put back when the salvo fails.
     previous: Value,
     plan: Option<Plan>,
+    /// A unicast Sender to point at the Receiver before it connects.
+    unicast: Option<Unicast>,
     /// Whether it cannot be sent at all, whatever [`Settings::force`] says.
     blocked: bool,
 }
@@ -307,8 +309,16 @@ pub fn connect(
             api: String::new(),
             previous: Value::Null,
             plan: None,
+            unicast: None,
             blocked: false,
         });
+    }
+    // A unicast Sender sends to one Receiver at a time.
+    for (i, job) in jobs.iter().enumerate() {
+        let Some(sender) = job.report.sender.as_ref().filter(|s| is_unicast(s)) else { continue };
+        if jobs[..i].iter().any(|other| other.report.sender.as_ref().is_some_and(|s| s.id == sender.id)) {
+            return Err(format!("{} sends unicast, to one Receiver at a time, but is named twice", sender.describe()));
+        }
     }
 
     let prepared = each(&jobs, AT_ONCE, |job| prepare(snapshot, client, job));
@@ -321,6 +331,17 @@ pub fn connect(
                 job.report.problems.extend(prepared.unfit);
                 job.report.notes.clone_from(&prepared.plan.notes);
                 job.report.problems.extend(prepared.plan.problems.iter().cloned());
+                if let Some(unicast) = &prepared.unicast {
+                    let sender = job.report.sender.as_ref().map(Endpoint::describe).unwrap_or_default();
+                    let to: Vec<String> = destinations_of(&unicast.plan).iter().map(ToString::to_string).collect();
+                    job.report.notes.push(format!(
+                        "{sender} sends unicast, so it is first pointed at this Receiver, at {}",
+                        to.join(" and ")
+                    ));
+                    job.report.notes.extend(unicast.plan.notes.iter().cloned());
+                    job.report.problems.extend(unicast.plan.problems.iter().cloned());
+                }
+                job.unicast = prepared.unicast;
                 job.plan = Some(prepared.plan);
             }
             Err(problem) => {
@@ -364,6 +385,23 @@ pub fn connect(
         });
     }
 
+    // Unicast Senders are pointed at their Receivers first; the Receivers then take
+    // what their SDP files say now.
+    let pointed = point_senders(client, &mut jobs, settings);
+    if !pointed {
+        for job in &mut jobs {
+            if let Some(plan) = job.plan.take() {
+                job.report.request.get_or_insert(plan.request);
+            }
+            if job.report.state != State::Failed {
+                job.report.state = State::Held;
+            }
+        }
+        return Ok(Outcome {
+            activation: pick(&jobs).to_json(),
+            connections: jobs.into_iter().map(|j| j.report).collect(),
+        });
+    }
     // The time is picked now, when everything is ready to send.
     let activation = pick(&jobs);
     for job in &mut jobs {
@@ -406,6 +444,8 @@ pub fn connect(
         let undone = each(&work, usize::MAX, |(job, sent)| roll_back(client, job, sent, activation.is_scheduled()));
         for ((job, sent), (state, warnings)) in jobs.iter_mut().zip(&sent).zip(undone) {
             job.report.warnings.extend(warnings);
+            let sender_left = put_back_sender(client, job);
+            job.report.warnings.extend(sender_left);
             job.report.state = match sent {
                 Sent::Accepted { .. } => state,
                 Sent::Rejected(problem) | Sent::Uncertain(problem) => {
@@ -451,6 +491,41 @@ pub fn connect(
     Ok(Outcome { activation: activation.to_json(), connections: jobs.into_iter().map(|j| j.report).collect() })
 }
 
+/// Adds the rest of each Receiver's BCP-002-01 natural group to `routes`, so that a
+/// group, such as a monitor's video and audio, takes a Sender's group, such as a
+/// camera's, as one: each other Receiver of the group takes the Sender of the other
+/// group that [`st2110_nmos::groups::companions`] pairs it with, or is disconnected
+/// with it. A Receiver `routes` already names keeps what it was given there.
+///
+/// Also returns, for each Receiver of a group left as it is, why. Fails when a name
+/// finds no Sender or Receiver, or more than one.
+pub fn with_groups(snapshot: &Snapshot, routes: &[Route]) -> Result<(Vec<Route>, Vec<String>), String> {
+    let mut named: Vec<String> = Vec::with_capacity(routes.len());
+    for route in routes {
+        named.push(routing::find(snapshot, Kind::Receiver, &route.receiver)?.id);
+    }
+    let mut all = routes.to_vec();
+    let mut left = Vec::new();
+    for (route, receiver) in routes.iter().zip(named.clone()) {
+        let sender = match &route.take {
+            Take::Sender(name) => Some(routing::find(snapshot, Kind::Sender, name)?.id),
+            Take::Nothing => None,
+            Take::Sdp { .. } => continue,
+        };
+        let companions = st2110_nmos::groups::companions(snapshot, &receiver, sender.as_deref());
+        left.extend(companions.left);
+        for (other, take) in companions.routes {
+            if named.iter().any(|id| id.eq_ignore_ascii_case(&other.id)) {
+                continue;
+            }
+            named.push(other.id.clone());
+            let take = take.map_or(Take::Nothing, |s| Take::Sender(s.id));
+            all.push(Route { receiver: other.id, take });
+        }
+    }
+    Ok((all, left))
+}
+
 /// A Receiver's scheduled activation, cancelled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Cancelled {
@@ -491,6 +566,306 @@ pub fn cancel(snapshot: &Snapshot, receiver: &str, client: &ConnectionClient) ->
     })
 }
 
+/// A change to a Sender, and what became of it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SenderControl {
+    /// The Sender.
+    pub sender: Endpoint,
+    /// What became of the change.
+    pub state: State,
+    /// The request for the Sender's `/staged` endpoint, when one was planned.
+    pub request: Option<Value>,
+    /// When it took effect or is to, in PTP time, as `<seconds>:<nanoseconds>`.
+    pub activation_time: Option<String>,
+    /// What an operator should know, such as an ST 2022-7 leg turned off.
+    pub notes: Vec<String>,
+    /// Why it was refused, failed or differs, and the problems it was sent with when
+    /// forced.
+    pub problems: Vec<String>,
+    /// What went wrong without changing the outcome, such as a registry that has not
+    /// caught up.
+    pub warnings: Vec<String>,
+}
+
+/// Turns a Sender on or off, or changes where it sends, through its Connection API, and
+/// checks that the change took, on the Sender's `/active` endpoint and, when `registry`
+/// is given, on its IS-04 `subscription` and `version`.
+///
+/// The change is planned against the Sender's `/constraints` (see
+/// [`SenderPlan::configure`]) and its transport: an `rtp.mcast` Sender sends to
+/// multicast groups and an `rtp.ucast` one to unicast addresses. It takes effect at once
+/// unless [`Settings::activation`] says otherwise. [`Settings::force`] and
+/// [`Settings::dry_run`] work as they do for [`connect`].
+///
+/// Fails, sending nothing, when the name finds no Sender or more than one.
+pub fn control(
+    snapshot: &Snapshot,
+    sender: &str,
+    change: &SenderChange,
+    client: &ConnectionClient,
+    registry: Option<&QueryClient>,
+    settings: &Settings,
+) -> Result<SenderControl, String> {
+    let sender = routing::find(snapshot, Kind::Sender, sender)?;
+    let mut report = SenderControl {
+        sender,
+        state: State::Planned,
+        request: None,
+        activation_time: None,
+        notes: Vec::new(),
+        problems: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let activation = settings.activation.unwrap_or(Activation::Immediate);
+    let prepared = (|| -> Result<(String, SenderPlan), String> {
+        let api = connection_api(&report.sender)?;
+        let constraints = read_json(client, &single(&api, Kind::Sender, &report.sender.id, "constraints"))?;
+        let constraints = Constraints::from_json(&constraints).map_err(|e| format!("its /constraints are {e}"))?;
+        Ok((api, SenderPlan::configure(change, &constraints, activation)?))
+    })();
+    let (api, plan) = match prepared {
+        Ok(prepared) => prepared,
+        Err(problem) => {
+            report.problems.push(problem);
+            report.state = State::Refused;
+            return Ok(report);
+        }
+    };
+    report.request = Some(plan.request.clone());
+    report.notes.clone_from(&plan.notes);
+    report.problems.extend(plan.problems.iter().cloned());
+    report.problems.extend(transport_problems(&report.sender, &change.destinations));
+    if !report.problems.is_empty() && !settings.force {
+        report.state = State::Refused;
+        return Ok(report);
+    }
+    if settings.dry_run {
+        return Ok(report);
+    }
+    let staged = single(&api, Kind::Sender, &report.sender.id, "staged");
+    let sent_at = now(settings.tai_utc);
+    let reply = match client.patch(&staged, &plan.request) {
+        Ok(reply) => judge(reply, true, now(settings.tai_utc)),
+        Err(e) => Sent::Uncertain(format!("no answer: {e}")),
+    };
+    if let Sent::Rejected(problem) | Sent::Uncertain(problem) = reply {
+        report.problems.push(problem);
+        report.state = State::Failed;
+        return Ok(report);
+    }
+    let due = match activation {
+        Activation::Immediate => now(settings.tai_utc),
+        Activation::At(time) => time,
+        Activation::After(nanos) => sent_at.add_nanos(i128::from(nanos)).unwrap_or(sent_at),
+    };
+    let checked = check_sender(client, &api, &report.sender, &plan, due, settings);
+    report.state = checked.state;
+    report.activation_time = checked.activation_time;
+    report.problems.extend(checked.problems);
+    if report.state == State::Done
+        && let Some(registry) = registry
+        && let Some(lag) =
+            registry_lag(registry, &report.sender, change.receiver_id.as_deref(), change.enable, settings.wait)
+    {
+        report.warnings.push(lag);
+    }
+    Ok(report)
+}
+
+/// Why a Sender's transport does not take these destinations: an `rtp.mcast` Sender
+/// sends to multicast groups and an `rtp.ucast` one to unicast addresses (NMOS
+/// Parameter Registers: Transports).
+fn transport_problems(sender: &Endpoint, destinations: &[Destination]) -> Vec<String> {
+    let multicast = match sender.transport.as_deref() {
+        Some("urn:x-nmos:transport:rtp.mcast") => true,
+        Some("urn:x-nmos:transport:rtp.ucast") => false,
+        _ => return Vec::new(),
+    };
+    destinations
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.ip.is_multicast() != multicast)
+        .map(|(i, d)| {
+            let (kind, wants) =
+                if multicast { ("rtp.mcast", "multicast group") } else { ("rtp.ucast", "unicast address") };
+            format!("leg {}: {} is not a {wants}, which an {kind} Sender sends to", i + 1, d.ip)
+        })
+        .collect()
+}
+
+/// Waits for a change to a Sender to come due, then checks it on the Sender's `/active`
+/// endpoint.
+fn check_sender(
+    client: &ConnectionClient,
+    api: &str,
+    sender: &Endpoint,
+    plan: &SenderPlan,
+    due: PtpTime,
+    settings: &Settings,
+) -> Settled {
+    let ahead = due.nanos() - now(settings.tai_utc).nanos();
+    if ahead > settings.wait.as_nanos() as i128 {
+        return Settled {
+            state: State::Scheduled,
+            activation_time: Some(tai(due)),
+            problems: Vec::new(),
+            warnings: Vec::new(),
+        };
+    }
+    if ahead > 0 {
+        thread::sleep(Duration::from_nanos(u64::try_from(ahead).unwrap_or(u64::MAX)));
+    }
+    let url = single(api, Kind::Sender, &sender.id, "active");
+    let deadline = Instant::now().checked_add(settings.wait);
+    let (active, problems) = loop {
+        let (active, problems) = match read_json(client, &url) {
+            Ok(active) => {
+                let problems = plan.verify(&active);
+                (Some(active), problems)
+            }
+            Err(e) => (None, vec![format!("its /active endpoint could not be read: {e}")]),
+        };
+        if problems.is_empty() || passed(deadline) {
+            break (active, problems);
+        }
+        thread::sleep(POLL);
+    };
+    let shown = if problems.is_empty() { active.as_ref().and_then(activation_time) } else { None };
+    Settled {
+        state: if problems.is_empty() { State::Done } else { State::Differs },
+        activation_time: Some(tai(shown.unwrap_or(due))),
+        problems: problems.into_iter().map(|p| format!("its /active endpoint shows {p}")).collect(),
+        warnings: Vec::new(),
+    }
+}
+
+/// A unicast Sender's part in a connection: it is pointed at the Receiver first.
+struct Unicast {
+    /// The Sender's Connection API: its versioned base, ending in `/`.
+    api: String,
+    /// What the Sender's `/active` endpoint showed before, to put back should it fail.
+    previous: Value,
+    plan: SenderPlan,
+}
+
+/// Plans pointing a unicast Sender at a Receiver: at the address of each of the
+/// Receiver's interfaces, one per leg, as its `/active` endpoint shows them or else
+/// its constraints allow, naming the Receiver as its `receiver_id` (IS-05 v1.2
+/// Controllers: Connection Management).
+fn unicast(
+    client: &ConnectionClient,
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    receiver_active: &Value,
+    receiver_constraints: &Constraints,
+) -> Result<Unicast, String> {
+    let api = connection_api(sender)?;
+    let previous = read_json(client, &single(&api, Kind::Sender, &sender.id, "active"))?;
+    let constraints = read_json(client, &single(&api, Kind::Sender, &sender.id, "constraints"))?;
+    let constraints = Constraints::from_json(&constraints).map_err(|e| format!("its Sender's /constraints are {e}"))?;
+    let params = receiver_active.get("transport_params").and_then(Value::as_array);
+    let legs = constraints.legs.len().min(receiver_constraints.legs.len());
+    let mut destinations = Vec::new();
+    for i in 0..legs {
+        let active = params.and_then(|p| p.get(i));
+        let address = |value: Option<&Value>| value?.as_str()?.parse::<std::net::IpAddr>().ok();
+        let allowed = receiver_constraints.legs[i]
+            .get("interface_ip")
+            .and_then(|c| c.values.as_ref())
+            .and_then(|values| values.iter().find_map(|v| address(Some(v))));
+        let Some(ip) = address(active.and_then(|a| a.get("interface_ip"))).or(allowed) else { break };
+        let port =
+            active.and_then(|a| a.get("destination_port")).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+        destinations.push(Destination { ip, port });
+    }
+    if destinations.is_empty() {
+        return Err(format!(
+            "{} sends unicast, but the Receiver's address is not known: its /active and /constraints give no \
+             interface_ip",
+            sender.describe()
+        ));
+    }
+    let change = SenderChange { enable: true, destinations, receiver_id: Some(receiver.id.clone()) };
+    let plan = SenderPlan::configure(&change, &constraints, Activation::Immediate)?;
+    Ok(Unicast { api, previous, plan })
+}
+
+/// Points each unicast Sender in a salvo at its Receiver, at once, and checks each on
+/// its `/active` endpoint. Returns, for each job, why it failed; when one fails, the
+/// Senders already pointed are put back.
+fn point_senders(client: &ConnectionClient, jobs: &mut [Job], settings: &Settings) -> bool {
+    let work: Vec<usize> = (0..jobs.len()).filter(|&i| jobs[i].unicast.is_some()).collect();
+    if work.is_empty() {
+        return true;
+    }
+    let results = each(&work, usize::MAX, |&i| {
+        let job = &jobs[i];
+        let unicast = job.unicast.as_ref().expect("picked for its unicast Sender");
+        let sender = job.report.sender.as_ref().expect("a unicast route names its Sender");
+        let staged = single(&unicast.api, Kind::Sender, &sender.id, "staged");
+        match client.patch(&staged, &unicast.plan.request) {
+            Ok(reply) if reply.is_success() => {}
+            Ok(reply) => return Err(format!("pointing {} at it was refused: {}", sender.describe(), reply.error())),
+            Err(e) => return Err(format!("pointing {} at it got no answer: {e}", sender.describe())),
+        }
+        let checked = check_sender(client, &unicast.api, sender, &unicast.plan, now(settings.tai_utc), settings);
+        if checked.state != State::Done {
+            return Err(format!("{} was pointed at it, but {}", sender.describe(), checked.problems.join("; ")));
+        }
+        // The Sender's SDP file now names the Receiver: plan with that.
+        let (sdp, from) = sender_sdp(client, sender)?;
+        let constraints = read_json(client, &single(&job.api, Kind::Receiver, &job.report.receiver.id, "constraints"))?;
+        let constraints = Constraints::from_json(&constraints).map_err(|e| format!("its /constraints are {e}"))?;
+        let plan = Plan::connect(&sdp, Some(&sender.id), &constraints, Activation::Immediate)
+            .map_err(|e| format!("{from}: {e}"))?;
+        Ok((plan, from))
+    });
+    let ok = results.iter().all(Result::is_ok);
+    for (&i, result) in work.iter().zip(results) {
+        let job = &mut jobs[i];
+        match result {
+            Ok((plan, from)) if ok => {
+                let activation = job.plan.as_ref().map(|p| p.request["activation"].clone()).unwrap_or(Value::Null);
+                let mut plan = plan;
+                plan.request["activation"] = activation;
+                job.report.request = Some(plan.request.clone());
+                job.report.sdp = Some(from);
+                job.plan = Some(plan);
+            }
+            Ok(_) => {}
+            Err(problem) => {
+                job.report.problems.push(problem);
+                job.report.state = State::Failed;
+            }
+        }
+    }
+    if !ok {
+        for &i in &work {
+            let warnings = put_back_sender(client, &jobs[i]);
+            jobs[i].report.warnings.extend(warnings);
+        }
+    }
+    ok
+}
+
+/// Puts a unicast Sender back as it was before the connection pointed it, when the
+/// connection failed.
+fn put_back_sender(client: &ConnectionClient, job: &Job) -> Vec<String> {
+    let (Some(unicast), Some(sender)) = (&job.unicast, &job.report.sender) else {
+        return Vec::new();
+    };
+    let staged = single(&unicast.api, Kind::Sender, &sender.id, "staged");
+    let problem = match SenderPlan::restore(&unicast.previous, Activation::Immediate) {
+        Ok(restore) => match client.patch(&staged, &restore.request) {
+            Ok(reply) if reply.is_success() => return Vec::new(),
+            Ok(reply) => reply.error(),
+            Err(e) => format!("no answer: {e}"),
+        },
+        Err(e) => e,
+    };
+    vec![format!("{} may still send to this Receiver: putting it back failed: {problem}", sender.describe())]
+}
+
 /// The versioned base of the Connection API that controls a Sender or Receiver.
 fn connection_api(endpoint: &Endpoint) -> Result<String, String> {
     endpoint.connection_api.as_ref().map(|api| api.href.clone()).ok_or_else(|| {
@@ -503,6 +878,7 @@ struct Prepared {
     api: String,
     previous: Value,
     plan: Plan,
+    unicast: Option<Unicast>,
     sdp: Option<String>,
     /// Why the Receiver cannot take the stream, as the registry lists them.
     unfit: Option<String>,
@@ -516,7 +892,7 @@ fn prepare(snapshot: &Snapshot, client: &ConnectionClient, job: &Job) -> Result<
     let (sdp, from) = match &job.take {
         Take::Nothing => {
             let plan = Plan::disconnect(Activation::Immediate);
-            return Ok(Prepared { api, previous, plan, sdp: None, unfit: None });
+            return Ok(Prepared { api, previous, plan, unicast: None, sdp: None, unfit: None });
         }
         Take::Sender(_) => {
             let sender = job.report.sender.as_ref().expect("a Sender route found its Sender");
@@ -527,14 +903,23 @@ fn prepare(snapshot: &Snapshot, client: &ConnectionClient, job: &Job) -> Result<
     let constraints = read_json(client, &single(&api, Kind::Receiver, &receiver.id, "constraints"))?;
     let constraints = Constraints::from_json(&constraints).map_err(|e| format!("its /constraints are {e}"))?;
     let sender_id = job.report.sender.as_ref().map(|s| s.id.as_str());
-    let plan =
-        Plan::connect(&sdp, sender_id, &constraints, Activation::Immediate).map_err(|e| format!("{from}: {e}"))?;
     let unfit = match sender_id {
         Some(id) => routing::route(snapshot, id, &receiver.id, Some(&sdp)),
         None => routing::route_sdp(snapshot, &sdp, &receiver.id),
     }
     .err();
-    Ok(Prepared { api, previous, plan, sdp: Some(from), unfit })
+    // A unicast Sender is planned as it will be once pointed at the Receiver.
+    let unicast = match job.report.sender.as_ref().filter(|s| is_unicast(s)) {
+        Some(sender) => Some(unicast(client, sender, receiver, &previous, &constraints)?),
+        None => None,
+    };
+    let sdp = match &unicast {
+        Some(unicast) => retarget(&sdp, &destinations_of(&unicast.plan)),
+        None => sdp,
+    };
+    let plan =
+        Plan::connect(&sdp, sender_id, &constraints, Activation::Immediate).map_err(|e| format!("{from}: {e}"))?;
+    Ok(Prepared { api, previous, plan, unicast, sdp: Some(from), unfit })
 }
 
 /// A Sender's SDP file, and where it came from: its `manifest_href`, or else its
@@ -819,39 +1204,57 @@ fn settle(
     };
     if settled.state == State::Done
         && let Some(registry) = registry
-        && let Some(lag) = registry_lag(registry, job, plan, settings.wait)
+        && let Some(lag) = registry_lag(
+            registry,
+            &job.report.receiver,
+            plan.expect.sender_id.as_deref(),
+            plan.expect.master_enable,
+            settings.wait,
+        )
     {
         settled.warnings.push(lag);
     }
     settled
 }
 
-/// Why the registry does not show a connection that took effect, having waited up to
+/// Why the registry does not show a change that took effect, having waited up to
 /// `wait` for it to: IS-05 v1.2 (Interoperability: IS-04) has the Node update the
-/// Receiver's `subscription`, and advance its `version`, on every activation.
-fn registry_lag(registry: &QueryClient, job: &Job, plan: &Plan, wait: Duration) -> Option<String> {
-    let receiver = &job.report.receiver;
-    let want = plan.expect.sender_id.as_deref();
+/// Sender's or Receiver's `subscription`, and advance its `version`, on every
+/// activation. `want` is the peer the subscription should name, and `enabled` whether
+/// it should be active.
+fn registry_lag(
+    registry: &QueryClient,
+    endpoint: &Endpoint,
+    want: Option<&str>,
+    enabled: bool,
+    wait: Duration,
+) -> Option<String> {
+    let (peer, other) = match endpoint.kind {
+        Kind::Sender => ("receiver_id", "receiver"),
+        _ => ("sender_id", "sender"),
+    };
+    // A subscription names its peer only while active (IS-04 v1.3 Behaviour: Nodes).
+    let want = want.filter(|_| enabled);
     let deadline = Instant::now().checked_add(wait);
     loop {
-        let why = match registry.resource(Kind::Receiver, &receiver.id) {
+        let why = match registry.resource(endpoint.kind, &endpoint.id) {
             Ok(Some(resource)) => {
                 let subscription = resource.get("subscription");
                 let field = |name: &str| subscription.and_then(|s| s.get(name));
-                let sender_id = field("sender_id").and_then(Value::as_str);
+                let peer_id = field(peer).and_then(Value::as_str);
                 let active = field("active").and_then(Value::as_bool);
                 let version = resource.get("version").and_then(Value::as_str);
-                let same_sender = match (sender_id, want) {
+                let same_peer = match (peer_id, want) {
                     (Some(got), Some(want)) => got.eq_ignore_ascii_case(want),
                     (got, want) => got == want,
                 };
-                let named = |id: Option<&str>| id.map_or_else(|| "no sender".to_string(), |id| format!("sender {id}"));
+                let named = |id: Option<&str>| id.map_or_else(|| format!("no {other}"), |id| format!("{other} {id}"));
                 let mut subscription = Vec::new();
-                if !same_sender {
-                    subscription.push(format!("names {} rather than {}", named(sender_id), named(want)));
+                if !same_peer {
+                    subscription.push(format!("names {} rather than {}", named(peer_id), named(want)));
                 }
                 if let Some(active) = active
-                    && active != plan.expect.master_enable
+                    && active != enabled
                 {
                     subscription.push(if active { "is active" } else { "is inactive" }.to_string());
                 }
@@ -860,7 +1263,7 @@ fn registry_lag(registry: &QueryClient, job: &Job, plan: &Plan, wait: Duration) 
                     why.push(format!("its subscription {}", subscription.join(" and ")));
                 }
                 if let Some(version) = version
-                    && receiver.version.as_deref() == Some(version)
+                    && endpoint.version.as_deref() == Some(version)
                 {
                     why.push(format!("its version is still {version}"));
                 }
@@ -876,7 +1279,8 @@ fn registry_lag(registry: &QueryClient, job: &Job, plan: &Plan, wait: Duration) 
             let waited = wait.as_secs_f64();
             return Some(format!(
                 "after {waited} s the registry does not show the change: {why}. IS-05 requires the Node to \
-                 update the Receiver's subscription and version on every activation"
+                 update the {}'s subscription and version on every activation",
+                if endpoint.kind == Kind::Sender { "Sender" } else { "Receiver" }
             ));
         }
         thread::sleep(POLL);
@@ -905,6 +1309,59 @@ fn aligned(activation: Activation, rate: Option<Rational>) -> Activation {
 fn now(tai_utc: i32) -> PtpTime {
     let unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
     PtpTime::from_utc(unix, tai_utc).unwrap_or_default()
+}
+
+/// Whether a Sender sends unicast, to one Receiver it is pointed at.
+fn is_unicast(sender: &Endpoint) -> bool {
+    sender.transport.as_deref() == Some("urn:x-nmos:transport:rtp.ucast")
+}
+
+/// The destinations a Sender plan sends to.
+fn destinations_of(plan: &SenderPlan) -> Vec<Destination> {
+    crate::destinations(&plan.request).into_iter().flatten().collect()
+}
+
+/// An SDP file as it will read once its Sender sends each leg to `destinations`: each
+/// leg's `c=` address and, where given, `m=` port, with any `a=source-filter` for the
+/// old address changed to match. Only media sections with their own `c=` line change.
+fn retarget(sdp: &str, destinations: &[Destination]) -> String {
+    let mut out = String::with_capacity(sdp.len());
+    let mut section: Option<usize> = None;
+    let mut old: Option<String> = None;
+    for line in sdp.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        let end = &line[text.len()..];
+        if text.starts_with("m=") {
+            section = Some(section.map_or(0, |s| s + 1));
+            old = None;
+        }
+        let target = section.and_then(|s| destinations.get(s));
+        let changed = match (target, text.split_once('=')) {
+            (Some(to), Some(("m", rest))) => {
+                let mut words: Vec<&str> = rest.split(' ').collect();
+                let port = to.port.map(|p| p.to_string());
+                if let (Some(port), Some(word)) = (&port, words.get_mut(1)) {
+                    *word = port;
+                }
+                Some(format!("m={}", words.join(" ")))
+            }
+            (Some(to), Some(("c", rest))) => {
+                let mut words = rest.split(' ');
+                let (net, family) = (words.next().unwrap_or("IN"), if to.ip.is_ipv4() { "IP4" } else { "IP6" });
+                old = words.nth(1).map(|a| a.split('/').next().unwrap_or(a).to_string());
+                Some(format!("c={net} {family} {}", to.ip))
+            }
+            (Some(to), Some(("a", rest))) if rest.starts_with("source-filter:") => old.as_ref().map(|old| {
+                let words: Vec<String> =
+                    text.split(' ').map(|w| if w == old { to.ip.to_string() } else { w.to_string() }).collect();
+                words.join(" ")
+            }),
+            _ => None,
+        };
+        out.push_str(changed.as_deref().unwrap_or(text));
+        out.push_str(end);
+    }
+    out
 }
 
 fn is_http(href: &str) -> bool {

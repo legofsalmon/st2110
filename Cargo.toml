@@ -26,6 +26,7 @@ nix = { version = "0.31", default-features = false, features = ["socket", "uio",
 serde-wasm-bindgen = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
+ring = "0.17"
 ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 wasm-bindgen = "0.2.100"
 

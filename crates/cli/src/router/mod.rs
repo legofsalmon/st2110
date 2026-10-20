@@ -6,6 +6,9 @@
 //! included. The browser talks only to it, so devices need not allow a page from
 //! another site to send them requests, and no video passes through the browser.
 //!
+//! The page also turns a Sender on and off and changes where it sends, through the
+//! same controller ([`controller::control`]).
+//!
 //! The page hears of each change over a WebSocket ([`events`]), as the router hears of
 //! them from the registry's subscriptions. Requests to the registry and the Nodes carry
 //! an IS-10 token where they ask for one. The log of connections made, and the demo
@@ -17,6 +20,7 @@
 //! itself, so another web site cannot make them through a visitor's browser.
 
 mod demo;
+mod dnssd;
 mod events;
 mod http;
 mod keep;
@@ -25,7 +29,7 @@ mod signal;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,10 +39,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use st2110_connect::client::{self, ConnectionClient};
-use st2110_connect::controller::{self, Route, Settings, Take};
-use st2110_nmos::auth::{ClientCredentials, Token};
+use st2110_connect::controller::{self, Route, SenderControl, Settings, Take};
+use st2110_connect::{Destination, SenderChange};
+use st2110_nmos::auth::{ClientCredentials, SigningKey, Token};
 use st2110_nmos::client::{Options, QueryClient};
-use st2110_nmos::{Manifest, Snapshot, routing};
+use st2110_nmos::{Kind, Manifest, Snapshot, groups, routing};
 
 use self::demo::Facility;
 use self::events::{Hub, Sent, Signal, Subscriptions};
@@ -72,6 +77,8 @@ pub(crate) struct Args {
     pub interface: Option<Ipv4Addr>,
     pub auth: crate::auth::Auth,
     pub demo_auth: bool,
+    /// With --register: register for `private_key_jwt`, publishing the key here.
+    pub private_key_jwt: bool,
     /// The state file, or `None` to keep nothing.
     pub state: Option<PathBuf>,
 }
@@ -117,7 +124,13 @@ struct Router {
     keeper: Keeper,
     /// The demo registry's subscriptions' WebSockets, each with its subscription's id.
     demo_sockets: Hub,
+    /// The public key it signs `private_key_jwt` assertions with, as a JSON Web Key
+    /// Set, for the Authorization Server to read at `/.well-known/jwks.json`.
+    jwks: Option<Value>,
 }
+
+/// Where the router publishes the key it signs IS-10 client assertions with.
+const JWKS_PATH: &str = "/.well-known/jwks.json";
 
 pub(crate) fn run(args: &Args) -> io::Result<ExitCode> {
     match serve(args) {
@@ -168,7 +181,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         _ => address.to_string(),
     };
     let page = format!("http://{local}/");
-    let (registry, demo) = match (&args.target, args.demo) {
+    let (registry, mut demo) = match (&args.target, args.demo) {
         (Some(target), false) => {
             let lower = target.to_ascii_lowercase();
             if !lower.starts_with("http://") && !lower.starts_with("https://") {
@@ -184,17 +197,44 @@ fn serve(args: &Args) -> Result<(), Failure> {
         }
         _ => return Err(Failure::Usage("give a registry's Query API URL, or --demo".into())),
     };
-    let token = match demo.as_ref().and_then(Facility::auth_server) {
-        Some(server) => Some(Token::client_credentials(
-            ClientCredentials {
-                server,
-                client_id: demo::CLIENT_ID.into(),
-                client_secret: demo::CLIENT_SECRET.into(),
-                scope: st2110_nmos::auth::SCOPES.into(),
-            },
-            timeout,
-            false,
-        )),
+    let mut jwks = None;
+    let token = match demo.as_mut().and_then(|f| f.auth_server().map(|server| (server, f))) {
+        // The router registers with the demo's Authorization Server for private_key_jwt,
+        // as IS-10 recommends a confidential client do, and publishes its key.
+        Some((server, facility)) => {
+            let key = SigningKey::generate().map_err(|e| e.message)?;
+            let asked = json!({
+                "client_name": format!("st2110 router at {page}"), "scope": st2110_nmos::auth::SCOPES,
+                "grant_types": ["client_credentials"], "token_endpoint_auth_method": "private_key_jwt",
+                "jwks_uri": format!("http://{local}{JWKS_PATH}"),
+            });
+            let issued = facility.register_client(&asked).map_err(|(_, e)| e.to_string())?;
+            jwks = Some(key.jwks());
+            Some(Token::client_credentials(
+                ClientCredentials {
+                    server,
+                    client_id: issued["client_id"].as_str().unwrap_or_default().into(),
+                    client_secret: String::new(),
+                    scope: st2110_nmos::auth::SCOPES.into(),
+                    key: Some(key),
+                },
+                timeout,
+                false,
+            ))
+        }
+        None if args.private_key_jwt => {
+            // The Authorization Server reads the key from this server, so at an address
+            // it can reach.
+            if address.ip().is_unspecified() {
+                return Err(Failure::Usage(
+                    "--private-key-jwt publishes the key at --listen, so give it the address the Authorization Server reaches this machine at".into(),
+                ));
+            }
+            let key = args.auth.kept_key()?;
+            jwks = Some(key.jwks());
+            let uri = format!("http://{address}{JWKS_PATH}");
+            args.auth.token_with(timeout, true, &crate::auth::Proof::Key(&key, uri))?
+        }
         None => args.auth.token(timeout, demo.is_none())?,
     };
     let keeper = Keeper::new(args.state.clone(), if demo.is_some() { "demo" } else { registry.as_str() });
@@ -223,6 +263,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         entries: AtomicU64::new(entries),
         keeper,
         demo_sockets: Hub::default(),
+        jwks,
         // The demo's streams come over the loopback interface.
         previews: Previews::new(
             if args.demo { Some(Ipv4Addr::LOCALHOST) } else { args.interface },
@@ -230,6 +271,14 @@ fn serve(args: &Args) -> Result<(), Failure> {
             // The demo's streams are small, and all of them fit.
             if args.demo && args.previews > 0 { args.previews.max(DEMO_PREVIEWS) } else { args.previews },
         ),
+    });
+    // The demo's DNS-SD, on the same address and port over UDP.
+    let dns_sd = router.demo.as_ref().map(|demo| {
+        let auth = demo.lock().is_ok_and(|f| f.auth_server().is_some());
+        UdpSocket::bind(address).map(|socket| {
+            let advertised = dnssd::Advertised { address, auth };
+            std::thread::spawn(move || dnssd::serve(socket, &advertised));
+        })
     });
     // Without previews nothing would show the demo's streams, so they are not sent.
     if let Some(demo) = router.demo.as_ref().filter(|_| args.previews > 0) {
@@ -245,13 +294,25 @@ fn serve(args: &Args) -> Result<(), Failure> {
             Some(_) => writeln!(out, "Registry: the demo facility, at {}", router.registry)?,
             None => writeln!(out, "Registry: {}", router.registry)?,
         }
+        match dns_sd {
+            Some(Ok(())) => writeln!(
+                out,
+                "DNS-SD: {local} answers for the demo in any domain, as in st2110 nmos --dns-server {local} --domain demo.test"
+            )?,
+            Some(Err(e)) => writeln!(out, "DNS-SD: none for the demo, as UDP {local} cannot be had: {e}")?,
+            None => {}
+        }
         if let Some(server) = router.demo.as_ref().and_then(|d| d.lock().ok()?.auth_server()) {
             writeln!(
                 out,
-                "IS-10: the demo asks for tokens, from {server} (client {}, secret {})",
+                "IS-10: the demo asks for tokens, from {server} (client {}, secret {}, or register with the initial access token {})",
                 demo::CLIENT_ID,
-                demo::CLIENT_SECRET
+                demo::CLIENT_SECRET,
+                demo::INITIAL_TOKEN
             )?;
+            if let Some(token) = &router.token {
+                writeln!(out, "IS-10: the router gets {}", token.describe())?;
+            }
         } else if let Some(token) = &router.token {
             writeln!(out, "IS-10: {}", token.describe())?;
         }
@@ -463,10 +524,18 @@ fn answer(router: &Router, request: &Request) -> Response {
             ],
             body: PAGE.as_bytes().to_vec(),
         },
+        ("GET", JWKS_PATH) => match &router.jwks {
+            Some(jwks) => Response::json(200, jwks),
+            None => Response::error(404, "this router signs no IS-10 assertions"),
+        },
         ("GET", "/api/state") => state(router),
         ("GET", "/api/why") => why(router, request),
         ("POST", "/api/take") => match same_origin(request) {
             Ok(()) => take(router, request),
+            Err(message) => Response::error(403, message),
+        },
+        ("POST", "/api/sender") => match same_origin(request) {
+            Ok(()) => sender(router, request),
             Err(message) => Response::error(403, message),
         },
         ("POST", "/api/watch") => match same_origin(request) {
@@ -482,8 +551,8 @@ fn answer(router: &Router, request: &Request) -> Response {
         ("GET", "/api/stream") => stream(router, request),
         (
             _,
-            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/watch" | "/api/live" | "/api/log" | "/api/preview"
-            | "/api/stream" | "/api/events",
+            "/" | "/api/state" | "/api/why" | "/api/take" | "/api/sender" | "/api/watch" | "/api/live" | "/api/log"
+            | "/api/preview" | "/api/stream" | "/api/events",
         ) => Response::error(405, "not with that method"),
         _ => Response::error(404, "nothing here"),
     }
@@ -627,6 +696,14 @@ fn state_json(router: &Router) -> Result<Value, String> {
     let snapshot = read.map_err(|message| format!("reading the registry: {message}"))?;
     let matrix = routing::matrix(&snapshot);
     let flows = &snapshot.flows;
+    // Each one's BCP-002-01 natural group, for taking a group as one.
+    let group = |memberships: &std::collections::BTreeMap<String, (groups::Group, String)>, id: &str| {
+        memberships
+            .get(id)
+            .map(|(g, role)| json!({"name": g.name, "key": format!("{}/{}", g.scope, g.name), "role": role}))
+    };
+    let sender_groups = groups::memberships(&snapshot, Kind::Sender);
+    let receiver_groups = groups::memberships(&snapshot, Kind::Receiver);
     let senders: Vec<Value> = matrix
         .senders
         .iter()
@@ -637,8 +714,11 @@ fn state_json(router: &Router) -> Result<Value, String> {
                 .and_then(Value::as_str)
                 .and_then(|id| flows.iter().find(|f| f.get("id").and_then(Value::as_str) == Some(id)));
             let (device, node) = device_and_node(&snapshot, raw);
+            // IS-04 v1.2 and later: whether the Sender's master_enable is on.
+            let enabled = raw.get("subscription").and_then(|s| s.get("active")).and_then(Value::as_bool);
             json!({
-                "id": s.id, "label": s.label, "device": device, "node": node,
+                "id": s.id, "label": s.label, "device": device, "node": node, "enabled": enabled,
+                "group": s.id.as_deref().and_then(|id| group(&sender_groups, id)),
                 "format": format_name(flow.and_then(|f| f.get("format")).and_then(Value::as_str)),
                 "summary": text(raw, "id").and_then(|id| summary(&snapshot, &id)),
             })
@@ -653,6 +733,7 @@ fn state_json(router: &Router) -> Result<Value, String> {
             let (device, node) = device_and_node(&snapshot, raw);
             json!({
                 "id": row.receiver.id, "label": row.receiver.label, "device": device, "node": node,
+                "group": row.receiver.id.as_deref().and_then(|id| group(&receiver_groups, id)),
                 "format": format_name(raw.get("format").and_then(Value::as_str)),
                 "fits": row.fits, "current": row.current,
                 "sender_id": subscription.and_then(|s| s.get("sender_id")).and_then(Value::as_str),
@@ -718,6 +799,9 @@ struct TakeRequest {
     routes: Vec<Wanted>,
     #[serde(default)]
     dry_run: bool,
+    /// Take the rest of each Receiver's natural group with it.
+    #[serde(default)]
+    group: bool,
 }
 
 /// Makes the connections the page asks for, together, as `st2110 connect --salvo` does,
@@ -736,7 +820,7 @@ fn take(router: &Router, request: &Request) -> Response {
             "error": error, "connections": [],
         }),
         None => json!({
-            "dry_run": body["dry_run"], "succeeded": body["succeeded"],
+            "dry_run": body["dry_run"], "succeeded": body["succeeded"], "notes": body["notes"],
             "connections": body["connections"].as_array().into_iter().flatten().map(|c| json!({
                 "state": c["state"], "describe": c["describe"],
                 "problems": c["problems"], "warnings": c["warnings"], "notes": c["notes"],
@@ -779,11 +863,23 @@ fn make(router: &Router, request: &Request) -> Response {
         Ok(snapshot) => snapshot,
         Err(e) => return Response::error(502, format!("reading the registry: {e}")),
     };
+    let (routes, left) = if wanted.group {
+        match controller::with_groups(&snapshot, &routes) {
+            Ok(grouped) => grouped,
+            Err(message) => return Response::error(400, message),
+        }
+    } else {
+        (routes, Vec::new())
+    };
+    if routes.len() > MOST {
+        return Response::error(400, format!("at most {MOST} connections are made at once, with their groups"));
+    }
     let settings = Settings { dry_run: wanted.dry_run, ..router.settings.clone() };
     match controller::connect(&snapshot, &routes, &router.connection_client(), Some(&registry), &settings) {
         Ok(outcome) => {
             let mut body = serde_json::to_value(&outcome).unwrap_or(Value::Null);
             body["succeeded"] = json!(outcome.succeeded());
+            body["notes"] = json!(left);
             for (value, connection) in
                 body["connections"].as_array_mut().into_iter().flatten().zip(&outcome.connections)
             {
@@ -798,6 +894,86 @@ fn make(router: &Router, request: &Request) -> Response {
         }
         Err(message) => Response::error(400, message),
     }
+}
+
+/// A change to a Sender the page asks for: on or off, and where each leg goes, path 1
+/// first, or nothing to leave where it sends as it is.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SenderRequest {
+    sender: String,
+    enable: bool,
+    #[serde(default)]
+    destinations: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Turns a Sender on or off, or changes where it sends, as `st2110 connect --sender`
+/// does, and logs what happened as a take is logged.
+fn sender(router: &Router, request: &Request) -> Response {
+    let wanted: SenderRequest = match serde_json::from_slice(&request.body) {
+        Ok(wanted) => wanted,
+        Err(e) => return Response::error(400, format!("not a change to a sender: {e}")),
+    };
+    let mut destinations = Vec::new();
+    for (i, text) in wanted.destinations.iter().enumerate() {
+        match Destination::parse(text) {
+            Ok(destination) => destinations.push(destination),
+            Err(message) => return Response::error(400, format!("leg {}: {message}", i + 1)),
+        }
+    }
+    let Ok(_taking) = router.taking.try_lock() else {
+        return Response::error(409, "other connections are being made; try again when they are done");
+    };
+    let registry = match router.query_client(false) {
+        Ok(registry) => registry,
+        Err(message) => return Response::error(502, format!("reading the registry: {message}")),
+    };
+    let snapshot = match registry.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(e) => return Response::error(502, format!("reading the registry: {e}")),
+    };
+    let change = SenderChange { enable: wanted.enable, destinations, receiver_id: None };
+    let settings = Settings { dry_run: wanted.dry_run, ..router.settings.clone() };
+    let report = match controller::control(
+        &snapshot,
+        &wanted.sender,
+        &change,
+        &router.connection_client(),
+        Some(&registry),
+        &settings,
+    ) {
+        Ok(report) => report,
+        Err(message) => return Response::error(400, message),
+    };
+    let describe = describe_control(&report, &change);
+    let connection = json!({
+        "state": report.state, "describe": describe,
+        "problems": report.problems, "warnings": report.warnings, "notes": report.notes,
+    });
+    let succeeded = report.state.is_success();
+    let log_id =
+        router.record(json!({"dry_run": wanted.dry_run, "succeeded": succeeded, "connections": [connection.clone()]}));
+    router.changes.raise();
+    let mut body = serde_json::to_value(&report).unwrap_or(Value::Null);
+    body["succeeded"] = json!(succeeded);
+    body["dry_run"] = json!(wanted.dry_run);
+    body["describe"] = json!(describe);
+    body["connections"] = json!([connection]);
+    body["log_id"] = json!(log_id);
+    Response::json(200, &body)
+}
+
+/// A change to a Sender and what became of it, in a line: "CAM 1 video (Camera 1): on,
+/// to 239.10.1.9:5004: done".
+fn describe_control(report: &SenderControl, change: &SenderChange) -> String {
+    let mut what = String::from(if change.enable { "on" } else { "off" });
+    if !change.destinations.is_empty() {
+        let to: Vec<String> = change.destinations.iter().map(Destination::to_string).collect();
+        what.push_str(&format!(", to {}", to.join(", ")));
+    }
+    format!("{}: {what}: {}", report.sender.describe(), report.state.describe())
 }
 
 /// The Senders whose streams the page is showing.
@@ -862,11 +1038,34 @@ fn stream(router: &Router, request: &Request) -> Response {
     let Some(id) = request.param("sender") else {
         return Response::error(400, "name a sender");
     };
+    let (mut body, active_url) = match stream_json(router, &id) {
+        Ok(read) => read,
+        Err(response) => return response,
+    };
+    // What the Sender says it is doing now, as its Connection API reads it back.
+    let active = active_url.map(|url| router.connection_client().get(&url));
+    body["active"] = match &active {
+        Some(Ok(reply)) if reply.is_success() => reply.body.clone(),
+        _ => Value::Null,
+    };
+    body["active_error"] = match active {
+        Some(Ok(reply)) if !reply.is_success() => json!(reply.error()),
+        Some(Err(e)) => json!(e.message),
+        None => json!("its Device advertises no IS-05 Connection API"),
+        Some(Ok(_)) => Value::Null,
+    };
+    Response::json(200, &body)
+}
+
+/// What [`stream`] answers, from the registry as last read, and where the Sender's
+/// `/active` endpoint is.
+fn stream_json(router: &Router, id: &str) -> Result<(Value, Option<String>), Response> {
+    let id = id.to_string();
     let Ok(last) = router.last.lock() else {
-        return Response::error(500, "the router failed");
+        return Err(Response::error(500, "the router failed"));
     };
     let Some(snapshot) = last.as_ref() else {
-        return Response::error(409, "the registry has not been read yet");
+        return Err(Response::error(409, "the registry has not been read yet"));
     };
     let by_id = |list: &[Value], id: Option<&str>| -> Value {
         id.and_then(|id| list.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(id)).cloned())
@@ -874,8 +1073,12 @@ fn stream(router: &Router, request: &Request) -> Response {
     };
     let sender = by_id(&snapshot.senders, Some(&id));
     if sender.is_null() {
-        return Response::error(404, "no such sender");
+        return Err(Response::error(404, "no such sender"));
     }
+    let active_url = routing::find(snapshot, Kind::Sender, &id).ok().and_then(|endpoint| {
+        let api = endpoint.connection_api?;
+        Some(client::single(&api.href, Kind::Sender, &id, "active"))
+    });
     let flow = by_id(&snapshot.flows, sender.get("flow_id").and_then(Value::as_str));
     let source = by_id(&snapshot.sources, flow.get("source_id").and_then(Value::as_str));
     let (device, node) = device_and_node(snapshot, &sender);
@@ -897,9 +1100,8 @@ fn stream(router: &Router, request: &Request) -> Response {
         })
         .map(|r| json!(text(r, "label").unwrap_or_default()))
         .collect();
-    Response::json(
-        200,
-        &json!({
+    Ok((
+        json!({
             "id": id, "device": device, "node": node,
             "sender": sender, "flow": flow, "source": source,
             "sdp_url": manifest.map(|m| m.url.clone()),
@@ -909,7 +1111,8 @@ fn stream(router: &Router, request: &Request) -> Response {
             "findings": findings,
             "receivers": receivers,
         }),
-    )
+        active_url,
+    ))
 }
 
 #[cfg(test)]

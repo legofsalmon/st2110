@@ -7,7 +7,7 @@ use serde_json::Value;
 use st2110_sdp::{ClockIdentity, Rational, RefClock, Stream, parse_frame_rate};
 
 use crate::caps::{self, SdpFacts, StreamFacts};
-use crate::model::{Clock, Core, Flow, Kind, Model, Node, Receiver, Sender, Source, is_uuid, short_urn};
+use crate::model::{Clock, Core, Flow, Kind, Model, Node, Receiver, Sender, Source, is_mac, is_uuid, short_urn};
 use crate::report::{Findings, Grandmaster, ReceiverView, Report, ResourceRef, SenderView, Summary};
 use crate::rules::*;
 use crate::{Manifest, Snapshot};
@@ -29,7 +29,10 @@ pub fn check(snapshot: &Snapshot) -> Report {
     let sdps: Vec<Option<Sdp>> =
         model.senders.iter().map(|sender| transport_file(&model, snapshot, sender, &mut findings)).collect();
     subscriptions(&model, &sdps, &mut findings);
+    active(&model, snapshot, &mut findings);
     connections(&model, &sdps, &mut findings);
+    crate::groups::check_groups(&model, snapshot, &mut findings);
+    crate::groups::check_assets(&model, snapshot, &mut findings);
 
     let summary = Summary {
         nodes: model.nodes.len(),
@@ -122,6 +125,12 @@ fn references(model: &Model<'_>, findings: &mut Findings) {
             findings.add(&MISSING_PARENT, core, format!("its Device {id} is not registered"));
         }
     };
+    for node in &model.nodes {
+        lldp(node, findings);
+    }
+    for receiver in &model.receivers {
+        constraint_sets(receiver, findings);
+    }
     for d in &model.devices {
         if let Some(id) = d.node_id
             && model.node(id).is_none()
@@ -198,7 +207,7 @@ fn check_bindings<'a>(
     let Some(interfaces) = &node.interfaces else {
         return;
     };
-    let known = known.entry(node.core.index).or_insert_with(|| interfaces.iter().copied().collect());
+    let known = known.entry(node.core.index).or_insert_with(|| interfaces.iter().map(|i| i.name).collect());
     let mut reported = HashSet::new();
     let mut names = None;
     for &name in bindings {
@@ -208,10 +217,72 @@ fn check_bindings<'a>(
         let message = if interfaces.is_empty() {
             format!("it binds to interface {name}, but its Node lists no interfaces")
         } else {
-            let names = names.get_or_insert_with(|| list(interfaces.iter().copied()));
+            let names = names.get_or_insert_with(|| list(interfaces.iter().map(|i| i.name)));
             format!("it binds to interface {name}, but its Node's interfaces are {names}")
         };
         f.add(&UNKNOWN_INTERFACE, core, message);
+    }
+}
+
+/// Checks what a Node's interfaces say about LLDP.
+fn lldp(node: &Node<'_>, findings: &mut Findings) {
+    let interfaces = node.interfaces.as_deref().unwrap_or_default();
+    for interface in interfaces {
+        let name = interface.name;
+        match interface.chassis_id {
+            Some(None) => findings.add(
+                &INTERFACE_LLDP,
+                &node.core,
+                format!("interface {name} has chassis_id null, so it sends no LLDP to tell the switch what it is"),
+            ),
+            Some(Some(id)) if !is_mac(id) && is_mac(&id.to_ascii_lowercase().replace(':', "-")) => findings.add(
+                &INTERFACE_LLDP,
+                &node.core,
+                format!("interface {name} has chassis_id {id}; IS-04 writes a MAC address lowercase with dashes"),
+            ),
+            _ => {}
+        }
+    }
+    // Only IS-04 v1.3 has attached_network_device, so only a Node known to be at
+    // v1.3 can be expected to give it.
+    let unattached: Vec<&str> = interfaces.iter().filter(|i| i.attached.is_none()).map(|i| i.name).collect();
+    if node.schema == Some("v1.3") && !unattached.is_empty() {
+        let (which, are) = match unattached.as_slice() {
+            [one] => (format!("interface {one} gives"), "it is"),
+            _ => (format!("interfaces {} give", list(unattached.iter().copied())), "they are"),
+        };
+        findings.add(
+            &INTERFACE_LLDP,
+            &node.core,
+            format!("{which} no attached_network_device, so nothing says which switch port {are} plugged into"),
+        );
+    }
+}
+
+/// Checks a Receiver's BCP-004-01 constraint sets for what they must hold.
+fn constraint_sets(receiver: &Receiver<'_>, findings: &mut Findings) {
+    let Some(sets) = receiver.constraint_sets else {
+        return;
+    };
+    if receiver.caps_version.is_none() {
+        findings.add(
+            &CONSTRAINT_SETS,
+            &receiver.core,
+            "it has caps.constraint_sets but no caps.version, so a controller cannot tell when they change",
+        );
+    }
+    for (i, set) in sets.iter().enumerate() {
+        let constraints =
+            set.as_object().map_or(0, |set| set.keys().filter(|k| !k.starts_with("urn:x-nmos:cap:meta:")).count());
+        if constraints == 0 {
+            findings.add(
+                &CONSTRAINT_SETS,
+                &receiver.core,
+                format!(
+                    "constraint set {i} holds no parameter constraint, so it says nothing about what the Receiver takes"
+                ),
+            );
+        }
     }
 }
 
@@ -536,7 +607,27 @@ fn video_sdp(flow: &Flow<'_>, stream: &Stream, mismatch: &mut impl FnMut(String)
     {
         mismatch(format!("its Flow's transfer_characteristic is {transfer}, but TCS is {tcs}"));
     }
-    if !flow.media_type.is_some_and(|m| m.eq_ignore_ascii_case("video/raw")) {
+    let jxsv = flow.media_type.is_some_and(|m| m.eq_ignore_ascii_case("video/jxsv"));
+    if jxsv {
+        // BCP-006-01: each is in the SDP file with the Flow's value, and both leave it
+        // out for Unrestricted.
+        for (attribute, value) in [("profile", flow.profile), ("level", flow.level), ("sublevel", flow.sublevel)] {
+            match (value, param(stream, attribute)) {
+                (Some(value), Some(text)) if value != text => {
+                    mismatch(format!("its Flow's {attribute} is {value}, but {attribute} is {text}"))
+                }
+                (Some(value), None) => {
+                    mismatch(format!("its Flow's {attribute} is {value}, but its SDP file has no {attribute}"))
+                }
+                (None, Some(text)) => mismatch(format!(
+                    "its Flow has no {attribute}, which means Unrestricted, but {attribute} is {text}"
+                )),
+                _ => {}
+            }
+        }
+    }
+    // The components describe JPEG XS as they do uncompressed video (BCP-006-01).
+    if !jxsv && !flow.media_type.is_some_and(|m| m.eq_ignore_ascii_case("video/raw")) {
         return;
     }
     if let (Some(from_components), Some(sampling)) = (caps::sampling(&flow.components), param(stream, "sampling"))
@@ -690,6 +781,44 @@ fn subscriptions(model: &Model<'_>, sdps: &[Option<Sdp>], findings: &mut Finding
                 &SUBSCRIPTION_STATE,
                 &receiver.core,
                 format!("subscription.sender_id is {sender} while the Receiver is inactive; it must be null"),
+            );
+        }
+    }
+}
+
+/// Compares each Sender's and Receiver's `subscription` with its IS-05 `/active`.
+fn active(model: &Model<'_>, snapshot: &Snapshot, findings: &mut Findings) {
+    let senders = model.senders.iter().map(|s| (&s.core, s.subscription.as_ref(), "receiver_id"));
+    let receivers = model.receivers.iter().map(|r| (&r.core, r.subscription.as_ref(), "sender_id"));
+    for (core, subscription, peer) in senders.chain(receivers) {
+        let Some(active) = core.id.and_then(|id| snapshot.active.get(id)) else { continue };
+        let Some(subscription) = subscription else { continue };
+        let Some(enabled) = active.get("master_enable").and_then(Value::as_bool) else { continue };
+        if let Some(registered) = subscription.active
+            && registered != enabled
+        {
+            findings.add(
+                &ACTIVE_SUBSCRIPTION,
+                core,
+                format!("subscription.active is {registered}, but master_enable is {enabled} in its IS-05 /active"),
+            );
+            continue;
+        }
+        let expected = if enabled { active.get(peer).and_then(Value::as_str) } else { None };
+        if subscription.peer != expected {
+            let show = |id: Option<&str>| id.unwrap_or("null").to_string();
+            findings.add(
+                &ACTIVE_SUBSCRIPTION,
+                core,
+                format!(
+                    "subscription.{peer} is {}, but its IS-05 /active {}",
+                    show(subscription.peer),
+                    match (enabled, expected) {
+                        (false, _) => "is disabled, so it names none".to_string(),
+                        (true, Some(id)) => format!("names {id}"),
+                        (true, None) => format!("has {peer} null"),
+                    }
+                ),
             );
         }
     }

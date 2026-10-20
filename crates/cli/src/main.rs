@@ -5,6 +5,7 @@
 mod auth;
 mod connect;
 mod discover;
+mod find;
 mod nmos;
 mod pcap;
 mod ptp;
@@ -59,13 +60,16 @@ enum Command {
     /// Sender's SDP file.
     ///
     /// TARGET is a registry's Query API URL, a Node's Node API URL to check it alone, or
-    /// a snapshot saved with --save (`-` reads standard input). Exits with 0 when nothing
-    /// is an error, 1 when something is (or is a warning, with --deny-warnings), and 2
-    /// when the registry, Node or file cannot be read.
+    /// a snapshot saved with --save (`-` reads standard input). Without it, the registry
+    /// is found by DNS-SD (_nmos-query._tcp): by unicast DNS in the search domains, then
+    /// by multicast DNS. Exits with 0 when nothing is an error, 1 when something is (or
+    /// is a warning, with --deny-warnings), and 2 when the registry, Node or file cannot
+    /// be read.
     Nmos {
         /// Query API URL, such as http://registry.example:8080, Node API URL, such as
-        /// http://camera.example/x-nmos/node/, or a saved snapshot.
-        target: String,
+        /// http://camera.example/x-nmos/node/, or a saved snapshot; found by DNS-SD when
+        /// omitted.
+        target: Option<String>,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
@@ -91,11 +95,16 @@ enum Command {
     /// can take.
     ///
     /// TARGET is a registry's Query API URL, or a snapshot saved with `st2110 nmos
-    /// --save`. Name a Receiver with --receiver and what it is to take with --sender,
+    /// --save`; without it, the registry is found by DNS-SD. Name a Receiver with --receiver and what it is to take with --sender,
     /// --sdp or --disconnect, or give several connections to make together with --salvo.
     /// Without them, lists which Senders each Receiver can take (or the one --receiver
     /// names), by transport, format and capabilities. --cancel cancels an activation
     /// scheduled on a Receiver.
+    ///
+    /// With --sender and --enable, --disable or --destination, it turns that Sender on
+    /// or off, or sends it to other multicast groups or unicast addresses. A Receiver
+    /// connected to a unicast (rtp.ucast) Sender has the Sender pointed at it first,
+    /// naming it as the Sender's receiver_id.
     ///
     /// Each connection is checked against the Receiver's constraints and capabilities
     /// before anything is sent, and on its /active endpoint and in the registry after.
@@ -105,14 +114,30 @@ enum Command {
     /// refused, failed or differs, and 2 when the registry or a file cannot be read or a
     /// name finds no Sender or Receiver, or more than one.
     Connect {
-        /// Query API URL, such as http://registry.example:8080, or a saved snapshot.
-        target: String,
+        /// Query API URL, such as http://registry.example:8080, or a saved snapshot; found
+        /// by DNS-SD when omitted.
+        target: Option<String>,
         /// The Receiver: its id, its label, or the start of its id.
         #[arg(long, value_name = "RECEIVER", conflicts_with = "salvo")]
         receiver: Option<String>,
         /// The Sender whose stream it is to take: its id, its label, or the start of its id.
-        #[arg(long, value_name = "SENDER", group = "take", requires = "receiver")]
+        /// With --enable, --disable or --destination, the Sender to change.
+        #[arg(long, value_name = "SENDER", group = "take")]
         sender: Option<String>,
+        /// Turn the Sender on, sending where it sent before or where --destination says.
+        #[arg(long, requires = "sender", conflicts_with_all = ["receiver", "disable", "salvo", "cancel"])]
+        enable: bool,
+        /// Turn the Sender off.
+        #[arg(long, requires = "sender", conflicts_with_all = ["receiver", "destination", "salvo", "cancel"])]
+        disable: bool,
+        /// Where the Sender sends, and turn it on: a multicast group or a unicast address,
+        /// with a port or not, such as 239.10.1.1:5004. Give it twice for an ST 2022-7
+        /// pair, path 1 first; a leg left without one is turned off.
+        #[arg(long, value_name = "ADDRESS", requires = "sender", conflicts_with_all = ["receiver", "salvo", "cancel"])]
+        destination: Vec<String>,
+        /// The Receiver a unicast Sender's --destination is, named as its receiver_id.
+        #[arg(long, value_name = "RECEIVER", requires = "destination")]
+        receiver_id: Option<String>,
         /// An SDP file of the stream it is to take, such as one from outside NMOS; `-`
         /// reads standard input.
         #[arg(long, value_name = "FILE", group = "take", requires = "receiver")]
@@ -128,6 +153,11 @@ enum Command {
         /// "feed.sdp"}, {"receiver": "MON 3", "disconnect": true}].
         #[arg(long, value_name = "FILE", conflicts_with = "take")]
         salvo: Option<PathBuf>,
+        /// Take the rest of each Receiver's BCP-002-01 natural group with it, such as a
+        /// monitor's audio with its video: each takes the Sender of the same role in
+        /// the Sender's group, or the next of its format, or is disconnected with it.
+        #[arg(long, conflicts_with = "cancel")]
+        group: bool,
         /// When they take effect: now, a PTP time such as 1790510437:0, or a UTC time such
         /// as 2026-09-27T12:00:00Z. Now for one connection when omitted, and --lead from
         /// now for several.
@@ -175,8 +205,8 @@ enum Command {
     /// Serve a router panel to use in a browser: a crosspoint grid of which Senders
     /// each Receiver can take, where a click connects them through IS-05.
     ///
-    /// TARGET is a registry's Query API URL; --demo serves a facility of cameras and
-    /// monitors instead, to try the panel with no equipment. The page reads the registry
+    /// TARGET is a registry's Query API URL, found by DNS-SD when omitted; --demo serves a
+    /// facility of cameras and monitors instead, to try the panel with no equipment. The page reads the registry
     /// through this command, and connections are made by it as `st2110 connect` makes
     /// them: checked against each Receiver's constraints and capabilities first, made
     /// together as a salvo at one PTP time when several are taken at once, rolled back
@@ -185,8 +215,9 @@ enum Command {
     /// the browser. Anyone who can reach --listen can make connections. Runs until
     /// stopped, and exits with 2 when it cannot start.
     Router {
-        /// Query API URL, such as http://registry.example:8080.
-        #[arg(required_unless_present = "demo", conflicts_with = "demo")]
+        /// Query API URL, such as http://registry.example:8080; found by DNS-SD when
+        /// omitted.
+        #[arg(conflicts_with = "demo")]
         target: Option<String>,
         /// Serve a demo facility of four cameras, a graphics machine and four monitors.
         #[arg(long)]
@@ -230,8 +261,14 @@ enum Command {
         /// With --demo: the demo facility asks for IS-10 tokens, and serves an
         /// Authorization Server to get them from, for client st2110-demo with secret
         /// demo-secret. The router gets its tokens there.
-        #[arg(long, requires = "demo", conflicts_with_all = ["token_file", "auth"])]
+        #[arg(long, requires = "demo", conflicts_with_all = ["token_file", "auth", "client_id", "register"])]
         demo_auth: bool,
+        /// With --register: register for private_key_jwt rather than a secret, signing
+        /// with a key kept with the registrations and published at
+        /// http://<--listen>/.well-known/jwks.json, where the Authorization Server must
+        /// be able to read it.
+        #[arg(long, requires = "register")]
+        private_key_jwt: bool,
         /// The file the router keeps its connection log in, and the demo facility its
         /// connections, so that they are there again after a restart. A file in this
         /// user's application data when omitted.
@@ -455,17 +492,27 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
         Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, auth } => {
-            let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, auth };
-            nmos::run(&target, &fetch, format, quiet, deny_warnings)
+            match registry(target, &auth, timeout) {
+                Ok(target) => {
+                    let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, auth };
+                    nmos::run(&target, &fetch, format, quiet, deny_warnings)
+                }
+                Err(code) => Ok(code),
+            }
         }
         Command::Connect {
             target,
             receiver,
             sender,
+            enable,
+            disable,
+            destination,
+            receiver_id,
             sdp,
             disconnect,
             cancel,
             salvo,
+            group,
             at,
             after,
             lead,
@@ -478,14 +525,23 @@ fn main() -> ExitCode {
             format,
             auth,
         } => {
+            let target = match registry(target, &auth, timeout) {
+                Ok(target) => target,
+                Err(code) => return code,
+            };
             let args = connect::Args {
                 target,
                 receiver,
                 sender,
+                enable,
+                disable,
+                destination,
+                receiver_id,
                 sdp,
                 disconnect,
                 cancel,
                 salvo,
+                group,
                 at,
                 after,
                 lead,
@@ -512,9 +568,17 @@ fn main() -> ExitCode {
             interface,
             auth,
             demo_auth,
+            private_key_jwt,
             state,
             no_state,
         } => {
+            let target = match target {
+                None if !demo => match registry(None, &auth, timeout) {
+                    Ok(target) => Some(target),
+                    Err(code) => return code,
+                },
+                target => target,
+            };
             let state = if no_state { None } else { state.or_else(router::default_state) };
             let args = router::Args {
                 target,
@@ -529,6 +593,7 @@ fn main() -> ExitCode {
                 interface,
                 auth,
                 demo_auth,
+                private_key_jwt,
                 state,
             };
             router::run(&args)
@@ -727,6 +792,21 @@ fn write_diagnostic(out: &mut impl Write, file: &str, d: &Diagnostic, style: Sty
 }
 
 /// A number of seconds given for `option`: a timeout, a wait or a lead, up to a day.
+/// TARGET as given, or the registry found by DNS-SD; the exit code when none is found.
+fn registry(target: Option<String>, auth: &auth::Auth, timeout: f64) -> Result<String, ExitCode> {
+    if let Some(target) = target {
+        return Ok(target);
+    }
+    let found = seconds("--timeout", timeout).and_then(|timeout| {
+        let authorized = auth.token_file.is_some() || auth.auth.is_some() || auth.client_id.is_some() || auth.register;
+        find::registry(&auth.look, timeout, authorized)
+    });
+    found.map_err(|message| {
+        eprintln!("st2110: {message}");
+        ExitCode::from(2)
+    })
+}
+
 pub(crate) fn seconds(option: &str, value: f64) -> Result<Duration, String> {
     Duration::try_from_secs_f64(value)
         .ok()
