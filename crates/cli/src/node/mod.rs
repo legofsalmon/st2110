@@ -27,6 +27,7 @@
 //! receive` feed with what the stream does.
 
 pub(crate) mod connection;
+pub(crate) mod mapping;
 pub(crate) mod monitor;
 mod ncp;
 mod receiving;
