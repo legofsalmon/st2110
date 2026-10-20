@@ -13,6 +13,12 @@
 //! Its Senders can be turned on and off and sent elsewhere through their Connection
 //! APIs too, and their `/transportfile` follows what each sends.
 //!
+//! An audio Node, Audio 1, has an IS-08 Channel Mapping API ([`crate::node::mapping`]):
+//! an 8-channel Input fed by its Receiver, AUD 1 in, and a stereo tone, and two Outputs,
+//! a stereo Monitor that takes either and an 8-channel Program that takes only the
+//! Receiver's channels. With `--demo-auth` it asks for a token with the `connection`
+//! scope, where a real Device would ask for `channelmapping`.
+//!
 //! The streams are real: [`super::signal::start`] sends each Sender's from this
 //! machine, on the loopback interface, so the router can show them. They are small
 //! pictures at 25 frames a second, so that a laptop carries them all with ease. A
@@ -47,6 +53,7 @@ use st2110_nmos::auth;
 use super::signal::Live;
 use crate::http::{Request, Response};
 use crate::node::connection::{self, Control, Endpoint, Side, error, tai};
+use crate::node::mapping::{self, ChannelMap};
 use crate::timing::now;
 
 const VIDEO: &str = "urn:x-nmos:format:video";
@@ -214,6 +221,8 @@ pub(crate) struct Facility {
     senders: BTreeMap<String, Endpoint>,
     /// What each Sender's `/transportfile` serves, keyed by Sender `id`.
     sdp: BTreeMap<String, String>,
+    /// Each IS-08 Channel Mapping API, keyed by the number of its Node.
+    maps: BTreeMap<u32, ChannelMap>,
     /// Each Sender's stream, keyed by Sender `id`: its label and description, as it was
     /// made, and what it is told to send now.
     streams: BTreeMap<String, (String, Description, Arc<Live>)>,
@@ -293,6 +302,7 @@ impl Facility {
             receivers: BTreeMap::new(),
             senders: BTreeMap::new(),
             sdp: BTreeMap::new(),
+            maps: BTreeMap::new(),
             streams: BTreeMap::new(),
             edits: 0,
             subscriptions: BTreeMap::new(),
@@ -361,6 +371,8 @@ impl Facility {
             enabled: false,
         };
         facility.add_sender_node(base, node, "PTZ 1", &["192.168.10.51"], &[ptz]);
+        node += 1;
+        facility.add_audio(base, node);
         // Monitors 1 and 2 are on cameras 1 and 2 already.
         let now = now(tai_utc).unwrap_or_else(|_| PtpTime::from_utc(0, 0).expect("the epoch"));
         for monitor in 1..=2u32 {
@@ -565,6 +577,71 @@ impl Facility {
         }
     }
 
+    /// The audio Node: a Receiver of up to 8 channels, and an IS-08 Channel Mapping API
+    /// that routes its channels, and a tone, to two Outputs. Each Output starts by
+    /// taking the Receiver's channels in order.
+    fn add_audio(&mut self, base: &str, n: u32) {
+        let device_id = self.node(base, n, "Audio 1", &["192.168.10.61"]);
+        let k = u32::try_from(self.registry["receivers"].len()).expect("a few receivers") + 1;
+        let receiver_id = id("7ecf", k);
+        let caps = json!({
+            "media_types": ["audio/L24", "audio/L16"],
+            "constraint_sets": [{
+                "urn:x-nmos:cap:format:channel_count": {"minimum": 1, "maximum": 8},
+                "urn:x-nmos:cap:format:sample_rate": {"enum": [{"numerator": 48000}]},
+                "urn:x-nmos:cap:format:sample_depth": {"enum": [16, 24]},
+                "urn:x-nmos:cap:transport:packet_time": {"enum": [0.125, 1]},
+            }],
+            "version": "1790510437:0",
+        });
+        self.registry.get_mut("receivers").expect("receivers").push(merge(
+            core(&receiver_id, "AUD 1 in"),
+            json!({
+                "device_id": device_id, "transport": MCAST, "interface_bindings": ["eth0"],
+                "subscription": {"sender_id": null, "active": false}, "format": AUDIO, "caps": caps,
+            }),
+        ));
+        let interfaces = ["192.168.10.61".to_string()];
+        self.receivers.insert(receiver_id.clone(), Endpoint::idle_receiver(&interfaces, constraints(&interfaces)));
+        let surround = ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs"];
+        let free = json!({"reordering": true, "block_size": 1});
+        let io = json!({
+            "inputs": {
+                "network": {
+                    "properties": {"name": "Network", "description": "What AUD 1 in receives"},
+                    "parent": {"id": receiver_id, "type": "receiver"},
+                    "channels": mapping::channels(&surround), "caps": free,
+                },
+                "tone": {
+                    "properties": {"name": "Tone", "description": "Line-up tone at -18 dBFS"},
+                    "parent": {"id": null, "type": null},
+                    "channels": mapping::channels(&["L", "R"]), "caps": free,
+                },
+            },
+            "outputs": {
+                "monitor": {
+                    "properties": {"name": "Monitor", "description": "The loudspeakers"}, "source_id": null,
+                    "channels": mapping::channels(&["L", "R"]), "caps": {"routable_inputs": null},
+                },
+                "program": {
+                    "properties": {"name": "Program", "description": "The 7.1 feed to the desk"}, "source_id": null,
+                    "channels": mapping::channels(&surround), "caps": {"routable_inputs": ["network", null]},
+                },
+            },
+        });
+        let mut map = ChannelMap::new(io).with("monitor", 0, "network", 0).with("monitor", 1, "network", 1);
+        for channel in 0..surround.len() {
+            map = map.with("program", channel, "network", channel);
+        }
+        self.maps.insert(n, map);
+        let device = self.registry.get_mut("devices").and_then(|d| d.iter_mut().find(|d| d["id"] == device_id));
+        if let Some(controls) = device.and_then(|d| d["controls"].as_array_mut()) {
+            controls.push(json!({
+                "href": format!("{base}/node/{n}/x-nmos/channelmapping/v1.0/"), "type": "urn:x-nmos:control:cm-ctrl/v1.0",
+            }));
+        }
+    }
+
     /// Each Sender's label, the stream it sends, and what it is told to send now, for
     /// [`super::signal::start`].
     pub(crate) fn streams(&self) -> Vec<(String, Description, Arc<Live>)> {
@@ -629,6 +706,26 @@ impl Facility {
             }
         };
         let path = request.path.trim_end_matches('/');
+        // `/node/<n>/x-nmos/channelmapping/...`: a Node's Channel Mapping API.
+        if let Some((n, rest)) = path
+            .strip_prefix("/node/")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(n, rest)| Some((n.parse::<u32>().ok()?, rest.strip_prefix("x-nmos/channelmapping")?)))
+            .filter(|(_, rest)| rest.is_empty() || rest.starts_with('/'))
+        {
+            let now = self.now();
+            let Some(map) = self.maps.get_mut(&n) else {
+                return Response::json(404, &error(404, "Not Found", "this Node has no Channel Mapping API").1);
+            };
+            let (status, body) = map.route(&request.method, rest, &body, now);
+            if map.take_changed() {
+                self.dirty = true;
+            }
+            return match status {
+                204 => Response { status, content_type: "application/json", headers: Vec::new(), body: Vec::new() },
+                _ => Response::json(status, &body),
+            };
+        }
         // `/node/<n>/x-nmos/connection/v1.1/...`: each Node's own Connection API.
         if let Some(rest) = path
             .strip_prefix("/node/")
@@ -696,6 +793,13 @@ impl Facility {
     /// have stopped sending heartbeats.
     pub(crate) fn settle(&mut self) {
         connection::settle(self);
+        let at = self.now();
+        for map in self.maps.values_mut() {
+            map.settle(at);
+            if map.take_changed() {
+                self.dirty = true;
+            }
+        }
         let now = Instant::now();
         let gone: Vec<String> =
             self.heard.iter().filter(|(_, at)| now.duration_since(**at) > EXPIRY).map(|(id, _)| id.clone()).collect();
@@ -844,19 +948,27 @@ impl Facility {
         }
     }
 
-    /// Each Sender's and Receiver's staged and active parameters, to keep for the next run.
+    /// Each Sender's and Receiver's staged and active parameters, and each channel map,
+    /// to keep for the next run.
     pub(crate) fn export(&self) -> Value {
         let kept = |map: &BTreeMap<String, Endpoint>| -> serde_json::Map<String, Value> {
             map.iter().map(|(id, r)| (id.clone(), json!({"staged": r.staged, "active": r.active}))).collect()
         };
-        json!({"receivers": kept(&self.receivers), "senders": kept(&self.senders)})
+        let maps: serde_json::Map<String, Value> = self.maps.iter().map(|(n, m)| (n.to_string(), m.export())).collect();
+        json!({"receivers": kept(&self.receivers), "senders": kept(&self.senders), "channel_maps": maps})
     }
 
-    /// Puts back what [`Facility::export`] kept: each Receiver takes what it took, and
-    /// each Sender sends where it sent. What was scheduled and not yet due is not
-    /// scheduled again.
+    /// Puts back what [`Facility::export`] kept: each Receiver takes what it took, each
+    /// Sender sends where it sent, and each channel map routes as it did. What was
+    /// scheduled and not yet due is not scheduled again.
     pub(crate) fn restore(&mut self, kept: &Value) {
         let now = self.now();
+        for (n, map) in &mut self.maps {
+            if let Some(saved) = kept["channel_maps"].get(n.to_string()) {
+                map.restore(saved);
+                map.take_changed();
+            }
+        }
         for side in [Side::Sender, Side::Receiver] {
             let ids: Vec<String> = self.endpoints(side).keys().cloned().collect();
             for id in ids {
@@ -1386,6 +1498,7 @@ mod tests {
         assert_eq!(fits["MON 1 video"], ["CAM 1 video", "CAM 2 video", "CAM 3 video", "CAM 4 video"]);
         assert_eq!(fits["MON 4 video"], ["GFX 1 video"]);
         assert_eq!(fits["MON 3 audio"].len(), 4);
+        assert_eq!(fits["AUD 1 in"], ["CAM 1 audio", "CAM 2 audio", "CAM 3 audio", "CAM 4 audio"]);
         let current: Vec<&str> = matrix
             .receivers
             .iter()

@@ -2985,6 +2985,31 @@ section.details .ds-disclosure { margin-top: var(--ds-space-2); }
    rest, so only its armed press is drawn red. */
 .sending .ds-btn[data-armed='true'] { background: var(--bad); border-color: var(--bad); color: var(--ds-bad-on); }
 .sending .result.bad { color: var(--bad-ink); }
+/* Channel maps (IS-08): a crosspoint grid for each of a Device's outputs, its
+   channels down the side and the inputs' channels across, drawn with the
+   grid's own cells and states: taking now green with a dot, armed amber with
+   a diamond, cannot take hatched. An output a waiting activation will change
+   is locked, as the design system draws it: no fill, the dot still in ink,
+   and a padlock and words on its heading. The open Device's button is drawn
+   selected, and carries a count of its armed channels. */
+section.maps { margin: var(--ds-space-3) var(--ds-space-4); }
+.map-devices { display: flex; flex-wrap: wrap; gap: var(--ds-space-2); }
+.map-devices .ds-btn[aria-expanded="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
+section.maps section.details { margin: var(--ds-space-3) 0 0; }
+section.details h3.map-output { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-1) var(--ds-space-2); margin: var(--ds-space-4) 0 var(--ds-space-2); }
+h3.map-output small { color: var(--dim); font: var(--ds-text-caption); letter-spacing: normal; text-transform: none; }
+.map-wrap { display: inline-block; max-width: 100%; overflow: auto; border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-panel); background: var(--panel); }
+.map-wrap thead th.corner { min-width: 0; }
+th.in { padding: var(--ds-space-1) var(--ds-space-2) var(--ds-space-half); text-align: center; font: var(--ds-text-caption); font-weight: var(--ds-weight-semibold); border-left: var(--ds-space-hairline) solid var(--line); }
+th.in small, th.ch small, th.dst small.ch-label { display: block; color: var(--dim); font: var(--ds-text-caption); font-weight: var(--ds-weight-regular); }
+th.ch { padding: var(--ds-space-half); text-align: center; font: var(--ds-text-caption); font-family: var(--ds-font-mono); min-width: var(--ds-size-control); }
+th.ch.silent { font-family: var(--ds-font-sans); vertical-align: bottom; }
+.cell button[data-locked="true"] { background: transparent; border-color: var(--line); color: var(--dim); cursor: not-allowed; }
+.cell button.live[data-locked="true"] { color: var(--text); border-color: var(--line-strong); }
+.map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ds-space-2) var(--ds-space-3); margin: var(--ds-space-4) 0 var(--ds-space-1); }
+.map-result { font: var(--ds-text-caption); }
+.map-result.bad, #map .line.bad { color: var(--bad-ink); }
+section.maps .ds-notice { margin: var(--ds-space-3) 0 0; }
 pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-space-hairline) solid var(--line); border-radius: var(--ds-radius-control); padding: var(--ds-space-2); overflow: auto; max-height: 260px; }
 /* Motion (the design system's motion.md): a notice, the open source's details
    and a new line in the log are small things arriving near where they were
@@ -3041,6 +3066,19 @@ pre.sdp { font: var(--ds-text-code); background: var(--bg); border: var(--ds-spa
   <span><i class="unfit"></i>cannot take (click for why)</span>
   <span><i class="armed"></i>armed for the salvo</span>
 </div>
+<section id="maps" class="maps" aria-labelledby="maps-head" hidden>
+  <div class="sources-head"><h2 class="label" id="maps-head">Channel maps</h2><small>Which input channel each output channel of a Device takes (IS-08)</small></div>
+  <div id="map-devices" class="map-devices"></div>
+  <section id="map" class="details" aria-label="The open Device's channel map" hidden>
+    <div id="map-body"></div>
+    <div class="map-actions">
+      <button id="map-take" class="ds-btn ds-btn--primary" disabled>Take changes</button>
+      <button id="map-clear" class="ds-btn" title="Release every armed channel (Esc)" disabled>Clear</button>
+      <span id="map-hint" class="hint"></span>
+    </div>
+    <div id="map-result" class="map-result" role="status"></div>
+  </section>
+</section>
 <section class="log" aria-live="polite">
   <h2 class="label">Connections</h2>
   <div id="log"><div class="empty">Nothing switched yet.</div></div>
@@ -3111,6 +3149,7 @@ function listen() {
     else if (m.type === "log") logEntry(m.entry);
     else if (m.type === "live" && live) { liveStatus = m.senders || {}; showLive(); }
     else if (m.type === "monitors") applyMonitors(m.monitors || {});
+    else if (m.type === "map" && m.device === mapOpen) readMap();
   };
   socket.onclose = () => {
     const was = socketOpen;
@@ -3293,6 +3332,8 @@ function render() {
   $("demo").hidden = !state.demo;
   $("group-switch").hidden = !state.receivers.some((r) => r.group);
   renderLevels();
+  renderMapDevices();
+  renderMap();
   const shown = (format) => level === "all" || format === level;
   // Grouped by format, video first, and in label order within each, as the registry lists them.
   const rank = (format) => { const i = formats().indexOf(format); return i < 0 ? 99 : i; };
@@ -3995,6 +4036,334 @@ function showDetailsLive() {
   box.replaceChildren(facts(pairs), ...(notes.length ? [el("ul", {}, ...notes)] : []));
 }
 
+// Channel maps (IS-08): which input channel each output channel of a Device takes,
+// as its Channel Mapping API reads it back, drawn as a crosspoint grid for each
+// output. A click arms a change, whatever the mode above, and Take sends every
+// change armed on the Device in one activation, at once: a swap of two channels
+// must not leave both on one input between two clicks. An output that a waiting
+// activation will change is locked until then; cancelling that activation arms
+// first, as it undoes a change made elsewhere. The map is read again every 5
+// seconds while it is open, and at once when any page changes it. What is armed
+// stays, for each Device, while the page is open.
+let mapOpen = null;          // the id of the Device whose map is open
+let mapRead = null;          // what /api/map last answered for it
+let mapShown = "";           // what the map was last drawn from, to draw it again only on a change
+let mapError = null;         // why it could not be read last time
+let mapTaking = false;       // a change is on its way
+let mapArm = null;           // the armed Cancel button and its timer
+const mapArmed = new Map();  // device id -> "output/channel" -> the route armed for it
+
+function armedOf(device) {
+  if (!mapArmed.has(device)) mapArmed.set(device, new Map());
+  return mapArmed.get(device);
+}
+
+function clock(ms) { return new Date(ms).toLocaleTimeString(); }
+
+// A TAI time as IS-08 writes it, <seconds>:<nanoseconds>, as a time of day here.
+function taiClock(time) {
+  if (!time || !mapRead) return null;
+  const [s, ns] = String(time).split(":").map(Number);
+  return Number.isFinite(s) ? clock((s - (mapRead.tai_utc || 0)) * 1000 + (ns || 0) / 1e6) : null;
+}
+
+function renderMapDevices() {
+  const devices = (state && state.channel_maps) || [];
+  $("maps").hidden = !devices.length;
+  if (mapOpen && state && !devices.some((d) => d.id === mapOpen)) { mapOpen = null; mapRead = null; }
+  const box = $("map-devices");
+  const focused = box.contains(document.activeElement) ? document.activeElement.dataset.device : null;
+  box.replaceChildren(...devices.map((d) => {
+    const count = armedOf(d.id).size;
+    const label = d.label || d.id.slice(0, 8);
+    const where = d.node && d.node !== d.label ? ` on ${d.node}` : "";
+    const open = mapOpen === d.id;
+    const b = el("button", {
+      class: "ds-btn", "aria-expanded": String(open), "aria-controls": "map", "data-device": d.id,
+      title: open ? `Close the channel map of ${label}` : `Show which input channel each output of ${label}${where} takes, and change them`,
+      onclick: () => openMap(d.id),
+    }, el("span", { text: label }));
+    if (count) b.append(el("span", { class: "ds-badge ds-badge--warn", "aria-hidden": "true", text: String(count) }),
+      el("span", { class: "ds-visually-hidden", text: `, ${count} armed` }));
+    return b;
+  }));
+  if (focused) { const again = box.querySelector(`[data-device="${CSS.escape(focused)}"]`); if (again) again.focus(); }
+}
+
+async function openMap(id) {
+  disarmMap();
+  sayMap("");
+  if (mapOpen === id) { mapOpen = null; mapRead = null; mapError = null; renderMapDevices(); renderMap(); return; }
+  mapOpen = id;
+  mapRead = null;
+  mapError = null;
+  renderMapDevices();
+  renderMap();
+  await readMap();
+}
+
+async function readMap() {
+  const id = mapOpen;
+  if (!id || mapTaking) return;
+  try {
+    const answer = await call(`/api/map?device=${encodeURIComponent(id)}`);
+    if (mapOpen !== id) return;
+    mapRead = answer;
+    mapError = null;
+  } catch (e) {
+    // What was last read stays, said to be as it was then.
+    if (mapOpen !== id) return;
+    mapError = e.message;
+  }
+  renderMap();
+}
+
+function sayMap(text, bad) {
+  $("map-result").className = bad ? "map-result bad" : "map-result";
+  $("map-result").textContent = text;
+}
+
+// What each button says: what it does, how many, and with Check only, that it only checks.
+function renderMapActions() {
+  const n = mapOpen ? armedOf(mapOpen).size : 0;
+  const dry = $("dry").checked;
+  const take = $("map-take");
+  take.textContent = `${dry ? "Check" : "Take"} ${n ? n + " " : ""}${n === 1 ? "change" : "changes"}`;
+  take.disabled = !n && !mapTaking;
+  if (mapTaking) take.setAttribute("aria-busy", "true"); else take.removeAttribute("aria-busy");
+  take.title = !n ? "Click channels above to arm them first"
+    : dry ? "Check each armed channel against the Device's inputs and outputs, and change nothing"
+    : n === 1 ? "The channel changes at once" : `The ${n} channels change together, at once, in one activation`;
+  $("map-clear").disabled = !n || mapTaking;
+  $("map-hint").textContent = dry ? "Arm channels, then Check: nothing changes" : "Click channels to arm them, then Take: they change together";
+}
+
+function nameOf(id, io) { return (io && io.properties && io.properties.name) || id; }
+
+function renderMap() {
+  const box = $("map");
+  box.hidden = !mapOpen;
+  renderMapActions();
+  if (!mapOpen) { mapShown = ""; return; }
+  const device = ((state && state.channel_maps) || []).find((d) => d.id === mapOpen) || { id: mapOpen };
+  const label = device.label || device.id.slice(0, 8);
+  const status = mapRead
+    ? (mapError ? `Cannot read it now (${mapError}); this is how it was at ${clock(mapRead.read_at)}. Trying again every 5 seconds.`
+      : `As its Channel Mapping API read it back at ${clock(mapRead.read_at)}; read again every 5 seconds`)
+    : (mapError ? `Cannot read its channel map: ${mapError}. Trying again every 5 seconds.` : "Reading its channel map…");
+  const drawn = JSON.stringify([label, mapRead && [mapRead.io, mapRead.active, mapRead.pending, mapRead.pending_error],
+    [...armedOf(mapOpen)], mapTaking, $("dry").checked, state && state.receivers.map((r) => [r.id, r.label])]);
+  if (drawn === mapShown && $("map-status")) {
+    // Only the time it was read has changed: the grid stays as it is, and keeps focus.
+    $("map-status").className = mapError ? "line bad" : "line";
+    $("map-status").textContent = status;
+    return;
+  }
+  mapShown = drawn;
+  disarmMap();
+  const focused = $("map-body").contains(document.activeElement) ? document.activeElement.dataset.key : null;
+  const parts = [
+    el("div", { class: "details-head" }, el("h2", { text: label }), el("span", { class: "spacer" }),
+      el("button", { class: "ds-btn", text: "Close", "data-key": "close", onclick: () => openMap(mapOpen) })),
+    el("div", { id: "map-status", class: mapError ? "line bad" : "line", text: status }),
+  ];
+  if (mapRead) {
+    const io = mapRead.io || {}, map = (mapRead.active && mapRead.active.map) || {};
+    const byName = (side) => Object.entries(io[side] || {}).sort(([a, x], [b, y]) => nameOf(a, x).localeCompare(nameOf(b, y)));
+    const inputs = byName("inputs"), outputs = byName("outputs");
+    // The outputs a waiting activation will change: locked to any other change until then.
+    const locks = new Map();
+    for (const [id, p] of Object.entries(mapRead.pending || {})) {
+      for (const output of Object.keys((p && p.action) || {})) {
+        if (!locks.has(output)) locks.set(output, { id, at: taiClock(p.activation && p.activation.activation_time) });
+      }
+    }
+    if (locks.size) parts.push(waitingNotice(io));
+    if (mapRead.pending_error) parts.push(el("div", { class: "line bad", text: `Cannot read the activations waiting on it (${mapRead.pending_error}), so which outputs are locked is not known.` }));
+    if (!outputs.length) parts.push(el("div", { class: "line", text: "It lists no outputs, so there is nothing to route." }));
+    for (const [id, output] of outputs) parts.push(...outputGrid(id, output, inputs, map[id] || {}, locks.get(id)));
+  }
+  $("map-body").replaceChildren(...parts);
+  if (focused) {
+    const again = [...$("map-body").querySelectorAll("[data-key]")].find((n) => n.dataset.key === focused);
+    if (again) again.focus();
+  }
+}
+
+// The activations waiting on the Device, and the one way out of the lock: cancel them.
+function waitingNotice(io) {
+  const entries = Object.entries(mapRead.pending || {});
+  const changes = (p) => Object.keys((p && p.action) || {}).map((o) => nameOf(o, (io.outputs || {})[o]));
+  const lines = entries.map(([id, p]) => {
+    const at = taiClock(p.activation && p.activation.activation_time);
+    return `Activation ${id} changes ${changes(p).join(" and ")}${at ? " at " + at : ""}.`;
+  });
+  const names = [...new Set(entries.flatMap(([, p]) => changes(p)))];
+  const n = entries.length;
+  const dry = $("dry").checked;
+  const cancel = el("button", { class: "ds-btn ds-btn--danger", type: "button", "data-key": "cancel" },
+    el("span", { text: dry ? "Check cancelling" : n > 1 ? `Cancel ${n} activations` : "Cancel the activation" }));
+  armMap(cancel, `Cancel ${n > 1 ? n + " activations" : "activation " + entries[0][0]}? ${names.join(" and ")} stay${names.length === 1 ? "s" : ""} as now`, () => cancelMap(cancel));
+  return el("div", { class: "ds-notice ds-notice--warn" },
+    el("div", { class: "ds-notice__body" },
+      el("div", { class: "ds-notice__title", text: n > 1 ? `${n} activations are waiting` : "An activation is waiting" }),
+      el("div", { text: `${lines.join(" ")} It was scheduled from outside this page. Until it takes effect, ${names.join(" and ")} ${names.length === 1 ? "is" : "are"} locked and any other change to ${names.length === 1 ? "it" : "them"} is refused; cancel it to change ${names.length === 1 ? "it" : "them"} now.` })),
+    el("div", { class: "ds-notice__actions" }, cancel));
+}
+
+// One output's grid: its channels down the side, each input's channels across, and
+// silence last.
+function outputGrid(id, output, inputs, routes, lock) {
+  const name = nameOf(id, output);
+  const channels = output.channels || [];
+  const routable = output.caps && Array.isArray(output.caps.routable_inputs) ? output.caps.routable_inputs : null;
+  const takes = (input) => !routable || routable.includes(input);
+  const only = routable ? routable.filter((r) => r !== null).map((r) => nameOf(r, inputs.find(([i]) => i === r)?.[1])) : [];
+  const armed = armedOf(mapOpen);
+  const lockText = lock ? `${name} is locked: activation ${lock.id} changes it${lock.at ? " at " + lock.at : ""}. Cancel the activation above to change it now.` : "";
+  const facts = [output.properties && output.properties.description, `${channels.length} channel${channels.length === 1 ? "" : "s"}`,
+    lock ? `locked until ${lock.at || "activation " + lock.id}` : null].filter(Boolean).join(" · ");
+  const heading = el("h3", { class: "map-output" },
+    lock ? el("span", { class: "ds-lock", "aria-hidden": "true" }) : null, el("span", { class: "label", text: name }), el("small", { text: facts }));
+  const across = inputs.reduce((n, [, input]) => n + (input.channels || []).length, 0);
+  const top = el("tr", {}, el("th", { class: "corner", rowspan: "2", text: `${channels.length} × ${across}` }));
+  const sub = el("tr");
+  for (const [inputId, input] of inputs) {
+    const parent = input.parent && input.parent.type === "receiver" && state ? state.receivers.find((r) => r.id === input.parent.id) : null;
+    const fed = parent ? parent.label || parent.id.slice(0, 8) : null;
+    const count = (input.channels || []).length;
+    top.append(el("th", { class: "in", colspan: String(Math.max(count, 1)),
+      title: [nameOf(inputId, input), input.properties && input.properties.description, fed ? `Fed by receiver ${fed}` : null,
+        takes(inputId) ? null : `${name} cannot take it`].filter(Boolean).join("\n") },
+      el("span", { text: nameOf(inputId, input) }), fed ? el("small", { text: fed }) : null));
+    (input.channels || []).forEach((ch, i) => sub.append(el("th", { class: "ch", title: `${nameOf(inputId, input)} channel ${i + 1}${ch.label ? ": " + ch.label : ""}` },
+      el("span", { text: String(i + 1) }), ch.label && ch.label !== String(i + 1) ? el("small", { text: ch.label }) : null)));
+  }
+  top.append(el("th", { class: "ch silent", rowspan: "2", title: "No input: the channel is silent" }, el("span", { text: "Silent" })));
+  const body = el("tbody");
+  channels.forEach((ch, index) => {
+    const key = `${id}/${index}`;
+    const now = routes[String(index)] || { input: null, channel_index: null };
+    const want = armed.get(key);
+    const row = `${name} ${index + 1}${ch.label ? " (" + ch.label + ")" : ""}`;
+    const tr = el("tr", {}, el("th", { class: "dst", title: `${name} channel ${index + 1}${ch.label ? ": " + ch.label : ""}` },
+      String(index + 1), ch.label ? el("small", { class: "ch-label", text: ch.label }) : null));
+    const cell = (inputId, inputChannel, inputName, from) => {
+      const isNow = inputId === null ? now.input == null : now.input === inputId && now.channel_index === inputChannel;
+      const isArmed = !!want && want.input === inputId && want.input_channel === inputChannel;
+      const fits = takes(inputId);
+      let label = inputId === null
+        ? (isArmed ? `${row} silent, armed: click to release` : `Arm ${row} to be silent`)
+        : (isArmed ? `${row} from ${from}, armed: click to release` : `Arm ${row} to take ${from}`);
+      let why = null;
+      if (isNow) label = inputId === null ? `${row} is silent now` : `${row} takes ${from} now`;
+      if (isNow && want) label += ": click to release what is armed for it";
+      if (lock) { why = lockText; label = isNow ? `${label}. ${lockText}` : lockText; }
+      else if (!isNow && !fits) {
+        why = `${name} cannot ${inputId === null ? "be silent" : "take " + inputName}: it takes only ${only.join(" or ") || "the inputs it lists"}${routable.includes(null) ? ", or silence" : ""}.`;
+        label = `${name} cannot ${inputId === null ? "be silent" : "take " + from}: click for why`;
+      }
+      const b = el("button", { "aria-label": label, title: label, "data-key": `${key}/${inputId ?? "-"}/${inputChannel ?? ""}` });
+      if (isNow) b.className = "live"; else if (!fits && !lock) b.className = "unfit";
+      if (lock) { b.setAttribute("aria-disabled", "true"); b.dataset.locked = "true"; }
+      else if (!isNow && fits) b.setAttribute("aria-pressed", String(isArmed));
+      if (isArmed) { b.dataset.armed = "true"; if (mapTaking) b.setAttribute("aria-busy", "true"); }
+      b.addEventListener("click", () => {
+        if (mapTaking) return;
+        if (why) { sayMap(why, false); return; }
+        if (isNow) { if (want) { armed.delete(key); sayMap(""); renderMapDevices(); renderMap(); } return; }
+        if (isArmed) armed.delete(key);
+        else armed.set(key, { output: id, channel: index, input: inputId, input_channel: inputChannel });
+        sayMap("");
+        renderMapDevices();
+        renderMap();
+      });
+      return el("td", { class: "cell" }, b);
+    };
+    for (const [inputId, input] of inputs) {
+      const inputName = nameOf(inputId, input);
+      (input.channels || []).forEach((c, i) => tr.append(cell(inputId, i, inputName, `${inputName} channel ${i + 1}${c.label ? " (" + c.label + ")" : ""}`)));
+    }
+    tr.append(cell(null, null, null, "silence"));
+    body.append(tr);
+  });
+  const table = el("table", { "aria-label": `${name}: which input channel each of its channels takes` }, el("thead", {}, top, sub), body);
+  return [heading, el("div", { class: "map-wrap" }, table)];
+}
+
+// The Cancel button arms first: it undoes a change someone else scheduled. The next
+// press within the arm time cancels; leaving it, Escape or the timer lets it go.
+function armMap(button, armedText, act) {
+  button.addEventListener("click", () => {
+    if (mapTaking) return;
+    if (!$("dry").checked && !button.dataset.armed) {
+      disarmMap();
+      button.dataset.armed = "true";
+      button.dataset.was = button.firstChild.textContent;
+      button.firstChild.textContent = armedText;
+      mapArm = { button, timer: setTimeout(disarmMap, ARM_MS) };
+      return;
+    }
+    disarmMap();
+    act();
+  });
+  button.addEventListener("blur", () => { if (mapArm && mapArm.button === button) disarmMap(); });
+  button.addEventListener("keydown", (e) => { if (e.key === "Escape" && mapArm && mapArm.button === button) { e.stopPropagation(); disarmMap(); } });
+}
+
+function disarmMap() {
+  if (!mapArm) return;
+  clearTimeout(mapArm.timer);
+  const { button } = mapArm;
+  mapArm = null;
+  button.removeAttribute("data-armed");
+  button.firstChild.textContent = button.dataset.was;
+}
+
+// Sends what is armed on the open Device, or a cancel, and says what became of it
+// under the grid and in the log. What is armed stays when it fails, to try again.
+async function sendMap(body, button) {
+  const device = mapOpen;
+  if (!device || mapTaking) return;
+  const dry = $("dry").checked;
+  mapTaking = true;
+  if (button) button.setAttribute("aria-busy", "true");
+  sayMap("");
+  renderMap();
+  try {
+    const outcome = await call("/api/map", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device, ...body, dry_run: dry }),
+    });
+    logEntry({ id: outcome.log_id, at: Date.now(), dry_run: outcome.dry_run, succeeded: outcome.succeeded, connections: outcome.connections });
+    if (outcome.succeeded && !dry && body.routes) armedOf(device).clear();
+    const said = [outcome.describe, ...outcome.problems, ...outcome.warnings, ...outcome.notes].join(". ");
+    sayMap((dry ? "Check only: " : "") + said, !outcome.succeeded);
+  } catch (e) {
+    sayMap(e.unreachable ? `${e.message} Its map shows here once the router answers.` : `Nothing was changed: ${e.message}`, true);
+  } finally {
+    mapTaking = false;
+    if (button) button.removeAttribute("aria-busy");
+    renderMapDevices();
+    renderMap();
+    await readMap();
+  }
+}
+
+function takeMap() {
+  const armed = mapOpen ? armedOf(mapOpen) : new Map();
+  if (armed.size) sendMap({ routes: [...armed.values()] }, null);
+}
+
+function cancelMap(button) { sendMap({ cancel: true }, button); }
+
+$("map-take").onclick = takeMap;
+$("map-clear").onclick = () => { if (mapOpen) armedOf(mapOpen).clear(); sayMap(""); renderMapDevices(); renderMap(); };
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && mapOpen && armedOf(mapOpen).size && !mapTaking) { armedOf(mapOpen).clear(); renderMapDevices(); renderMap(); }
+});
+setInterval(() => { if (mapOpen && !document.hidden) readMap(); }, 5000);
+
 $("live").onchange = () => {
   try { localStorage.setItem("st2110-router-live", $("live").checked ? "1" : "0"); } catch (_) { /* not kept */ }
   setLive($("live").checked);
@@ -4002,7 +4371,7 @@ $("live").onchange = () => {
 setInterval(watch, 3000);
 setInterval(poll, 500);
 
-$("dry").onchange = () => { disarmSend(); renderSalvo(); render(); sendLabels(); };
+$("dry").onchange = () => { disarmSend(); disarmMap(); renderSalvo(); render(); sendLabels(); };
 // Off until turned on, and then kept in this browser: it reaches more outputs than the one clicked.
 try { $("group").checked = localStorage.getItem("st2110-router-group") === "on"; } catch (_) { /* not kept */ }
 $("group").onchange = () => {

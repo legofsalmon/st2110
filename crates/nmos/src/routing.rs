@@ -257,6 +257,27 @@ pub fn find_device(snapshot: &Snapshot, selector: &str) -> Result<DeviceEndpoint
     })
 }
 
+/// Every Device with an `id` that advertises an IS-08 Channel Mapping API, as a
+/// controller lists them: in label order.
+pub fn mapping_devices(snapshot: &Snapshot) -> Vec<DeviceEndpoint> {
+    let model = Model::read(snapshot);
+    let mut devices: Vec<DeviceEndpoint> = model
+        .devices
+        .iter()
+        .filter_map(|device| {
+            let api = control_apis(device, CM_CTRL, "/x-nmos/channelmapping").into_iter().next()?;
+            Some(DeviceEndpoint {
+                id: device.core.id?.to_string(),
+                label: device.core.label.to_string(),
+                node: model.node(device.node_id.unwrap_or_default()).map(|n| n.core.label.to_string()),
+                channel_mapping: Some(api),
+            })
+        })
+        .collect();
+    devices.sort_by_cached_key(|d| (d.label.to_lowercase(), d.id.clone()));
+    devices
+}
+
 /// A Sender's or Receiver's IS-11 resources: what it is, its `id`, and its own base.
 #[cfg(feature = "client")]
 pub(crate) type ControlUrl = (Kind, String, String);

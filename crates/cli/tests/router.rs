@@ -136,7 +136,7 @@ fn serves_the_page_and_the_demo_registry() {
     let state = router.get("/api/state");
     assert_eq!(state["demo"], true);
     assert_eq!(state["senders"].as_array().unwrap().len(), 10);
-    assert_eq!(state["receivers"].as_array().unwrap().len(), 8);
+    assert_eq!(state["receivers"].as_array().unwrap().len(), 9);
     let routes = router.routes();
     assert_eq!(taking(&routes, "MON 1 video").as_deref(), Some("CAM 1 video"));
     assert_eq!(taking(&routes, "MON 3 video"), None);
@@ -345,6 +345,76 @@ fn previews_the_demo_streams_and_describes_them() {
 }
 
 #[test]
+fn reads_and_changes_a_devices_channel_map() {
+    let router = Router::start();
+    let state = router.get("/api/state");
+    let devices = state["channel_maps"].as_array().expect("channel maps");
+    assert_eq!(devices.len(), 1, "{devices:?}");
+    assert_eq!(devices[0]["label"], "Audio 1");
+    let device = devices[0]["id"].as_str().unwrap().to_string();
+
+    let map = router.get(&format!("/api/map?device={device}"));
+    assert_eq!(map["io"]["inputs"]["network"]["channels"].as_array().unwrap().len(), 8);
+    assert_eq!(map["active"]["map"]["monitor"]["1"], json!({"input": "network", "channel_index": 1}));
+    assert_eq!(map["pending"], json!({}));
+
+    // Monitor takes the tone on its left and is silent on its right, in one activation.
+    let change = json!({"device": device, "routes": [
+        {"output": "monitor", "channel": 0, "input": "tone", "input_channel": 0},
+        {"output": "monitor", "channel": 1, "input": null},
+    ]});
+    let (status, done) = router.post("/api/map", &change);
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["succeeded"], true, "{done:#}");
+    assert_eq!(done["describe"], "device \"Audio 1\" (de71000b) map, Monitor 1 ← Tone 1, Monitor 2 silent: done");
+    let map = router.get(&format!("/api/map?device={device}"));
+    assert_eq!(map["active"]["map"]["monitor"]["0"], json!({"input": "tone", "channel_index": 0}));
+    assert_eq!(map["active"]["map"]["monitor"]["1"], json!({"input": null, "channel_index": null}));
+
+    // Program takes only the Receiver's channels: refused, and nothing sent.
+    let (_, refused) = router.post(
+        "/api/map",
+        &json!({"device": "Audio 1", "routes": [{"output": "program", "channel": 0, "input": "tone", "input_channel": 0}]}),
+    );
+    assert_eq!(refused["state"], "refused", "{refused:#}");
+    assert!(refused["problems"][0].as_str().unwrap().contains("routable_inputs"), "{refused:#}");
+
+    // An activation scheduled elsewhere locks Monitor until it is cancelled.
+    let api = map["device"]["href"].as_str().unwrap().strip_prefix(&format!("http://{}", router.address)).unwrap();
+    let (status, scheduled) = router.post(
+        &format!("{api}map/activations"),
+        &json!({"activation": {"mode": "activate_scheduled_relative", "requested_time": "600:0"},
+                "action": {"monitor": {"1": {"input": "tone", "channel_index": 1}}}}),
+    );
+    assert_eq!(status, 202, "{scheduled}");
+    let map = router.get(&format!("/api/map?device={device}"));
+    assert_eq!(map["pending"].as_object().unwrap().len(), 1, "{map:#}");
+    let (_, locked) = router.post("/api/map", &change);
+    assert_eq!(locked["state"], "failed", "{locked:#}");
+    assert!(locked["problems"][0].as_str().unwrap().contains("HTTP 423"), "{locked:#}");
+    let (_, cancelled) = router.post("/api/map", &json!({"device": device, "cancel": true}));
+    assert_eq!(cancelled["succeeded"], true, "{cancelled:#}");
+    assert_eq!(router.get(&format!("/api/map?device={device}"))["pending"], json!({}));
+
+    // A check changes nothing; each change, refusal and cancel is in the log.
+    let back = json!({"device": device, "dry_run": true, "routes": [{"output": "monitor", "channel": 0, "input": "network", "input_channel": 0}]});
+    let (_, checked) = router.post("/api/map", &back);
+    assert_eq!(checked["state"], "planned", "{checked:#}");
+    assert_eq!(router.get(&format!("/api/map?device={device}"))["active"]["map"]["monitor"]["0"]["input"], "tone");
+    assert_eq!(router.get("/api/log")["log"].as_array().unwrap().len(), 5);
+
+    // Only from the router's own page, and only what makes sense.
+    let headers = [("Content-Type", "application/json"), ("Origin", "http://evil.example")];
+    assert_eq!(router.request("POST", "/api/map", &headers, &change.to_string()).0, 403);
+    let (status, _) = router.post("/api/map", &json!({"device": device}));
+    assert_eq!(status, 400);
+    let (status, _) = router
+        .post("/api/map", &json!({"device": device, "routes": [{"output": "monitor", "channel": 0, "input": "tone"}]}));
+    assert_eq!(status, 400);
+    assert_eq!(router.request("GET", "/api/map?device=nothing", &[], "").0, 404);
+}
+
+#[test]
 fn takes_connections_only_from_its_own_page() {
     let router = Router::start();
     let body = json!({"routes": [{"receiver": "MON 3 video", "sender": "CAM 2 video"}]}).to_string();
@@ -464,7 +534,7 @@ fn the_demo_registry_pushes_its_changes_to_subscriptions() {
     socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let sync: Value = serde_json::from_str(&socket.read().unwrap().unwrap()).unwrap();
     assert_eq!(sync["grain"]["topic"], "/receivers/");
-    assert_eq!(sync["grain"]["data"].as_array().unwrap().len(), 8);
+    assert_eq!(sync["grain"]["data"].as_array().unwrap().len(), 9);
     router.take(json!([{"receiver": "MON 3 audio", "sender": "CAM 3 audio"}]));
     let change: Value = serde_json::from_str(&socket.read().unwrap().unwrap()).unwrap();
     let data = &change["grain"]["data"][0];
