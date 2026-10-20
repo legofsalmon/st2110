@@ -385,17 +385,60 @@ impl AncEngine {
     }
 }
 
-/// ST 2110-31 AES3: the header and the AM824 subframes.
+/// AES3 frames in a block, over which the channel status runs, one bit a frame.
+const BLOCK_FRAMES: usize = 192;
+
+/// The AM824 block start and channel status bits.
+const AM824_B: u8 = 0x20;
+const AM824_C: u8 = 0x04;
+
+/// Where one AES3 signal's frames are in its block, once a B bit has said, and the
+/// channel status each of its two subframes has brought so far.
+#[derive(Clone, Default)]
+struct Aes3Signal {
+    frame: Option<usize>,
+    status: [[u8; 24]; 2],
+}
+
+/// The AES3 channel status CRC (AES3-2-2009 §5): x⁸ + x⁴ + x³ + x² + 1 from all ones,
+/// over the bits in the order they are sent, least significant first.
+fn status_crc(bytes: &[u8]) -> u8 {
+    let mut crc = 0xFFu8;
+    for &byte in bytes {
+        crc ^= byte;
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xB8 } else { crc >> 1 };
+        }
+    }
+    crc
+}
+
+/// ST 2110-31 AES3: the header, the AM824 subframes, their parity, and each signal's
+/// 192-frame blocks of channel status.
 pub(crate) struct Am824Engine {
     channels: Option<usize>,
     header: Problems,
     subframes: Problems,
+    parity: Problems,
+    blocks: Problems,
+    status: Problems,
+    signals: Vec<Aes3Signal>,
+    last_seq: Option<u32>,
 }
 
 impl Am824Engine {
     fn new(channels: Option<u16>) -> Self {
         let channels = channels.map(usize::from).filter(|&n| n > 0 && n % 2 == 0);
-        Self { channels, header: Problems::default(), subframes: Problems::default() }
+        Self {
+            channels,
+            header: Problems::default(),
+            subframes: Problems::default(),
+            parity: Problems::default(),
+            blocks: Problems::default(),
+            status: Problems::default(),
+            signals: vec![Aes3Signal::default(); channels.unwrap_or(0) / 2],
+            last_seq: None,
+        }
     }
 
     fn push(&mut self, p: &Packet<'_>) {
@@ -406,6 +449,12 @@ impl Am824Engine {
                 (false, n) => format!("the CSRC count is {n}"),
                 (true, n) => format!("the marker bit is set and the CSRC count is {n}"),
             });
+        }
+        // A loss leaves each signal's place in its block unknown until its next B bit.
+        if self.last_seq.replace(p.seq).is_some_and(|last| p.seq != last.wrapping_add(1)) {
+            for signal in &mut self.signals {
+                signal.frame = None;
+            }
         }
         // A payload that is not whole sample periods is the channel count's finding.
         let Some(channels) = self.channels else { return };
@@ -437,7 +486,86 @@ impl Am824Engine {
                         channel / 2 + 1
                     )
                 });
+                for signal in &mut self.signals {
+                    signal.frame = None;
+                }
                 return;
+            }
+        }
+        self.aes3_bits(p, channels);
+    }
+
+    /// The parity of each subframe, and each signal's blocks: a B bit every 192 frames,
+    /// and the channel status they carry, checked by its CRC.
+    fn aes3_bits(&mut self, p: &Packet<'_>, channels: usize) {
+        let mut parity = None;
+        let mut block = None;
+        let mut status = None;
+        for (sample, frames) in p.payload.chunks_exact(4 * channels).enumerate() {
+            let subframes = frames.as_chunks::<4>().0;
+            for (channel, subframe) in subframes.iter().enumerate() {
+                // P evens out time slots 4 to 31: the audio and the V, U, C and P bits.
+                if parity.is_none() && !(u32::from_be_bytes(*subframe) & 0x0FFF_FFFF).count_ones().is_multiple_of(2) {
+                    parity = Some(format!(
+                        "subframe {} of AES3 signal {} in sample period {} has odd parity",
+                        channel % 2 + 1,
+                        channel / 2 + 1,
+                        sample + 1
+                    ));
+                }
+            }
+            for (s, signal) in self.signals.iter_mut().enumerate() {
+                let pair = [subframes[2 * s][0], subframes[2 * s + 1][0]];
+                let started = pair[0] & AM824_B != 0;
+                match (signal.frame, started) {
+                    (Some(k), true) if k != 0 => {
+                        block.get_or_insert_with(|| {
+                            format!("AES3 signal {} had a B bit {k} frames into its block", s + 1)
+                        });
+                    }
+                    (Some(0), false) => {
+                        block.get_or_insert_with(|| {
+                            format!("AES3 signal {} had no B bit 192 frames after the last", s + 1)
+                        });
+                        signal.frame = None;
+                        continue;
+                    }
+                    (None, false) => continue,
+                    _ => {}
+                }
+                let k = if started { 0 } else { signal.frame.unwrap_or(0) };
+                if k == 0 {
+                    signal.status = [[0; 24]; 2];
+                }
+                for (bits, flags) in signal.status.iter_mut().zip(pair) {
+                    if flags & AM824_C != 0 {
+                        bits[k / 8] |= 1 << (k % 8);
+                    }
+                }
+                if k + 1 < BLOCK_FRAMES {
+                    signal.frame = Some(k + 1);
+                    continue;
+                }
+                signal.frame = Some(0);
+                for (sub, bits) in signal.status.iter().enumerate() {
+                    // Professional use ends with a CRC; a minimum implementation sends 0.
+                    if bits[0] & 1 == 1 && bits[23] != 0 && status_crc(&bits[..23]) != bits[23] {
+                        status.get_or_insert_with(|| {
+                            format!(
+                                "subframe {} of AES3 signal {} sent channel status whose CRC is {:#04X}, not {:#04X}",
+                                sub + 1,
+                                s + 1,
+                                bits[23],
+                                status_crc(&bits[..23])
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        for (problems, problem) in [(&mut self.parity, parity), (&mut self.blocks, block), (&mut self.status, status)] {
+            if let Some(problem) = problem {
+                problems.hit(p.t, || problem);
             }
         }
     }
@@ -447,7 +575,15 @@ impl Am824Engine {
             self.header.finding(&rules::AM824_HEADER, flow, timeline, "had RTP headers ST 2110-31 does not allow");
         let subframes =
             self.subframes.finding(&rules::AM824_SUBFRAME, flow, timeline, "had AM824 subframes out of AES3 framing");
-        header.into_iter().chain(subframes).collect()
+        let parity = self.parity.finding(&rules::AM824_PARITY, flow, timeline, "had AM824 subframes with odd parity");
+        let blocks = self.blocks.finding(&rules::AM824_BLOCK, flow, timeline, "broke an AES3 signal's 192-frame block");
+        let status = self.status.finding(
+            &rules::AM824_STATUS,
+            flow,
+            timeline,
+            "ended a block of channel status with a wrong CRC",
+        );
+        [header, subframes, parity, blocks, status].into_iter().flatten().collect()
     }
 }
 
@@ -547,6 +683,7 @@ pub(crate) struct TtmlEngine {
     documents: u64,
     payload: Problems,
     document: Problems,
+    keepalive: Problems,
     lost: Tally,
 }
 
@@ -586,8 +723,17 @@ impl TtmlEngine {
             self.resync = !h.marker;
             return;
         }
-        // A keep-alive, between documents (ST 2110-43:2021 §4.3).
-        if length == 0 && h.marker && self.open.is_none() {
+        // A keep-alive, between documents (ST 2110-43:2021 §4.3). One anywhere else is
+        // left out too, and said.
+        if length == 0 {
+            if !h.marker || self.open.is_some() {
+                let (marker, open) = (h.marker, self.open.is_some());
+                self.keepalive.hit(p.t, || match (marker, open) {
+                    (false, false) => "an empty packet had its marker clear".into(),
+                    (false, true) => "an empty packet came partway through a document, with its marker clear".into(),
+                    _ => "an empty packet came partway through a document".into(),
+                });
+            }
             return;
         }
         match self.open {
@@ -613,6 +759,12 @@ impl TtmlEngine {
         let mut findings = Vec::new();
         findings.extend(self.payload.finding(&rules::TTML_PAYLOAD, flow, timeline, "had malformed payload headers"));
         findings.extend(self.document.finding(&rules::TTML_DOCUMENT, flow, timeline, "broke a document's framing"));
+        findings.extend(self.keepalive.finding(
+            &rules::TTML_KEEPALIVE,
+            flow,
+            timeline,
+            "came as keep-alives out of place",
+        ));
         if self.lost.count > 0 {
             let message = format!(
                 "{} lost a packet partway through, and so were lost whole; {} arrived whole. Documents that lost their first packets are not counted",
