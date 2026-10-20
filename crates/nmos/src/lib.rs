@@ -18,7 +18,8 @@
 //! Receiver a name refers to, its Device's IS-05 Connection API, and the crosspoint
 //! matrix of which Senders each Receiver can take. [`groups`] reads the BCP-002-01
 //! natural groups, such as a camera's video and audio, so a controller can take one as
-//! a whole.
+//! a whole. [`ncp`] holds the IS-12 control model, and the BCP-008 status monitors that
+//! say how each Receiver and Sender is doing.
 //!
 //! The `client` feature adds [`client::QueryClient`], which reads a snapshot from a
 //! live registry.
@@ -54,6 +55,8 @@ pub mod client;
 mod controls;
 pub mod groups;
 mod model;
+pub mod monitors;
+pub mod ncp;
 mod report;
 pub mod routing;
 pub mod rules;
@@ -64,7 +67,7 @@ pub mod ws;
 pub use check::check;
 pub use model::Kind;
 pub use report::{
-    ChannelMapView, ChannelRoute, Finding, Grandmaster, InterfaceView, NodeView, OutputMap, ReceiverView, Report,
-    ResourceRef, SenderView, Summary, SystemView,
+    ChannelMapView, ChannelRoute, Finding, Grandmaster, InterfaceView, MonitorView, NodeView, OutputMap, ReceiverView,
+    Report, ResourceRef, SenderView, Summary, SystemView,
 };
 pub use snapshot::{Manifest, Snapshot, System};

@@ -18,8 +18,14 @@
 //! destination, or stops and starts with `master_enable` ([`sending`]), and a Receiver
 //! receives what the transport file and parameters describe ([`receiving`]). The
 //! registry hears of each, as IS-04 asks.
+//!
+//! The Device also has an IS-12 control endpoint ([`ncp`]) with a BCP-008 status
+//! monitor of the Sender or Receiver ([`monitor`]), which `st2110 send` and `st2110
+//! receive` feed with what the stream does.
 
 pub(crate) mod connection;
+pub(crate) mod monitor;
+mod ncp;
 mod receiving;
 mod resources;
 mod sending;
@@ -128,13 +134,33 @@ struct Shared {
     state: Mutex<State>,
     /// Woken when the state changes, or the Node is to stop.
     wake: Condvar,
+    /// The controllers connected to the IS-12 endpoint.
+    sessions: ncp::Sessions,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Tells the IS-12 controllers what changed in the Device model.
+    fn notify(&self) {
+        let changes = {
+            let mut state = self.lock();
+            if !state.ncp.has_changes() {
+                return;
+            }
+            state.ncp.take_changes()
+        };
+        self.sessions.notify(&changes);
+    }
 }
+
+/// How often the monitor measures and reports.
+const MONITOR_TICK: Duration = Duration::from_millis(500);
+
+/// What a Sender's monitor reads its counts from.
+pub(crate) type Watch = Box<dyn FnMut() -> monitor::Observation + Send>;
 
 /// What the Node knows.
 struct State {
@@ -150,6 +176,12 @@ struct State {
     /// Whether the Sender or Receiver changed since it was last registered.
     changed: bool,
     stopping: bool,
+    /// The IS-12 Device model, with the monitor.
+    ncp: ncp::Model,
+    /// The addresses of the interfaces the stream uses, for the monitor's link status.
+    addresses: Vec<Ipv4Addr>,
+    /// Where a Sender's monitor reads its counts.
+    watch: Option<Watch>,
 }
 
 impl State {
@@ -184,6 +216,7 @@ impl Control for State {
             }),
             Side::Receiver => json!({"sender_id": active["sender_id"], "active": enabled}),
         };
+        self.ncp.monitor.activate(enabled, Instant::now());
         let resource = self.endpoint_resource();
         resource["subscription"] = subscription;
         resource["version"] = json!(tai(at));
@@ -336,6 +369,16 @@ impl Node {
             }
         }
         let side = role.side();
+        let sync = match &clock {
+            Some(Clock::Ptp { grandmaster, domain }) => {
+                monitor::Sync::ptp(&grandmaster.to_string().to_ascii_lowercase(), *domain)
+            }
+            _ => monitor::Sync::internal(),
+        };
+        let identity =
+            ncp::Identity { side, label: &label, device_id: &ids.device, endpoint_id: &ids.endpoint, hostname: &name };
+        let active = endpoint.active["master_enable"] == true;
+        let model = ncp::Model::new(&identity, &sync, active, Instant::now());
         let state = State {
             resources,
             side,
@@ -345,8 +388,12 @@ impl Node {
             tai_utc,
             changed: false,
             stopping: false,
+            ncp: model,
+            addresses: addresses.to_vec(),
+            watch: None,
         };
-        let shared = Arc::new(Shared { state: Mutex::new(state), wake: Condvar::new() });
+        let shared =
+            Arc::new(Shared { state: Mutex::new(state), wake: Condvar::new(), sessions: ncp::Sessions::default() });
         // The token, and the registry, are found before anything is served, so that
         // what goes wrong with them is said first.
         let mut auth = args.auth.clone();
@@ -358,9 +405,11 @@ impl Node {
         let finder = if registry.is_empty() { Finder::Look(args.auth.look.clone()) } else { Finder::Given(registry) };
         let api = format!("http://{host}:{port}/x-nmos/node/v1.3/");
         eprintln!(
-            "NMOS: {} {} at {api}, its Connection API at http://{host}:{port}/x-nmos/connection/{CONNECTION_VERSION}/",
+            "NMOS: {} {} at {api}, its Connection API at http://{host}:{port}/x-nmos/connection/{CONNECTION_VERSION}/, \
+             its IS-12 control at ws://{host}:{port}{}/",
             side.name(),
-            ids.endpoint
+            ids.endpoint,
+            ncp::PATH,
         );
         let served = shared.clone();
         thread::spawn(move || {
@@ -382,6 +431,16 @@ impl Node {
         })
     }
 
+    /// What the Receiver's stream did lately, for its monitor.
+    pub(crate) fn observe(&self, observation: monitor::Observation) {
+        self.shared.lock().ncp.monitor.observe(observation, Instant::now());
+    }
+
+    /// Where the Sender's monitor reads its counts, every half second.
+    pub(crate) fn watch(&self, watch: Watch) {
+        self.shared.lock().watch = Some(watch);
+    }
+
     /// Stops registering, and deletes the resources from the registry. Gives the
     /// registry's Registration API, when the Node was registered with one.
     pub(crate) fn finish(&mut self) -> Option<String> {
@@ -397,18 +456,40 @@ impl Drop for Node {
     }
 }
 
-/// Carries out scheduled activations when they are due, whether or not anything asks.
+/// Carries out scheduled activations when they are due, whether or not anything asks,
+/// and has the monitor measure and report every half second.
 fn tick(shared: &Shared) {
+    let mut measured = Instant::now();
     loop {
         thread::sleep(TICK);
-        let mut state = shared.lock();
-        if state.stopping {
-            return;
+        {
+            let mut state = shared.lock();
+            if state.stopping {
+                return;
+            }
+            connection::settle(&mut *state);
+            if state.changed {
+                shared.wake.notify_all();
+            }
+            let now = Instant::now();
+            if now.duration_since(measured) >= MONITOR_TICK {
+                measured = now;
+                let up = st2110_discover::interfaces();
+                let down: Vec<String> = state
+                    .addresses
+                    .iter()
+                    .filter(|a| !a.is_loopback() && !up.iter().any(|i| i.address == **a))
+                    .map(ToString::to_string)
+                    .collect();
+                let of = state.addresses.len();
+                state.ncp.monitor.measure_link(monitor::Measured::link(&down, of));
+                if let Some(observation) = state.watch.as_mut().map(|watch| watch()) {
+                    state.ncp.monitor.observe(observation, now);
+                }
+                state.ncp.monitor.update(now);
+            }
         }
-        connection::settle(&mut *state);
-        if state.changed {
-            shared.wake.notify_all();
-        }
+        shared.notify();
     }
 }
 
@@ -416,6 +497,17 @@ fn handle(shared: &Shared, stream: &TcpStream) {
     let Ok(Some(request)) = http::read(stream) else {
         return;
     };
+    if under(request.path.trim_end_matches('/'), ncp::PATH).is_some() {
+        if request.method == "GET" && http::is_upgrade(&request) {
+            ncp::serve(shared, stream, &request);
+            return;
+        }
+        let message = "the IS-12 control endpoint is a WebSocket: ask with GET and Upgrade: websocket";
+        let mut response = Response::json(426, &error(426, "Upgrade Required", message).1);
+        response.headers.push(("Upgrade", "websocket".into()));
+        let _ = http::write(stream, &response);
+        return;
+    }
     let mut response = answer(shared, &request);
     // Any web page may read and control a Node, as IS-04 and IS-05 ask (APIs: Cross-Origin
     // Resource Sharing).
@@ -446,7 +538,8 @@ fn answer(shared: &Shared, request: &Request) -> Response {
     let read = |list: Value| if method == "GET" { (200, list) } else { error(405, "Method Not Allowed", "") };
     let (status, body) = match path {
         "" => read(json!(["x-nmos/"])),
-        "/x-nmos" => read(json!(["node/", "connection/"])),
+        "/x-nmos" => read(json!(["node/", "connection/", "ncp/"])),
+        "/x-nmos/ncp" => read(json!(["v1.0/"])),
         "/x-nmos/node" => read(json!(["v1.3/"])),
         "/x-nmos/connection" => read(json!([format!("{CONNECTION_VERSION}/")])),
         _ => match (under(path, "/x-nmos/node/v1.3"), under(path, &format!("/x-nmos/connection/{CONNECTION_VERSION}")))
@@ -721,6 +814,25 @@ mod tests {
         assert!(sdp.contains("application/sdp") && sdp.ends_with("v=0\r\n"), "{sdp}");
         let kind = get(&format!("{base}single/senders/{id}/transporttype")).unwrap();
         assert!(kind.ends_with("\"urn:x-nmos:transport:rtp.mcast\""), "{kind}");
+
+        // The IS-12 endpoint the Device lists: a WebSocket, with the Sender's monitor.
+        let device = get(&format!("{}devices/", node.api)).unwrap();
+        let href = device.split('"').find(|s| s.starts_with("ws://")).expect("an IS-12 control").to_string();
+        assert!(href.ends_with("/x-nmos/ncp/v1.0/"), "{href}");
+        let plain = get(&href.replace("ws://", "http://")).unwrap();
+        assert!(plain.starts_with("HTTP/1.1 426"), "{plain}");
+        let mut ncp = st2110_nmos::ncp::client::Connection::open(&href, &[], TIMEOUT).unwrap();
+        let monitors = ncp.monitors().unwrap();
+        assert_eq!(monitors.len(), 1, "{monitors:?}");
+        let read = ncp.read_monitor(&monitors[0]).unwrap();
+        assert_eq!(read["role"], "sender-monitor", "{read}");
+        assert_eq!(read["touchpoints"][0]["resource"]["id"], id.as_str(), "{read}");
+        assert_eq!(ncp.subscribe(&[4, 99]).unwrap(), [4]);
+        let delay = st2110_nmos::ncp::property::STATUS_REPORTING_DELAY;
+        ncp.call(4, st2110_nmos::ncp::method::SET, json!({"id": delay.json(), "value": 0})).unwrap();
+        let heard = std::iter::from_fn(|| ncp.next_change().ok().flatten()).find(|n| n.property == delay).unwrap();
+        assert_eq!((heard.oid, heard.value), (4, json!(0)));
+        ncp.close();
         assert_eq!(node.finish(), None, "never registered");
     }
 }

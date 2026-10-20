@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use st2110_nmos::client::{NodeClient, Options, QueryClient};
-use st2110_nmos::{Finding, Report, ResourceRef, Snapshot};
+use st2110_nmos::{Finding, MonitorView, Report, ResourceRef, Snapshot};
 use st2110_sdp::Severity;
 
 use crate::{Format, Style, describe, plural, read, seconds};
@@ -119,6 +119,26 @@ fn short(id: Option<&str>) -> String {
 
 fn quoted(label: &str, id: Option<&str>) -> String {
     if label.is_empty() { short(id) } else { format!("\"{label}\" ({})", short(id)) }
+}
+
+/// A Sender's or Receiver's IS-12 status monitor, in one line: quiet when healthy,
+/// amber when partly healthy, red when unhealthy, with any counter that is not 0.
+fn monitor_line(monitor: &MonitorView, style: Style) -> String {
+    let overall = monitor.overall.as_deref().unwrap_or("unread");
+    let mut line = match overall {
+        "PartiallyHealthy" => style.paint("33", "partially healthy"),
+        "Unhealthy" => style.paint("31", "unhealthy"),
+        other => other.to_ascii_lowercase(),
+    };
+    if let Some(message) = monitor.overall_message.as_deref().filter(|m| !m.is_empty()) {
+        line.push_str(&format!(": {message}"));
+    }
+    let counted: Vec<String> =
+        monitor.counters.iter().filter(|c| c.value > 0).map(|c| format!("{} {}", c.value, c.name)).collect();
+    if !counted.is_empty() {
+        line.push_str(&format!(" ({})", counted.join(", ")));
+    }
+    format!("monitor: {line}")
 }
 
 fn urn(value: Option<&str>) -> &str {
@@ -270,6 +290,9 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
             }
         }
         writeln!(out, "{line}")?;
+        if let Some(monitor) = &sender.monitor {
+            writeln!(out, "    {}", monitor_line(monitor, style))?;
+        }
         for stream in &sender.streams {
             writeln!(out, "    {}", describe(stream))?;
         }
@@ -297,6 +320,9 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
             line.push_str(&format!(", IS-11 {}", state.replace('_', " ")));
         }
         writeln!(out, "{line}")?;
+        if let Some(monitor) = &receiver.monitor {
+            writeln!(out, "    {}", monitor_line(monitor, style))?;
+        }
     }
     if !report.channel_maps.is_empty() {
         writeln!(out, "channel maps:")?;

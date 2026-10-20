@@ -84,6 +84,16 @@ rules! {
     CHANNEL_MAP = "channel-map", Warning, "IS-08 v1.0.1 Behaviour",
         "A Device's IS-08 active map names only its Outputs and their channels, routes only Input channels that exist, and routes an Input to an Output only where the Output's `routable_inputs` allow it.";
 
+    // Status monitoring (IS-12, BCP-008).
+    NCP_CONTROL = "ncp-control", Warning, "IS-12 v1.0.1: Transport, IS-04 interactions · MS-05-02 v1.0: Blocks, Managers",
+        "A Device's `urn:x-nmos:control:ncp/v1.0` control is a ws:// or wss:// URL whose endpoint answers IS-12 commands, with a root block of role `root` that holds a DeviceManager and a ClassManager.";
+    MONITOR_TOUCHPOINT = "monitor-touchpoint", Warning, "BCP-008-01 v1.0 · BCP-008-02 v1.0: Touchpoints",
+        "Each Receiver or Sender monitor names exactly one Receiver or Sender, of the kind it watches, in its `x-nmos` touchpoints, that is registered as one of its own Device's, and no two monitors watch the same one.";
+    MONITOR_STATUS = "monitor-status", Warning, "BCP-008-01 v1.0 · BCP-008-02 v1.0: Controller",
+        "No monitor's overall status is `Unhealthy` or `PartiallyHealthy`: a controller shows the status, and the Device's message as it words it, to its user.";
+    MONITOR_ACTIVITY = "monitor-activity", Warning, "BCP-008-01 v1.0 · BCP-008-02 v1.0: Overall status, Deactivating",
+        "A monitor's overall status is `Inactive` exactly while the Receiver or Sender it watches is inactive in the registry, and its connection or transmission and stream or essence statuses are `Inactive` with it.";
+
     // System parameters (IS-09).
     SYSTEM_GLOBAL = "system-global", Warning, "IS-09 v1.0 System API: global.json · JT-NM TR-1001-1:2020",
         "The System API's `/global` can be read, and gives `is04.heartbeat_interval` (1 to 1000 s), the PTP `domain_number` (0 to 127) and `announce_receipt_timeout` (2 to 10) that every Node in the system uses.";

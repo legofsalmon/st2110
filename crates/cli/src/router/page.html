@@ -2893,6 +2893,8 @@ thead th.corner { left: 0; z-index: 3; text-align: left; padding: var(--ds-space
 th.src { padding: var(--ds-space-2) var(--ds-space-half); }
 th.src span { writing-mode: vertical-rl; transform: rotate(180deg); display: block; margin: 0 auto; white-space: nowrap; font: var(--ds-text-caption); font-weight: var(--ds-weight-semibold); }
 th.src small, th.dst small { display: block; color: var(--dim); font: var(--ds-text-caption); }
+th.dst small.monitor.warn { color: var(--warn-ink); } th.dst small.monitor.bad { color: var(--bad-ink); }
+.monitor-line.warn { color: var(--warn-ink); } .monitor-line.bad { color: var(--bad-ink); }
 th.src small { writing-mode: vertical-rl; transform: rotate(180deg); margin: 0 auto; }
 th.src .stack { display: flex; justify-content: center; gap: var(--ds-space-hairline); }
 th.dst { position: sticky; left: 0; z-index: 1; background: var(--panel); text-align: left; padding: var(--ds-space-1) var(--ds-space-3); border-right: var(--ds-space-hairline) solid var(--line); font-weight: var(--ds-weight-semibold); white-space: nowrap; }
@@ -3085,6 +3087,8 @@ let socketOpen = false;
 let subscribed = false;    // whether the registry tells the router of each change
 let readAt = null;         // when the router last read the registry
 let retryIn = 1000;
+let monitors = {};         // sender or receiver id -> what its IS-12 status monitor says
+let monitorsShown = "";    // the receivers' monitor lines last drawn, to draw again only on a change
 
 function listen() {
   if (socket) return;
@@ -3102,6 +3106,7 @@ function listen() {
     else if (m.type === "error") showFailure(m.message, false);
     else if (m.type === "log") logEntry(m.entry);
     else if (m.type === "live" && live) { liveStatus = m.senders || {}; showLive(); }
+    else if (m.type === "monitors") applyMonitors(m.monitors || {});
   };
   socket.onclose = () => {
     const was = socketOpen;
@@ -3112,6 +3117,30 @@ function listen() {
     setTimeout(listen, retryIn);
     retryIn = Math.min(retryIn * 2, 5000);
   };
+}
+
+// The status monitors (IS-12, BCP-008), as the router hears each change. Healthy is
+// quiet: a receiver's row gains a line only while its monitor says it is not.
+function applyMonitors(next) {
+  monitors = next;
+  const shown = JSON.stringify((state ? state.receivers : []).map((r) => monitorText(monitors[r.id])));
+  if (state && shown !== monitorsShown) { monitorsShown = shown; render(); }
+  showDetailsMonitor();
+}
+
+function monitorTone(m) {
+  return !m ? "" : m.overall === "Unhealthy" ? "bad" : m.overall === "PartiallyHealthy" ? "warn" : "";
+}
+
+// A monitor that is not healthy, in a few words; nothing when it is healthy or off.
+function monitorText(m) {
+  if (!monitorTone(m)) return null;
+  const said = m.overall_message || (m.domains || []).filter((d) => d.message).map((d) => `${d.domain}: ${d.message}`).join("; ");
+  return `${m.overall === "Unhealthy" ? "Unhealthy" : "Partly healthy"}${said ? ": " + said : ""}`;
+}
+
+function monitorTitle(m) {
+  return (m.domains || []).map((d) => `${d.domain}: ${d.status}${d.message ? " (" + d.message + ")" : ""}`).join("\n");
 }
 
 function applyState(next) {
@@ -3288,6 +3317,8 @@ function render() {
     if (r.active && r.sender_id && r.current == null) {
       tr.firstChild.append(el("small", { text: `taking unregistered sender ${r.sender_id.slice(0, 8)}` }));
     }
+    const watching = monitors[r.id], said = monitorText(watching);
+    if (said) tr.firstChild.append(el("small", { class: `monitor ${monitorTone(watching)}`, text: said, title: monitorTitle(watching) }));
     body.append(tr);
   }
   const table = el("table", {}, el("thead", {}, head), body);
@@ -3682,6 +3713,7 @@ function renderDetails() {
     el("div", { class: "details-head" }, el("h2", { text: snd.label || d.id }), el("span", { class: "spacer" }), close),
     facts(flowFacts),
     el("h3", { class: "label", text: "Sending" }), renderSending(d),
+    el("h3", { class: "label", text: "Status monitor" }), el("div", { id: "details-monitor" }),
     el("h3", { class: "label", text: "Received here" }), el("div", { id: "details-live" }),
     el("h3", { class: "label", text: "SDP file" }),
     d.sdp_error ? el("div", { class: "line", text: `Cannot be read: ${d.sdp_error}` }) : legs,
@@ -3689,6 +3721,29 @@ function renderDetails() {
     ...(d.sdp ? [el("details", { class: "ds-disclosure" }, el("summary", { text: "The SDP file" }), el("div", { class: "ds-disclosure__body" }, el("pre", { class: "sdp", text: d.sdp })))] : []),
   );
   showDetailsLive();
+  showDetailsMonitor();
+}
+
+// The open Sender's IS-12 status monitor, as its Device last said: each domain, and
+// any counter that is not 0.
+function showDetailsMonitor() {
+  const box = $("details-monitor");
+  if (!box || !details) return;
+  const m = monitors[details.id];
+  if (!m) {
+    box.replaceChildren(el("div", { class: "line", text: "Its Device lists no IS-12 status monitor for it, or the router cannot reach it." }));
+    return;
+  }
+  const overall = m.overall === "PartiallyHealthy" ? "Partly healthy" : m.overall || "Not read";
+  const pairs = [["Overall", m.overall_message ? `${overall}: ${m.overall_message}` : overall]];
+  for (const d of m.domains || []) pairs.push([d.domain[0].toUpperCase() + d.domain.slice(1), `${d.status}${d.message ? ": " + d.message : ""}`]);
+  pairs.push(["Clock source", m.synchronization_source]);
+  const counted = (m.counters || []).filter((c) => c.value > 0).map((c) => `${c.value} ${c.name}`);
+  if (counted.length) pairs.push(["Counted", counted.join(", ")]);
+  const list = facts(pairs);
+  const tone = monitorTone(m);
+  if (tone) list.querySelector("dd").className = `monitor-line ${tone}`;
+  box.replaceChildren(list);
 }
 
 // Sending: the open source's Sender turned on or off, or sent elsewhere, through its

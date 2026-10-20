@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -50,9 +50,9 @@ pub struct Options {
     /// Device's Connection API, so the check can compare them with the registry's
     /// `subscription` ([`Snapshot::active`]).
     pub fetch_active: bool,
-    /// Whether to read each Device's IS-11 Stream Compatibility Management API and IS-08
-    /// Channel Mapping API, where it advertises them ([`Snapshot::stream_compat`],
-    /// [`Snapshot::channel_mapping`]).
+    /// Whether to read each Device's IS-11 Stream Compatibility Management API, IS-08
+    /// Channel Mapping API and IS-12 status monitors, where it advertises them
+    /// ([`Snapshot::stream_compat`], [`Snapshot::channel_mapping`], [`Snapshot::ncp`]).
     pub fetch_controls: bool,
     /// Requests to make at once when fetching SDP files.
     pub parallel: usize,
@@ -403,8 +403,9 @@ impl Http {
         Ok(snapshot)
     }
 
-    /// Reads the IS-11 resources of each Sender and Receiver, and the IS-08 maps of each
-    /// Device, whose Devices advertise those APIs. What cannot be read is left out.
+    /// Reads the IS-11 resources of each Sender and Receiver, and the IS-08 maps and
+    /// IS-12 status monitors of each Device, whose Devices advertise those APIs. What
+    /// cannot be read is left out, or for IS-12 recorded as an `error`.
     fn controls(&self, snapshot: &mut Snapshot) {
         let (compat, mapping) = control_urls(snapshot);
         // Each Sender's status, active and supported constraints; each Receiver's status.
@@ -439,6 +440,20 @@ impl Http {
                 .or_insert_with(|| Value::Object(Default::default()));
             entry[*name] = value;
         }
+        // Each Device's IS-12 status monitors (BCP-008-01 and -02), read once with Get.
+        let endpoints = crate::routing::ncp_endpoints(snapshot);
+        let hrefs: Vec<&str> = endpoints.iter().map(|(_, href)| href.as_str()).collect();
+        let read = self.each(&hrefs, |href| {
+            let headers = match self.options.token.as_ref().filter(|_| auth::may_send_to(href)).map(auth::Token::bearer)
+            {
+                Some(Ok(bearer)) => vec![("Authorization".to_string(), format!("Bearer {bearer}"))],
+                Some(Err(e)) => return json!({"href": href, "error": e.message}),
+                None => Vec::new(),
+            };
+            let pairs: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+            crate::ncp::client::read_device(href, &pairs, self.options.timeout)
+        });
+        snapshot.ncp = endpoints.into_iter().map(|(id, _)| id).zip(read).collect();
     }
 }
 
