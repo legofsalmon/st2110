@@ -89,7 +89,7 @@ fn rtp(payload_type: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32, payl
     out
 }
 
-/// An ST 2110-20 sender of a small raster: 40 packets a frame, each 64 octets of one
+/// An ST 2110-20 sender of a small raster: 40 packets a frame, each 1200 octets of one
 /// row segment, on the narrow gapped schedule.
 #[derive(Clone)]
 struct Video {
@@ -115,7 +115,7 @@ impl Video {
             rate: (50, 1),
             interlaced: false,
             packets: 40,
-            octets: 64,
+            octets: 1_200,
         }
     }
 
@@ -434,7 +434,14 @@ fn a_clean_facility_on_ptp_time() {
     assert_eq!((vrx.schedule.as_str(), vrx.vrxfull, vrx.peak, vrx.underflows, vrx.overflows), ("gapped", 8, 1, 0, 0));
     assert!(close(vrx.troffset_us, 764.444) && !vrx.troffset_signalled);
     assert!(close(vrx.margin_us.unwrap().min, 20.0));
+    // Each packet arrives 20 µs before its read, and is the only one in the buffer: the
+    // RP 2110-25 Margin of every frame is 20 µs.
+    let levels = (vrx.min, vrx.average, vrx.steady_min, vrx.steady_average, vrx.gap_min);
+    assert_eq!(levels, (Some(0), Some(1.0), Some(0), Some(1.0), Some(0)));
+    let margin = vrx.frame_margin_us.unwrap();
+    assert!(close(margin.min, 20.0) && close(margin.max, 20.0) && margin.count == 50, "{margin:?}");
     assert_eq!(video.windows.len(), 1);
+    assert_eq!((video.windows[0].vrx_min, video.windows[0].vrx_average), (Some(0), Some(1.0)));
     assert_eq!(video.windows[0].second, i64::try_from(NOON).unwrap());
 
     let anc = report.flows[0].video.as_ref().expect("ancillary data");
@@ -575,6 +582,8 @@ fn bursts_overflow_the_models() {
     assert_eq!((cinst.flow, cinst.severity), (Some(1), Severity::Error));
     let vrx = report.flows[0].video.as_ref().unwrap().vrx.as_ref().unwrap();
     assert_eq!((vrx.peak, vrx.underflows), (40, 0));
+    // Each frame is in the buffer before its first read, so no frame has a steady state.
+    assert_eq!((vrx.min, vrx.average, vrx.steady_min, vrx.gap_min), (Some(0), Some(20.5), None, Some(0)));
     assert_eq!(finding(&report, "vrx-overflow").count, 800);
     assert_eq!(report.missing, ["video-dup.sdp stream 1, to 239.20.10.1:5004"]);
 }
@@ -828,24 +837,40 @@ fn timestamps_off_the_frame_grid() {
     assert_eq!(video.rtp_offset.unwrap().mean, -10.0);
 }
 
-fn with_uneven_compressed_frames() -> Report {
-    let mut scene = Scene::default();
+/// A JPEG XS sender at 59.94 frames a second: `packets(n)` packets in frame `n`, each
+/// `octets(j)` octets of RTP payload, 700 unless it says otherwise.
+fn send_jpeg_xs(scene: &mut Scene, packets: impl Fn(i128) -> i128, octets: impl Fn(i128) -> usize) {
     let mut seq: u16 = 0;
     for n in NOON * 60_000 / 1001..NOON * 60_000 / 1001 + 25 {
         let start = n * 1001 * NANOS / 60_000;
         let timestamp = (n * 1001 * 90_000 / 60_000) as u32;
-        // 30 and 31 packets in turn.
-        let packets = 30 + n % 2;
+        let packets = packets(n);
         for j in 0..packets {
             let last = j == packets - 1;
-            let payload = jxs_payload(last, None, n, j);
+            let mut payload = vec![0u8; octets(j)];
+            let header = jxs_payload(last, None, n, j);
+            payload[..4].copy_from_slice(&header[..4]);
             let packet = rtp(112, last, seq, timestamp, 0x4444_0004, &payload);
             seq = seq.wrapping_add(1);
             let t = start + 500_000 + j * 16_683_333 * 9 / 10 / 31;
             scene.udp(t, "192.168.10.30:5010", "239.10.10.4:5010", &packet);
         }
     }
-    send_ptp(&mut scene, GM, 1, |_, _| false);
+    send_ptp(scene, GM, 1, |_, _| false);
+}
+
+/// The JPEG XS fixture with `b=AS` set to the rate of 30 packets of 700 octets a frame:
+/// 30 × 740 octets of IP packets × 8 × 60000/1001 is 10645.4 kb/s.
+fn jpeg_xs_at_rate() -> SdpFile {
+    let mut sdp = fixture("jpeg-xs.sdp");
+    sdp.text = sdp.text.replace("b=AS:116000", "b=AS:10646");
+    sdp
+}
+
+fn with_uneven_compressed_frames() -> Report {
+    let mut scene = Scene::default();
+    // 30 and 31 packets in turn.
+    send_jpeg_xs(&mut scene, |n| 30 + n % 2, |_| 700);
     scene.analyse(&[fixture("jpeg-xs.sdp")])
 }
 
@@ -887,7 +912,11 @@ fn with_interlaced_jpeg_xs(break_marker: bool) -> Report {
     }
     send_ptp(&mut scene, GM, 1, |_, _| false);
     let mut sdp = fixture("jpeg-xs.sdp");
-    sdp.text = sdp.text.replace("exactframerate=60000/1001", "exactframerate=30000/1001; interlace");
+    // 40 packets of 740 octets a frame × 8 × 30000/1001 is 7096.9 kb/s.
+    sdp.text = sdp
+        .text
+        .replace("exactframerate=60000/1001", "exactframerate=30000/1001; interlace")
+        .replace("b=AS:116000", "b=AS:7097");
     scene.analyse(&[sdp])
 }
 
@@ -905,16 +934,184 @@ fn interlaced_jpeg_xs_stamps_each_field() {
 #[test]
 fn compressed_frames_of_uneven_size() {
     let report = with_uneven_compressed_frames();
-    assert_eq!(rules(&report), ["frame-packets"]);
+    assert_eq!(rules(&report), ["frame-packets", "frame-bytes", "cbr-rate"]);
     let frames = finding(&report, "frame-packets");
     // The first frame may have started before the capture, and the last may be cut short.
     assert_eq!((frames.message.as_str(), frames.count), ("frames carried from 30 to 31 packets", 11));
+    let bytes = finding(&report, "frame-bytes");
+    assert_eq!((bytes.message.as_str(), bytes.count), ("frames carried from 22200 to 22940 octets of IP packets", 11));
+    assert_eq!(
+        finding(&report, "cbr-rate").message,
+        "b=AS:116000, but 22554 octets of IP packets a frame, on average, at 60000/1001 frames a second make 10816 kb/s"
+    );
     let video = report.flows[0].video.as_ref().unwrap();
     assert_eq!(
         (video.frame_rate.as_deref(), video.vrx.as_ref(), video.vrx_skipped.as_ref()),
         (Some("60000/1001"), None, None)
     );
     assert!(video.cinst.as_ref().unwrap().peak <= 4);
+}
+
+#[test]
+fn compressed_frames_of_one_size_at_the_signalled_rate() {
+    let mut scene = Scene::default();
+    send_jpeg_xs(&mut scene, |_| 30, |_| 700);
+    let report = scene.analyse(&[jpeg_xs_at_rate()]);
+    assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    let video = report.flows[0].video.as_ref().unwrap();
+    let octets = video.octets_per_frame.unwrap();
+    assert_eq!((octets.min, octets.max), (22200.0, 22200.0));
+    // A rate a kilobit a second too low.
+    let mut low = jpeg_xs_at_rate();
+    low.text = low.text.replace("b=AS:10646", "b=AS:10645");
+    assert_eq!(rules(&scene.analyse(&[low])), ["cbr-rate"]);
+}
+
+fn with_unaligned_jpeg_xs() -> Report {
+    let mut scene = Scene::default();
+    // The fifth packet of each frame one octet long, and the last of each short.
+    send_jpeg_xs(
+        &mut scene,
+        |_| 30,
+        |j| match j {
+            4 => 701,
+            29 => 333,
+            _ => 700,
+        },
+    );
+    let mut sdp = jpeg_xs_at_rate();
+    sdp.text = sdp.text.replace("b=AS:10646", "b=AS:10470");
+    scene.analyse(&[sdp])
+}
+
+#[test]
+fn jpeg_xs_payloads_in_multiples_of_eight_octets() {
+    let report = with_unaligned_jpeg_xs();
+    assert_eq!(rules(&report), ["jxsv-alignment"]);
+    let unaligned = finding(&report, "jxsv-alignment");
+    assert_eq!(
+        unaligned.message,
+        "25 packets other than the last of a field or frame carried payload data that is not a multiple of 8 octets, as few as 697"
+    );
+}
+
+/// Frames whose sample row data headers break ST 2110-20's rules.
+fn with_bad_sample_rows() -> Report {
+    let mut scene = Scene::default();
+    let mut video = Video::new("192.168.10.21:5004", "239.10.10.1:5004");
+    for n in FRAME_50..FRAME_50 + 5 {
+        let mut packets = video.frame(n, |_, t| t);
+        // The payload header's first length, row and offset, after the RTP header and
+        // the extended sequence number.
+        let set =
+            |packet: &mut Vec<u8>, at: usize, value: u16| packet[at..at + 2].copy_from_slice(&value.to_be_bytes());
+        match n - FRAME_50 {
+            // A length of no whole number of pixel groups, past the end of the payload.
+            1 => set(&mut packets[5].1, 14, 1_201),
+            // Back up to the top of the picture.
+            2 => set(&mut packets[6].1, 16, 0),
+            // Below the picture, and a row segment that runs past its right edge.
+            3 => {
+                set(&mut packets[7].1, 16, 1_080);
+                set(&mut packets[39].1, 18, 1_600);
+            }
+            _ => {}
+        }
+        for (t, packet) in packets {
+            scene.udp(t, video.source, video.destination, &packet);
+        }
+    }
+    send_ptp(&mut scene, GM, 1, |_, _| false);
+    scene.analyse(&[fixture("video-dup.sdp")])
+}
+
+#[test]
+fn sample_row_data_headers() {
+    let report = with_bad_sample_rows();
+    assert_eq!(rules(&report), ["srd-length", "srd-order", "srd-geometry"]);
+    assert_eq!(
+        finding(&report, "srd-length").message,
+        "1 packet had sample row data headers that ST 2110-20 does not allow: 1 with lengths that are not whole pixel \
+         groups of 5 octets, 1 with row segments that run past the end of the payload"
+    );
+    // Row 0 after row 135, and row 216 after row 1080.
+    let order = finding(&report, "srd-order");
+    assert_eq!(order.count, 2);
+    assert_eq!(
+        finding(&report, "srd-geometry").message,
+        "2 packets placed samples outside the 1920x1080 picture the SDP file gives, the first at row 1080, offset 0"
+    );
+}
+
+/// Block packing with blocks that are not 180 octets, and general packing with short
+/// datagrams.
+fn with_bad_packing() -> Report {
+    let mut scene = Scene::default();
+    Video::new("192.168.10.21:5004", "239.10.10.1:5004").send(&mut scene, FRAME_50, 5);
+    let mut general = Video::new("192.168.20.21:5004", "239.20.10.1:5004");
+    general.octets = 400;
+    general.send(&mut scene, FRAME_50, 5);
+    send_ptp(&mut scene, GM, 1, |_, _| false);
+    let mut sdp = fixture("video-dup.sdp");
+    sdp.text = sdp.text.replacen("PM=2110GPM", "PM=2110BPM", 1);
+    scene.analyse(&[sdp])
+}
+
+#[test]
+fn packing_modes() {
+    let report = with_bad_packing();
+    assert_eq!(rules(&report), ["bpm-blocks", "gpm-short"]);
+    let blocks = finding(&report, "bpm-blocks");
+    assert_eq!((blocks.flow, blocks.count), (Some(1), 195));
+    assert!(blocks.message.ends_with("not a multiple of 180 octets, as few as 1200"), "{}", blocks.message);
+    let short = finding(&report, "gpm-short");
+    assert_eq!(
+        (short.flow, short.message.as_str()),
+        (Some(2), "195 IP datagrams other than the last of a field or frame were under 1000 octets, as few as 448")
+    );
+}
+
+/// The two halves of a MULTI-2SI picture, the second stamped a tick late from its
+/// third frame.
+fn with_split_timestamps() -> Report {
+    let mut scene = Scene::default();
+    Video::new("192.168.10.21:5004", "239.10.10.1:5004").send(&mut scene, FRAME_50, 10);
+    let mut second = Video::new("192.168.20.21:5004", "239.20.10.1:5004");
+    for n in FRAME_50..FRAME_50 + 10 {
+        for (t, mut packet) in second.frame(n, |_, t| t) {
+            if n >= FRAME_50 + 2 {
+                let timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap()).wrapping_add(1);
+                packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+            }
+            scene.udp(t, second.source, second.destination, &packet);
+        }
+    }
+    send_ptp(&mut scene, GM, 1, |_, _| false);
+    let mut sdp = fixture("video-dup.sdp");
+    sdp.text = sdp.text.replace("a=group:DUP", "a=group:MULTI-2SI");
+    scene.analyse(&[sdp])
+}
+
+#[test]
+fn multi_stream_parts_share_their_timestamps() {
+    let report = with_split_timestamps();
+    assert_eq!(rules(&report), ["rtp-alignment", "multistream-timestamp"]);
+    let split = finding(&report, "multistream-timestamp");
+    assert_eq!((split.flow, split.count), (Some(2), 8));
+    assert!(
+        split.message.starts_with(
+            "8 frames carried other RTP timestamps than flow 1 of video-dup.sdp a=group:MULTI-2SI primary secondary"
+        ),
+        "{}",
+        split.message
+    );
+    // Phases of a high frame rate camera have timestamps of their own.
+    let mut sdp = fixture("video-dup.sdp");
+    sdp.text = sdp.text.replace("a=group:DUP", "a=group:PHASED");
+    let mut scene = Scene::default();
+    Video::new("192.168.10.21:5004", "239.10.10.1:5004").send(&mut scene, FRAME_50, 3);
+    Video::new("192.168.20.21:5004", "239.20.10.1:5004").send(&mut scene, FRAME_50 + 1, 3);
+    assert!(rules(&scene.analyse(&[sdp])).is_empty());
 }
 
 #[test]
@@ -1411,6 +1608,10 @@ fn every_rule_has_a_capture_that_raises_it() {
         with_misaligned_timestamps(),
         with_uneven_compressed_frames(),
         with_interlaced_jpeg_xs(true),
+        with_unaligned_jpeg_xs(),
+        with_bad_sample_rows(),
+        with_bad_packing(),
+        with_split_timestamps(),
         with_ptp_faults(),
         with_slow_syncs(),
         with_broken_ancillary_data(),

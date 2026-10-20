@@ -45,6 +45,7 @@ pub mod capture;
 mod data;
 mod flow;
 pub mod net;
+mod payload;
 mod ptp;
 mod report;
 pub mod rtp;

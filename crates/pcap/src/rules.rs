@@ -73,6 +73,28 @@ rules! {
         "No ANC packet is embedded audio, an audio control packet or EDH, which ST 2110-40 says not to carry.";
     ANC_SEND_TIME = "anc-send-time", Error, "ST 2110-40:2023 §6.4, §6.5",
         "Ancillary data packets are sent within the window of the transmission model that `TM` names, CTM when it names none: by the frame start plus the earliest packet offset plus 1 ms (CTM) or 8 line times (LLTM), and no more than a frame before that.";
+    FRAME_BYTES = "frame-bytes", Error, "ST 2110-22:2022 §4",
+        "Compressed video sends the same number of octets for every frame.";
+    CBR_RATE = "cbr-rate", Error, "ST 2110-22:2022 §7.3",
+        "The SDP file's `b=AS` is the measured rate of whole IP packets: octets a frame times the frame rate, in kilobits a second rounded up.";
+    MULTISTREAM_TIMESTAMP = "multistream-timestamp", Error, "RP 2110-23:2019 §5.5",
+        "The streams of a `MULTI-2SI` or `MULTI-SD` group carry the same RTP timestamp for each frame.";
+
+    // ST 2110-20 payloads.
+    SRD_LENGTH = "srd-length", Error, "ST 2110-20:2022 §6.1.4, §6.2",
+        "Each packet has one to three sample row data headers, whose lengths are whole pixel groups, never zero beside another header, and fit the payload.";
+    SRD_ORDER = "srd-order", Error, "ST 2110-20:2022 §6.1.4, §6.1.5",
+        "Row segments run down the field or frame, and from left to right within a row: rows and offsets only increase.";
+    SRD_GEOMETRY = "srd-geometry", Error, "ST 2110-20:2022 §6.1.4, §7.2",
+        "Row segments lie within the `width` and `height` the SDP file gives, with each field of interlaced and PsF video holding half the rows.";
+    BPM_BLOCKS = "bpm-blocks", Error, "ST 2110-20:2022 §6.3.3",
+        "In block packing mode, every packet but the last of a field or frame carries a multiple of 180 octets of sample data.";
+    GPM_SHORT = "gpm-short", Warning, "ST 2110-20:2022 §6.3.2",
+        "In general packing mode, IP datagrams under 1000 octets come only at the end of a field or frame.";
+
+    // JPEG XS.
+    JXSV_ALIGNMENT = "jxsv-alignment", Warning, "VSF TR-08:2026 §8.1.2",
+        "JPEG XS packets carry payload data in multiples of 8 octets, except the last packet of a field or frame.";
 
     // Audio.
     PACKET_TIME = "packet-time", Error, "ST 2110-30:2025 §6.2.1 · RFC 8866 §6.4",

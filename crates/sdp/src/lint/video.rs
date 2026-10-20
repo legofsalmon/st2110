@@ -6,7 +6,7 @@ use crate::fmtp::{Fmtp, Param};
 use crate::rational::digits;
 use crate::rules;
 use crate::stream::Media;
-use crate::video::{Depth, Sampling, payload_bitrate, pixel_group, tro_default_progressive};
+use crate::video::{Depth, Sampling, payload_bitrate, pixel_group, tro_default_interlaced, tro_default_progressive};
 
 use super::params::{self, Names};
 
@@ -307,24 +307,27 @@ fn interlace(m: &Media<'_>, line: usize, picture: &Picture, d: &mut Diagnostics)
 }
 
 /// Type N receivers only have to accept the default read offset (ST 2110-21 §7.2).
-/// Only progressive video is checked: the interlaced defaults in ST 2110-21:2022
-/// Table 1 are misprinted for 525 and 625 lines.
+/// Interlaced and PsF video is checked in the 1125-line systems only: ST 2110-21:2022
+/// Table 1 misprints the defaults for 525 and 625 lines.
 fn read_offset(m: &Media<'_>, line: usize, fmtp: &Fmtp, picture: &Picture, d: &mut Diagnostics) {
-    if picture.interlaced {
-        return;
-    }
     let (Some(troff), Some(height), Some(rate)) = (fmtp.value("TROFF").and_then(digits), picture.height, picture.rate)
     else {
         return;
     };
-    let default = tro_default_progressive(height, rate) * 1e6;
+    let default = if picture.interlaced {
+        let Some(seconds) = tro_default_interlaced(height, rate) else { return };
+        seconds * 1e6
+    } else {
+        tro_default_progressive(height, rate) * 1e6
+    };
     if (troff as f64 - default).abs() >= 1.0 {
         d.report(
             &rules::TROFF_NONDEFAULT,
             m.index,
             line,
             format!(
-                "TROFF={troff} is not the default of {default:.0} µs for {height}-line video at {} fps; Type N receivers are only required to accept the default",
+                "TROFF={troff} is not the default of {default:.0} µs for {height}-line {} video at {} fps; Type N receivers are only required to accept the default",
+                super::scan(fmtp),
                 super::fps(rate)
             ),
         );
@@ -342,6 +345,16 @@ fn standard_definition(m: &Media<'_>, line: usize, fmtp: &Fmtp, picture: &Pictur
         (25, 1) if height <= 612 => (625, 576..=576, [(12, 11), (16, 11)]),
         _ => return,
     };
+    if let Some(sampling) = picture.sampling
+        && sampling != Sampling::YCbCr422
+    {
+        d.report(
+            &rules::VIDEO_SD_SAMPLING,
+            m.index,
+            line,
+            format!("sampling={sampling}: {system}-line video is sent as 4:2:2, sampling=YCbCr-4:2:2"),
+        );
+    }
     if let Some(width) = picture.width
         && width != 720
     {

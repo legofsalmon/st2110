@@ -271,6 +271,13 @@ fn write_video(out: &mut impl Write, essence: Essence, video: &VideoReport) -> i
             format!("{} to {} packets a frame", packets.min, packets.max)
         });
     }
+    if let Some(octets) = &video.octets_per_frame {
+        parts.push(if octets.min == octets.max {
+            format!("{} octets a frame", octets.min)
+        } else {
+            format!("{} to {} octets a frame", octets.min, octets.max)
+        });
+    }
     writeln!(
         out,
         "    {}: {}",
@@ -317,14 +324,22 @@ fn describe_cinst(cinst: &CinstReport) -> String {
 }
 
 fn describe_vrx(vrx: &VrxReport) -> String {
-    let mut text = format!(
-        "virtual receiver buffer peaked at {} of VRXFULL {}, {} reads from TROFFSET {:.1} µs{}",
-        vrx.peak,
-        vrx.vrxfull,
+    let mut text = format!("virtual receiver buffer peaked at {} of VRXFULL {}", vrx.peak, vrx.vrxfull);
+    if let Some(average) = vrx.average {
+        text.push_str(&format!(" and averaged {average:.1}"));
+    }
+    if let (Some(average), Some(min)) = (vrx.steady_average, vrx.steady_min) {
+        text.push_str(&format!(" ({average:.1}, and at least {min}, in each frame's steady state)"));
+    }
+    text.push_str(&format!(
+        ", {} reads from TROFFSET {:.1} µs{}",
         vrx.schedule,
         vrx.troffset_us,
         if vrx.troffset_signalled { " as signalled" } else { "" }
-    );
+    ));
+    if let Some(margin) = &vrx.frame_margin_us {
+        text.push_str(&format!("; Margin {}", range(margin, " µs")));
+    }
     match &vrx.margin_us {
         Some(margin) if margin.min < 0.0 => {
             text.push_str(&format!("; packets arrived as much as {:.1} µs after their reads", -margin.min));
@@ -437,9 +452,15 @@ mod tests {
             troffset_signalled: false,
             vrxfull: 8,
             peak: 9,
+            min: Some(0),
+            average: None,
+            steady_min: None,
+            steady_average: None,
+            gap_min: Some(0),
             underflows: 0,
             overflows: 1,
             margin_us: Some(stats),
+            frame_margin_us: None,
             method: String::new(),
         };
         assert_eq!(
@@ -447,6 +468,15 @@ mod tests {
             "virtual receiver buffer peaked at 9 of VRXFULL 8, gapped reads from TROFFSET 764.4 µs; \
              packets arrived 20.0 µs or more before their reads, 1 overflow"
         );
+        (vrx.average, vrx.steady_average, vrx.steady_min, vrx.frame_margin_us) =
+            (Some(2.5), Some(3.25), Some(1), Some(Stats { min: 30.0, max: 30.0, mean: 30.0, ..stats }));
+        assert_eq!(
+            describe_vrx(&vrx),
+            "virtual receiver buffer peaked at 9 of VRXFULL 8 and averaged 2.5 (3.2, and at least 1, in each frame's \
+             steady state), gapped reads from TROFFSET 764.4 µs; Margin 30.0 µs (30.0 to 30.0); packets arrived 20.0 µs \
+             or more before their reads, 1 overflow"
+        );
+        (vrx.average, vrx.steady_average, vrx.steady_min, vrx.frame_margin_us) = (None, None, None, None);
         assert_eq!(range(&stats, " µs"), "25.0 µs (20.0 to 30.0)");
         (vrx.margin_us, vrx.underflows, vrx.overflows) = (Some(Stats { min: -12.25, ..stats }), 3, 0);
         assert_eq!(

@@ -9,7 +9,7 @@ use st2110_ptp::Message;
 use st2110_sdp::Essence;
 
 use crate::capture::{CaptureError, Format, Frame, Reader};
-use crate::flow::{Flow, Key, RtpPacket, SdpStream};
+use crate::flow::{Flow, Key, RtpPacket, SdpStream, compare_constituents};
 use crate::net::{self, Packet};
 use crate::ptp::Monitor;
 use crate::report::{Capture, Finding, FlowReport, RelativeReport, Report, TimescaleReport};
@@ -233,6 +233,7 @@ impl Analyser {
         let mut findings = Vec::new();
         let mut flows = Vec::new();
         let mut fragmented_flows = false;
+        let constituents: Vec<_> = running.flows.iter().filter_map(Flow::constituent).collect();
         for flow in running.flows {
             let (report, more) = flow.finish(&timeline);
             fragmented_flows |= more.iter().any(|f| f.rule == rules::IP_FRAGMENT.id);
@@ -240,6 +241,7 @@ impl Analyser {
             findings.extend(more);
         }
         relate(&mut flows);
+        findings.extend(compare_constituents(&constituents, &timeline));
         if capture.fragments > 0 && !fragmented_flows {
             // Later fragments whose first fragment the capture missed.
             findings.insert(
