@@ -672,10 +672,8 @@ fn a_unicast_sender_is_pointed_at_its_receiver_first() {
     assert_eq!(connection.state, State::Done, "{connection:#?}");
     assert_eq!(
         connection.notes,
-        [format!(
-            "sender \"CAM 1 audio\" (5e0d0002) sends unicast, so it is first pointed at this Receiver, at \
-             192.168.10.32:5004"
-        )]
+        ["sender \"CAM 1 audio\" (5e0d0002) sends unicast, so it is first pointed at this Receiver, at \
+          192.168.10.32:5004"]
     );
     assert_eq!(
         mock.changes(),
