@@ -7,6 +7,7 @@ use serde_json::Value;
 use st2110_sdp::{ClockIdentity, Rational, RefClock, Stream, parse_frame_rate};
 
 use crate::caps::{self, SdpFacts, StreamFacts};
+use crate::controls;
 use crate::model::{Clock, Core, Flow, Kind, Model, Node, Receiver, Sender, Source, is_mac, is_uuid, short_urn};
 use crate::report::{Findings, Grandmaster, ReceiverView, Report, ResourceRef, SenderView, Summary};
 use crate::rules::*;
@@ -33,6 +34,14 @@ pub fn check(snapshot: &Snapshot) -> Report {
     connections(&model, &sdps, &mut findings);
     crate::groups::check_groups(&model, snapshot, &mut findings);
     crate::groups::check_assets(&model, snapshot, &mut findings);
+    let sender_sdps: Vec<Option<controls::SenderSdp<'_>>> = sdps
+        .iter()
+        .map(|sdp| sdp.as_ref().map(|s| controls::SenderSdp { facts: &s.facts, streams: &s.report.streams }))
+        .collect();
+    controls::sender_caps(&model, &sender_sdps, &mut findings);
+    controls::stream_compat(&model, snapshot, &sender_sdps, &mut findings);
+    let channel_maps = controls::channel_maps(&model, snapshot, &mut findings);
+    let system = controls::system(&model, snapshot, &sender_sdps, &mut findings);
 
     let summary = Summary {
         nodes: model.nodes.len(),
@@ -51,12 +60,16 @@ pub fn check(snapshot: &Snapshot) -> Report {
     senders.sort_by_cached_key(|s| (s.label.to_lowercase(), s.id.clone()));
     let mut receivers: Vec<ReceiverView> = model.receivers.iter().map(|r| receiver_view(&model, r)).collect();
     receivers.sort_by_cached_key(|r| (r.label.to_lowercase(), r.id.clone()));
+    controls::compat_views(snapshot, &mut senders, &mut receivers);
     Report {
         source: snapshot.source.clone(),
         api_version: snapshot.api_version.clone(),
         summary,
         senders,
         receivers,
+        nodes: controls::node_views(&model),
+        channel_maps,
+        system,
         findings: findings.into_sorted(),
     }
 }
@@ -264,25 +277,8 @@ fn constraint_sets(receiver: &Receiver<'_>, findings: &mut Findings) {
     let Some(sets) = receiver.constraint_sets else {
         return;
     };
-    if receiver.caps_version.is_none() {
-        findings.add(
-            &CONSTRAINT_SETS,
-            &receiver.core,
-            "it has caps.constraint_sets but no caps.version, so a controller cannot tell when they change",
-        );
-    }
-    for (i, set) in sets.iter().enumerate() {
-        let constraints =
-            set.as_object().map_or(0, |set| set.keys().filter(|k| !k.starts_with("urn:x-nmos:cap:meta:")).count());
-        if constraints == 0 {
-            findings.add(
-                &CONSTRAINT_SETS,
-                &receiver.core,
-                format!(
-                    "constraint set {i} holds no parameter constraint, so it says nothing about what the Receiver takes"
-                ),
-            );
-        }
+    for problem in controls::set_problems(sets, receiver.caps_version, "Receiver") {
+        findings.add(&CONSTRAINT_SETS, &receiver.core, problem);
     }
 }
 
@@ -859,6 +855,13 @@ pub(crate) fn compatibility(receiver: &Receiver<'_>, stream: &StreamFacts<'_, '_
         let types = list(types.iter().copied());
         return Some(format!("its caps.media_types ({types}) leave out {media_type}, which {sender} sends"));
     }
+    if let (Some(types), Some(event_type)) = (&receiver.event_types, stream.flow.event_type)
+        && !types.is_empty()
+        && !types.iter().any(|pattern| caps::event_type_matches(pattern, event_type))
+    {
+        let types = list(types.iter().copied());
+        return Some(format!("its caps.event_types ({types}) leave out {event_type}, which {sender} sends"));
+    }
     let reasons = caps::evaluate(receiver.constraint_sets?, stream).err()?;
     Some(format!("none of its constraint sets accepts what {sender} sends: {}", reasons.join("; ")))
 }
@@ -893,6 +896,8 @@ fn sender_view(model: &Model<'_>, sender: &Sender<'_>, sdp: Option<Sdp>) -> Send
         manifest_href: sender.manifest_href.map(str::to_string),
         streams: sdp.map(|s| s.report.streams).unwrap_or_default(),
         receivers,
+        compat: None,
+        active_constraints: None,
     }
 }
 
@@ -909,6 +914,7 @@ fn receiver_view(model: &Model<'_>, receiver: &Receiver<'_>) -> ReceiverView {
         active: receiver.active(),
         sender_id: sender_id.map(str::to_string),
         sender_label: sender_id.and_then(|id| model.sender(id)).map(|s| s.core.label.to_string()),
+        compat: None,
     }
 }
 

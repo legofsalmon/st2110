@@ -51,6 +51,7 @@ mod caps;
 mod check;
 #[cfg(feature = "client")]
 pub mod client;
+mod controls;
 pub mod groups;
 mod model;
 mod report;
@@ -62,5 +63,8 @@ pub mod ws;
 
 pub use check::check;
 pub use model::Kind;
-pub use report::{Finding, Grandmaster, ReceiverView, Report, ResourceRef, SenderView, Summary};
-pub use snapshot::{Manifest, Snapshot};
+pub use report::{
+    ChannelMapView, ChannelRoute, Finding, Grandmaster, InterfaceView, NodeView, OutputMap, ReceiverView, Report,
+    ResourceRef, SenderView, Summary, SystemView,
+};
+pub use snapshot::{Manifest, Snapshot, System};

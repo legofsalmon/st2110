@@ -24,8 +24,8 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::auth;
 use crate::check::is_http;
-use crate::routing::{active_urls, transport_file_urls};
-use crate::{Kind, Manifest, Snapshot};
+use crate::routing::{active_urls, control_urls, transport_file_urls};
+use crate::{Kind, Manifest, Snapshot, System};
 
 /// The IS-04 versions this client reads, oldest first.
 const VERSIONS: [&str; 4] = ["v1.0", "v1.1", "v1.2", "v1.3"];
@@ -50,6 +50,10 @@ pub struct Options {
     /// Device's Connection API, so the check can compare them with the registry's
     /// `subscription` ([`Snapshot::active`]).
     pub fetch_active: bool,
+    /// Whether to read each Device's IS-11 Stream Compatibility Management API and IS-08
+    /// Channel Mapping API, where it advertises them ([`Snapshot::stream_compat`],
+    /// [`Snapshot::channel_mapping`]).
+    pub fetch_controls: bool,
     /// Requests to make at once when fetching SDP files.
     pub parallel: usize,
     /// Whether to use the proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names
@@ -72,6 +76,7 @@ impl Default for Options {
             page_size: 100,
             fetch_sdp: true,
             fetch_active: false,
+            fetch_controls: false,
             parallel: 16,
             env_proxy: true,
             token: None,
@@ -358,7 +363,69 @@ impl Http {
             snapshot.active =
                 urls.into_iter().zip(fetched).filter_map(|((id, _), active)| Some((id, active?))).collect();
         }
+        if self.options.fetch_controls {
+            self.controls(&mut snapshot);
+        }
         Ok(snapshot)
+    }
+
+    /// Reads the IS-11 resources of each Sender and Receiver, and the IS-08 maps of each
+    /// Device, whose Devices advertise those APIs. What cannot be read is left out.
+    fn controls(&self, snapshot: &mut Snapshot) {
+        let (compat, mapping) = control_urls(snapshot);
+        // Each Sender's status, active and supported constraints; each Receiver's status.
+        let mut reads: Vec<(usize, &'static str, String)> = Vec::new();
+        for (i, (kind, _, base)) in compat.iter().enumerate() {
+            reads.push((i, "status", format!("{base}status")));
+            if *kind == Kind::Sender {
+                reads.push((i, "active", format!("{base}constraints/active")));
+                reads.push((i, "supported", format!("{base}constraints/supported")));
+            }
+        }
+        let urls: Vec<&str> = reads.iter().map(|(_, _, url)| url.as_str()).collect();
+        let fetched = self.each(&urls, |url| self.json::<Value>(url, "an IS-11 resource").ok());
+        for ((i, name, _), value) in reads.iter().zip(fetched) {
+            let Some(value) = value else { continue };
+            let entry =
+                snapshot.stream_compat.entry(compat[*i].1.clone()).or_insert_with(|| Value::Object(Default::default()));
+            entry[*name] = value;
+        }
+        let reads: Vec<(usize, &'static str, String)> = mapping
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (_, base))| [(i, "io", format!("{base}io")), (i, "active", format!("{base}map/active"))])
+            .collect();
+        let urls: Vec<&str> = reads.iter().map(|(_, _, url)| url.as_str()).collect();
+        let fetched = self.each(&urls, |url| self.json::<Value>(url, "an IS-08 resource").ok());
+        for ((i, name, _), value) in reads.iter().zip(fetched) {
+            let Some(value) = value else { continue };
+            let entry = snapshot
+                .channel_mapping
+                .entry(mapping[*i].0.clone())
+                .or_insert_with(|| Value::Object(Default::default()));
+            entry[*name] = value;
+        }
+    }
+}
+
+/// Reads the IS-09 System API's global configuration (`/global`). `url` may name the
+/// host (`http://system.example`), the API's root (`…/x-nmos/system/`) or its v1.0
+/// (`…/x-nmos/system/v1.0/`). A failure is recorded in the result, not returned.
+pub fn system(url: &str, options: &Options) -> System {
+    let trimmed = url.trim().trim_end_matches('/');
+    let global = if trimmed.ends_with("/global") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/x-nmos/system/v1.0") {
+        format!("{trimmed}/global")
+    } else if trimmed.ends_with("/x-nmos/system") {
+        format!("{trimmed}/v1.0/global")
+    } else {
+        format!("{trimmed}/x-nmos/system/v1.0/global")
+    };
+    let http = Http::new(options);
+    match http.json::<Value>(&global, "the System API's global configuration") {
+        Ok(value) => System { url: global, global: Some(value), error: None },
+        Err(e) => System { url: global, global: None, error: Some(e.message) },
     }
 }
 

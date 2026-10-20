@@ -309,6 +309,8 @@ pub(crate) struct Interface<'a> {
     /// where LLDP is not used, which IS-04 writes as `null`. `None` outside when the
     /// attribute is absent or malformed, which is noted as a problem.
     pub chassis_id: Option<Option<&'a str>>,
+    /// The LLDP port ID: the interface's MAC address.
+    pub port_id: Option<&'a str>,
     /// The switch port this interface is plugged into, as LLDP from the switch names
     /// it: chassis ID and port ID. `None` when not given, as before IS-04 v1.3.
     pub attached: Option<(&'a str, &'a str)>,
@@ -370,6 +372,8 @@ pub(crate) struct Flow<'a> {
     pub profile: Option<&'a str>,
     pub level: Option<&'a str>,
     pub sublevel: Option<&'a str>,
+    /// An IS-07 event Flow's `event_type`, such as `number/temperature/C`.
+    pub event_type: Option<&'a str>,
 }
 
 /// A Sender's or Receiver's connection state.
@@ -396,6 +400,10 @@ pub(crate) struct Sender<'a> {
     pub packet_transmission_mode: Option<&'a str>,
     pub hkep: Option<bool>,
     pub privacy: Option<bool>,
+    /// BCP-004-02 constraint sets: what the Sender can be made to send.
+    pub constraint_sets: Option<&'a [Value]>,
+    /// `caps.version`: when the constraint sets last changed.
+    pub caps_version: Option<&'a str>,
 }
 
 impl Sender<'_> {
@@ -413,6 +421,8 @@ pub(crate) struct Receiver<'a> {
     pub interface_bindings: Option<Vec<&'a str>>,
     pub subscription: Option<Subscription<'a>>,
     pub media_types: Option<Vec<&'a str>>,
+    /// The IS-07 event types an event Receiver takes, which may end in a wildcard.
+    pub event_types: Option<Vec<&'a str>>,
     /// BCP-004-01 constraint sets, kept as JSON for [`crate::caps`].
     pub constraint_sets: Option<&'a [Value]>,
     /// `caps.version`: when the constraint sets last changed.
@@ -479,7 +489,8 @@ impl<'a> Model<'a> {
                     Some(Value::Null) => Some(None),
                     _ => chassis_id.map(Some),
                 };
-                if let Some(port_id) = i.required_str("port_id")
+                let port_id = i.required_str("port_id");
+                if let Some(port_id) = port_id
                     && !is_mac(port_id)
                 {
                     i.wrong("port_id", "a MAC address written lowercase with dashes, such as 00-1b-21-a1-b2-c3");
@@ -490,7 +501,7 @@ impl<'a> Model<'a> {
                         chassis_id.zip(port_id)
                     })
                     .flatten();
-                Interface { name: i.required_str("name").unwrap_or_default(), chassis_id, attached }
+                Interface { name: i.required_str("name").unwrap_or_default(), chassis_id, port_id, attached }
             });
             at.require(&mut f, Kind::Node, value);
             model.add_problems(Kind::Node, index, f);
@@ -554,6 +565,7 @@ impl<'a> Model<'a> {
                 profile: f.str("profile"),
                 level: f.str("level"),
                 sublevel: f.str("sublevel"),
+                event_type: f.str("event_type"),
             };
             f.array("parents");
             // IS-04 v1.1 added media_type, and with it these attributes.
@@ -590,7 +602,16 @@ impl<'a> Model<'a> {
                 packet_transmission_mode: f.str("packet_transmission_mode"),
                 hkep: f.bool("hkep"),
                 privacy: f.bool("privacy"),
+                constraint_sets: None,
+                caps_version: None,
             };
+            let (constraint_sets, caps_version) = f
+                .object("caps", |c| {
+                    let sets = c.value("constraint_sets").map(|_| c.array("constraint_sets"));
+                    (sets, c.str("version"))
+                })
+                .unwrap_or_default();
+            let sender = Sender { constraint_sets, caps_version, ..sender };
             at.require(&mut f, Kind::Sender, value);
             model.add_problems(Kind::Sender, index, f);
             model.senders.push(sender);
@@ -604,11 +625,12 @@ impl<'a> Model<'a> {
             let interface_bindings = f.strings("interface_bindings");
             f.require("subscription");
             let subscription = subscription(&mut f, "sender_id");
-            let (media_types, constraint_sets, caps_version) = f
+            let (media_types, event_types, constraint_sets, caps_version) = f
                 .object("caps", |c| {
                     let media_types = c.strings("media_types");
+                    let event_types = c.strings("event_types");
                     let sets = c.value("constraint_sets").map(|_| c.array("constraint_sets"));
-                    (media_types, sets, c.str("version"))
+                    (media_types, event_types, sets, c.str("version"))
                 })
                 .unwrap_or_default();
             at.require(&mut f, Kind::Receiver, value);
@@ -621,6 +643,7 @@ impl<'a> Model<'a> {
                 interface_bindings,
                 subscription,
                 media_types,
+                event_types,
                 constraint_sets,
                 caps_version,
             });

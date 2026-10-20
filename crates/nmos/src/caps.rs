@@ -88,12 +88,14 @@ enum Target {
     Num(f64),
     Rat(i64, i64),
     Bool(bool),
+    /// An IS-07 event type, which a constraint may match with a wildcard.
+    EventType(String),
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Str(s) => f.write_str(s),
+            Self::Str(s) | Self::EventType(s) => f.write_str(s),
             Self::Int(n) => write!(f, "{n}"),
             Self::Num(n) => write!(f, "{n}"),
             Self::Rat(n, 1) => write!(f, "{n}"),
@@ -148,7 +150,7 @@ fn target(urn: &str, s: &StreamFacts<'_, '_>) -> Option<Target> {
         }
         "transport:hkep" => Some(Target::Bool(s.sender.hkep?)),
         "transport:privacy" => Some(Target::Bool(s.sender.privacy?)),
-        // Event types may use wildcards (IS-07), which this does not evaluate.
+        "format:event_type" => Some(Target::EventType(flow.event_type?.to_string())),
         _ => None,
     }
 }
@@ -239,8 +241,22 @@ fn compare_rational((n1, d1): (i64, i64), (n2, d2): (i64, i64)) -> Ordering {
 fn equal(allowed: &Value, value: &Target) -> bool {
     match value {
         Target::Str(s) => allowed.as_str() == Some(s),
+        Target::EventType(s) => allowed.as_str().is_some_and(|pattern| event_type_matches(pattern, s)),
         Target::Bool(b) => allowed.as_bool() == Some(*b),
         Target::Int(_) | Target::Num(_) | Target::Rat(..) => compare(value, allowed) == Some(Ordering::Equal),
+    }
+}
+
+/// Whether an IS-07 event type matches a Receiver's `pattern`: the same type, or one
+/// under a pattern ending in a wildcard that stands for whole words, so that
+/// `number/temperature/*` takes `number/temperature/C` and `*` takes any. Event types
+/// are compared case-sensitively (IS-07 v1.0.1 Event types: Event types capability
+/// management).
+pub(crate) fn event_type_matches(pattern: &str, event_type: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some("") => true,
+        Some(prefix) if prefix.ends_with('/') => event_type.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty()),
+        _ => pattern == event_type,
     }
 }
 
@@ -257,7 +273,7 @@ fn compare(value: &Target, bound: &Value) -> Option<Ordering> {
             if (n - b).abs() <= 1e-9 * b.abs().max(1.0) { Some(Ordering::Equal) } else { n.partial_cmp(&b) }
         }
         Target::Rat(n, d) => Some(compare_rational((*n, *d), json_rational(bound)?)),
-        Target::Str(_) | Target::Bool(_) => None,
+        Target::Str(_) | Target::Bool(_) | Target::EventType(_) => None,
     }
 }
 
@@ -351,5 +367,23 @@ mod tests {
         assert!(satisfies(&json!({"enum": ["video/raw"]}), &Target::Str("video/raw".into())).is_ok());
         assert!(satisfies(&json!({"enum": [true]}), &Target::Bool(false)).is_err());
         assert!(satisfies(&json!("video/raw"), &width).is_err());
+        let celsius = Target::EventType("number/temperature/C".into());
+        assert!(satisfies(&json!({"enum": ["number/temperature/*"]}), &celsius).is_ok());
+        assert!(satisfies(&json!({"enum": ["boolean", "number/*"]}), &celsius).is_ok());
+        assert_eq!(
+            satisfies(&json!({"enum": ["number/temperature/F"]}), &celsius),
+            Err("is not one of number/temperature/F".into())
+        );
+    }
+
+    #[test]
+    fn event_types_match_whole_words_at_the_end() {
+        assert!(event_type_matches("*", "boolean"));
+        assert!(event_type_matches("number/temperature/C", "number/temperature/C"));
+        assert!(event_type_matches("number/*", "number/temperature/C"));
+        assert!(!event_type_matches("number/*", "number"));
+        assert!(!event_type_matches("number/temperature/c", "number/temperature/C"), "case counts");
+        assert!(!event_type_matches("number/tempera*", "number/temperature/C"), "a wildcard is a whole word");
+        assert!(!event_type_matches("string/*", "number/temperature/C"));
     }
 }
