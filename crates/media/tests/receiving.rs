@@ -165,7 +165,35 @@ fn a_leg_that_goes_down_for_a_second_is_counted() {
     assert_eq!((sink.frames.len(), whole(&sink)), (150, true));
     assert_eq!((r.legs[0].rtp.lost, r.legs[1].rtp.lost, r.lost), (outage, 0, 0));
     assert!(r.problems.is_empty(), "{:?}", r.problems);
-    assert_eq!(r.notes, [format!("leg 1 (239.1.1.1:5004 from 10.0.0.1) lost {outage} packets")]);
+    // When it went and came back, as ST 2022-7 Annex B has a receiver tell.
+    assert_eq!(
+        r.notes,
+        [
+            format!("leg 1 (239.1.1.1:5004 from 10.0.0.1) lost {outage} packets"),
+            "leg 1 (239.1.1.1:5004 from 10.0.0.1) was gone from 0.500 s to 1.500 s, and the stream unprotected".into()
+        ]
+    );
+    assert_eq!(r.legs[0].outages.len(), 1);
+    assert!(r.legs[1].outages.is_empty());
+}
+
+#[test]
+fn copies_that_differ_are_counted() {
+    let d = video(2);
+    let packets = sent(&d, 20_000_000);
+    let mut arrivals = arrivals(&packets, &[20_000, 40_000], |_, _| false);
+    // Leg 2's copies of two packets differ in their last octet; leg 1's arrive first.
+    for (_, leg, datagram) in arrivals.iter_mut().filter(|a| a.1 == 1).skip(10).step_by(100).take(2) {
+        assert_eq!(*leg, 1);
+        *datagram.last_mut().unwrap() ^= 0xff;
+    }
+    let (r, _) = receive(&d, arrivals);
+    assert_eq!((r.legs[0].rtp.differs, r.legs[1].rtp.differs, r.lost), (0, 2, 0));
+    assert_eq!(
+        r.problems,
+        ["leg 2 (239.2.1.1:5004 from 10.0.1.1): 2 copies differ in RTP header or payload from the first copy, which \
+             ST 2022-7 has identical"]
+    );
 }
 
 #[test]

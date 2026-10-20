@@ -700,6 +700,7 @@ pub(crate) fn write_text(
             (leg.rtp.reordered, "out of order"),
             (leg.rtp.duplicates, "twice"),
             (leg.rtp.too_late, "too late to merge"),
+            (leg.rtp.differs, "unlike the first copy"),
         ] {
             if n > 0 {
                 line.push_str(&format!(", {n} {what}"));

@@ -38,10 +38,11 @@ struct Window {
     copies: u64,
 }
 
-/// One leg: its flow, when its last packet came, and its outages.
+/// One leg: its flow, when its first and last packets came, and its outages between.
 #[derive(Default)]
 struct Leg {
     flow: Option<usize>,
+    first: Option<i128>,
     last: Option<i128>,
     outages: Vec<(i128, Option<i128>)>,
 }
@@ -160,14 +161,13 @@ impl Pair {
     fn leg_arrived(&mut self, leg: usize, t: i128) {
         let others = self.legs.iter().enumerate().filter(|&(i, _)| i != leg).filter_map(|(_, l)| l.last).max();
         let l = &mut self.legs[leg];
-        match l.last {
-            // Silent for longer than OUTAGE while another leg brought packets.
-            Some(last) if t - last > OUTAGE && others.is_some_and(|o| o > last) => l.outages.push((last, Some(t))),
-            // Nothing yet, while another leg has brought packets for longer.
-            None if self.first.is_some_and(|first| t - first > OUTAGE) => {
-                l.outages.push((self.first.unwrap_or(t), Some(t)));
-            }
-            _ => {}
+        l.first.get_or_insert(t);
+        // Silent for longer than OUTAGE while another leg brought packets.
+        if let Some(last) = l.last
+            && t - last > OUTAGE
+            && others.is_some_and(|o| o > last)
+        {
+            l.outages.push((last, Some(t)));
         }
         l.last = Some(t);
     }
@@ -208,12 +208,19 @@ impl Pair {
         self.settle();
         let start = self.first;
         let at = |t: i128| timeline.at(Some(t)).unwrap_or_default();
+        // At the start and the end, a leg that runs behind the others by PD is not gone.
+        let edge = OUTAGE + self.pd.unwrap_or_default();
         let mut outages = Vec::new();
         for (i, leg) in self.legs.iter_mut().enumerate() {
-            match leg.last {
-                Some(last) if end - last > OUTAGE => leg.outages.push((last, None)),
-                None => leg.outages.extend(start.map(|first| (first, None))),
+            match (start, leg.first) {
+                (Some(start), Some(first)) if first - start > edge => leg.outages.push((start, Some(first))),
+                (Some(start), None) => leg.outages.push((start, None)),
                 _ => {}
+            }
+            if let Some(last) = leg.last
+                && end - last > edge
+            {
+                leg.outages.push((last, None));
             }
             for &(from, to) in &leg.outages {
                 outages.push(Outage { leg: i + 1, from: at(from), to: to.map(at) });
