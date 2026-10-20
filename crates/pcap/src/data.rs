@@ -412,7 +412,7 @@ impl Am824Engine {
         if p.payload.is_empty() || !p.payload.len().is_multiple_of(4 * channels) {
             return;
         }
-        for (i, subframe) in p.payload.chunks_exact(4).enumerate() {
+        for (i, subframe) in p.payload.as_chunks::<4>().0.iter().enumerate() {
             let (sample, channel) = (i / channels + 1, i % channels);
             let first = channel % 2 == 0;
             let (start, block, frame) = (subframe[0] & 0xC0, subframe[0] & 0x20 != 0, subframe[0] & 0x10 != 0);
