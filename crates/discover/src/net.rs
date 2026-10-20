@@ -144,6 +144,7 @@ fn route_source(destination: SocketAddrV4) -> io::Result<Ipv4Addr> {
 pub struct Announcer {
     socket: UdpSocket,
     to: SocketAddrV4,
+    origin: Ipv4Addr,
     announcement: Vec<u8>,
     deletion: Vec<u8>,
 }
@@ -169,6 +170,7 @@ impl Announcer {
         Ok(Self {
             socket: socket.into(),
             to,
+            origin,
             announcement: sap::packet(origin, sdp, false),
             deletion: sap::packet(origin, sdp, true),
         })
@@ -182,6 +184,15 @@ impl Announcer {
     /// Sends the deletion, for listeners to forget the session at once.
     pub fn delete(&self) -> io::Result<()> {
         self.socket.send_to(&self.deletion, self.to).map(drop)
+    }
+
+    /// Announces a changed SDP file in place of the one announced: deletes that one, which
+    /// its own message hash names, and announces the new one at once.
+    pub fn change(&mut self, sdp: &str) -> io::Result<()> {
+        let _ = self.delete();
+        self.announcement = sap::packet(self.origin, sdp, false);
+        self.deletion = sap::packet(self.origin, sdp, true);
+        self.announce()
     }
 }
 
