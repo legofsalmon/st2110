@@ -107,6 +107,12 @@ rules! {
         "The timestamped delay factor over each 200 ms of an audio stream stays under 17 packet times or 17 ms, whichever is smaller: the most AES67 allows a sender.";
     AM824_SUBFRAME = "am824-subframe", Error, "ST 2110-31:2022 §5.4",
         "Every AM824 subframe starts with two 0 bits, F is set on the first subframe of each AES3 frame and clear on the second, and B is set only on a first subframe.";
+    AM824_PARITY = "am824-parity", Error, "ST 2110-31:2022 §5.4; AES3-2-2009 §4",
+        "Each AM824 subframe's P bit gives it even parity over the audio and the V, U, C and P bits, as AES3 time slot 31 does.";
+    AM824_BLOCK = "am824-block", Error, "ST 2110-31:2022 §5.4; AES3-2-2009 §4",
+        "Each AES3 signal's B bit comes every 192 frames, starting a block of channel status.";
+    AM824_STATUS = "am824-channel-status", Error, "AES3-2-2009 §5",
+        "A block of professional channel status ends with its CRC (byte 23), unless a minimum implementation sends 0 there.";
     AM824_HEADER = "am824-header", Error, "ST 2110-31:2022 §5.3",
         "AES3 packets have the marker bit and the CSRC count set to 0.";
 
@@ -121,6 +127,8 @@ rules! {
         "Timed text payload headers have the reserved bits 0 and a Length equal to the octets of User Data Words that follow.";
     TTML_DOCUMENT = "ttml-document", Error, "RFC 8759 §4.1, §8",
         "The packets of one TTML document share its timestamp, the marker set on the last, and the next document has a different timestamp.";
+    TTML_KEEPALIVE = "ttml-keepalive", Warning, "ST 2110-43:2021 §4.3",
+        "An empty TTML packet is a keep-alive: it has its marker set and comes between documents. Receivers leave it out.";
     TTML_DOCUMENT_LOSS = "ttml-document-loss", Error, "RFC 8759 §8",
         "No TTML document loses a fragment: a document is put together from all its packets, so one lost packet loses it whole.";
 

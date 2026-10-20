@@ -1644,32 +1644,105 @@ fn ancillary_data_sent_outside_its_transmission_model() {
     );
 }
 
-/// An ST 2110-31 sender of eight AES3 subframes a sample period, 125 µs a packet, with
-/// `fault` to spoil a packet's RTP header and payload.
+/// A block of professional channel status for 48 kHz linear PCM, with its CRC.
+const AES3_STATUS: [u8; 24] = {
+    let mut status = [0; 24];
+    (status[0], status[2]) = (0x85, 0x01);
+    let mut crc = 0xFFu8;
+    let mut i = 0;
+    while i < 23 {
+        crc ^= status[i];
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xB8 } else { crc >> 1 };
+            bit += 1;
+        }
+        i += 1;
+    }
+    status[23] = crc;
+    status
+};
+
+/// One AM824 subframe of `sample`'s frame in its 192-frame block: F on the first of the
+/// pair, B on the first of a block, C from the channel status, and P for even parity.
+fn am824(first: bool, frame: usize, status: &[u8; 24], data: [u8; 3]) -> [u8; 4] {
+    let c = (status[frame / 8] >> (frame % 8)) & 1;
+    let flags = u8::from(first && frame == 0) << 5 | u8::from(first) << 4 | c << 2;
+    let mut subframe = [flags, data[0], data[1], data[2]];
+    if !(u32::from_be_bytes(subframe) & 0x0FFF_FFFF).count_ones().is_multiple_of(2) {
+        subframe[0] |= 0x08;
+    }
+    subframe
+}
+
+/// An ST 2110-31 sender of eight AES3 subframes a sample period, 125 µs a packet, whose
+/// RTP header and framing go wrong once each.
 fn with_broken_aes3() -> Report {
+    aes3_capture(|k, payload, _| {
+        if k == 400 {
+            // F on the second subframe of the second AES3 signal, not the first.
+            payload[8] ^= 0x10;
+            payload[12] ^= 0x10;
+        }
+        k == 500
+    })
+}
+
+/// An ST 2110-31 capture of eight AES3 subframes a sample period, which `spoil` may
+/// change: it has each packet's index, its payload, and the first frame's sample number,
+/// and says whether to set the packet's marker bit.
+fn aes3_capture(spoil: impl Fn(i128, &mut Vec<u8>, i128) -> bool) -> Report {
     let mut scene = Scene::default();
     let mut seq = 0_u16;
     for i in NOON * 8000..NOON * 8000 + 800 {
         let mut payload = Vec::new();
         for sample in i * 6..i * 6 + 6 {
             for channel in 0..8 {
-                let first = channel % 2 == 0;
-                let block = first && sample % 192 == 0;
-                payload.extend([u8::from(block) << 5 | u8::from(first) << 4, 0x12, 0x34, 0x56]);
+                let frame = (sample % 192) as usize;
+                payload.extend(am824(channel % 2 == 0, frame, &AES3_STATUS, [0x12, 0x34, 0x56]));
             }
         }
         let k = i - NOON * 8000;
-        if k == 400 {
-            // F on the second subframe of the second AES3 signal, not the first.
-            payload[8] ^= 0x10;
-            payload[12] ^= 0x10;
-        }
-        let packet = rtp(98, k == 500, seq, (i * 6) as u32, 0x4444_0004, &payload);
+        let marker = spoil(k, &mut payload, i * 6);
+        let packet = rtp(98, marker, seq, (i * 6) as u32, 0x4444_0004, &payload);
         seq = seq.wrapping_add(1);
         scene.udp((i * 6 + 6) * NANOS / 48_000 + 150_000, "192.168.10.50:5016", "239.10.10.7:5016", &packet);
     }
     send_ptp(&mut scene, GM, 1, |_, _| false);
     scene.analyse(&[fixture("aes3.sdp")])
+}
+
+/// AES3 whose parity, block starts and channel status go wrong once each.
+fn with_spoilt_aes3_bits() -> Report {
+    aes3_capture(|k, payload, first| {
+        match k {
+            // Odd parity on the third signal's second subframe.
+            100 => payload[4 * 5] ^= 0x08,
+            // A B bit on the fourth signal, partway through its block. B and F are outside
+            // the parity, which covers PCUV and the audio.
+            200 if first % 192 != 0 => payload[4 * 6] |= 0x20,
+            // A C bit flipped on the first signal: its block's CRC no longer holds.
+            300 => payload[0] ^= 0x0C,
+            _ => {}
+        }
+        false
+    })
+}
+
+#[test]
+fn aes3_parity_blocks_and_channel_status() {
+    let report = with_spoilt_aes3_bits();
+    assert_eq!(rules(&report), ["am824-parity", "am824-block", "am824-channel-status"], "{:#?}", report.findings);
+    assert_eq!(
+        finding(&report, "am824-parity").message,
+        "1 packet had AM824 subframes with odd parity; the first: subframe 2 of AES3 signal 3 in sample period 1 has odd parity"
+    );
+    assert!(
+        finding(&report, "am824-block").message.contains("AES3 signal 4 had a B bit"),
+        "{}",
+        finding(&report, "am824-block").message
+    );
+    assert!(finding(&report, "am824-channel-status").message.contains("subframe 1 of AES3 signal 1"));
 }
 
 #[test]
@@ -1747,8 +1820,8 @@ fn with_broken_timed_text() -> Report {
         let second = if doc == 3 { stamp + 1 } else { stamp };
         send(&mut scene, t, false, stamp, u16::from(doc == 7), b"<tt xml:lang=\"en\"><body>", false);
         send(&mut scene, t + 1_000_000, true, second, 0, b"</body></tt>", doc == 9);
-        // A keep-alive between documents.
-        send(&mut scene, t + 50_000_000, true, stamp, 0, b"", false);
+        // A keep-alive between documents; after document 12, without its marker.
+        send(&mut scene, t + 50_000_000, doc != 12, stamp, 0, b"", false);
     }
     send_ptp(&mut scene, GM, 2, |_, _| false);
     scene.analyse(&[fixture("ttml.sdp")])
@@ -1759,7 +1832,7 @@ fn timed_text_documents() {
     let report = with_broken_timed_text();
     assert_eq!(
         rules(&report),
-        ["packet-loss", "ttml-payload", "ttml-document", "ttml-document-loss"],
+        ["packet-loss", "ttml-payload", "ttml-document", "ttml-keepalive", "ttml-document-loss"],
         "{:#?}",
         report.findings
     );
@@ -1774,6 +1847,10 @@ fn timed_text_documents() {
         "2 packets broke a document's framing; the first: a document's packets carried timestamps 3061378376 and then 3061378377"
     );
     assert!(finding(&report, "ttml-document-loss").message.starts_with("1 document lost a packet partway through"));
+    assert_eq!(
+        finding(&report, "ttml-keepalive").message,
+        "1 packet came as keep-alives out of place; the first: an empty packet had its marker clear"
+    );
 }
 
 fn with_jitter_beyond_aes67() -> Report {
@@ -1844,6 +1921,7 @@ fn every_rule_has_a_capture_that_raises_it() {
         with_broken_ancillary_data(),
         with_mistimed_ancillary_data(),
         with_broken_aes3(),
+        with_spoilt_aes3_bits(),
         with_broken_fast_metadata(),
         with_broken_timed_text(),
         with_jitter_beyond_aes67(),
