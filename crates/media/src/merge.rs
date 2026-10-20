@@ -10,11 +10,15 @@
 //! numbers; a leg running further behind than the window, when they are as much older;
 //! a stray, when no packet follows it; and otherwise a sender that restarted.
 //!
+//! ST 2022-7:2019 §6 has the RTP header and payload of every copy identical:
+//! [`Merger::compare`] keeps a hash of each first copy and counts the copies that differ.
+//!
 //! The [`Playout`] then puts the first copies back in sequence order. When one is
 //! missing, it holds the packets after it for as long as the legs may differ, so that a
 //! copy on a leg that runs behind can still fill the gap.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::hash::{DefaultHasher, Hasher};
 
 /// Extends 16-bit RTP sequence numbers to 32 bits by counting wraps, for payloads that
 /// carry no extended sequence number, such as ST 2110-30 audio.
@@ -102,6 +106,9 @@ pub struct LegCounts {
     /// Packets older than the window when they came: the leg ran further behind the
     /// others than the window allows.
     pub too_late: u64,
+    /// Copies whose RTP header or payload differ from the first copy's, which ST 2022-7
+    /// §6 has identical.
+    pub differs: u64,
 }
 
 /// How far apart the legs' copies of the same packets arrived.
@@ -187,6 +194,8 @@ pub struct Merger {
     /// For each slot, a bit for each leg the packet came on.
     seen: Vec<u8>,
     first_leg: Vec<u8>,
+    /// A hash of each first copy's RTP header and payload, with its sequence number.
+    digests: Vec<Option<(u32, u64)>>,
     /// When the first copy came, in nanoseconds after `base`.
     arrival: Vec<i64>,
     base: Option<i128>,
@@ -220,6 +229,7 @@ impl Merger {
             pace,
             seen: vec![0; window as usize],
             first_leg: vec![0; window as usize],
+            digests: Vec::new(),
             arrival: vec![0; window as usize],
             base: None,
             regime: None,
@@ -287,6 +297,37 @@ impl Merger {
             return Verdict::Stale;
         }
         self.probation(leg, ssrc, sequence, timestamp, time)
+    }
+
+    /// Takes the datagram of a packet [`Merger::push`] just took from leg `leg`, with its
+    /// 32-bit sequence number and the verdict, and counts it on the leg when it is a copy
+    /// whose RTP header or payload differ from the first copy's. Only for more than one
+    /// leg; a copy whose first came while the merger held it is not compared.
+    pub fn compare(&mut self, leg: usize, sequence: u32, verdict: Verdict, datagram: &[u8]) {
+        if self.legs.len() < 2 {
+            return;
+        }
+        if self.digests.is_empty() {
+            self.digests = vec![None; self.window as usize];
+        }
+        let slot = self.slot(sequence);
+        let digest = || {
+            let mut hasher = DefaultHasher::new();
+            hasher.write(datagram);
+            hasher.finish()
+        };
+        match verdict {
+            Verdict::First | Verdict::Resumed | Verdict::Restart => self.digests[slot] = Some((sequence, digest())),
+            Verdict::Copy => {
+                if let Some((first, d)) = self.digests[slot]
+                    && first == sequence
+                    && d != digest()
+                {
+                    self.legs[leg].counts.differs += 1;
+                }
+            }
+            Verdict::TooLate | Verdict::Held | Verdict::Stale => {}
+        }
     }
 
     /// What it has counted, with the packets missing from the window so far as lost.
@@ -888,7 +929,10 @@ mod tests {
         let c = m.counts();
         // 0 never came; 1 came late and twice.
         assert_eq!((c.passed, c.lost), (5, 1));
-        assert_eq!(c.legs[0], LegCounts { received: 6, lost: 1, reordered: 1, duplicates: 1, first: 5, too_late: 0 });
+        assert_eq!(
+            c.legs[0],
+            LegCounts { received: 6, lost: 1, reordered: 1, duplicates: 1, first: 5, too_late: 0, differs: 0 }
+        );
         assert!(c.skew.is_none());
         // Past the window, the loss stays counted.
         for seq in 4..30 {

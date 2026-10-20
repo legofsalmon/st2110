@@ -16,7 +16,7 @@ use st2110_nmos::client::{Options, QueryClient};
 use st2110_nmos::routing::{self, Matrix};
 use st2110_nmos::{Kind, Snapshot};
 use st2110_ptp::PtpTime;
-use st2110_ptp::timing::read_time;
+use st2110_ptp::timing::{read_frame_rate, read_time};
 
 use crate::timing::now;
 use crate::{Format, Style, plural, read, seconds};
@@ -33,6 +33,7 @@ pub(crate) struct Args {
     pub at: Option<String>,
     pub after: Option<f64>,
     pub lead: f64,
+    pub align: Option<String>,
     pub dry_run: bool,
     pub force: bool,
     pub timeout: f64,
@@ -273,6 +274,15 @@ fn make(args: &Args, format: Format) -> Result<ExitCode, Failure> {
         dry_run: args.dry_run,
         wait: seconds("--wait", args.wait)?,
         tai_utc: args.tai_utc,
+        align: args
+            .align
+            .as_deref()
+            .map(|text| {
+                read_frame_rate(text).ok_or_else(|| {
+                    Failure::Usage(format!("--align {text}: not a frame rate, such as 50 or 60000/1001"))
+                })
+            })
+            .transpose()?,
     };
     let timeout = seconds("--timeout", args.timeout)?;
     if timeout.is_zero() {

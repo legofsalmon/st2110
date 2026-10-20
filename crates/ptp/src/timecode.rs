@@ -1,11 +1,12 @@
-//! Time code from PTP time: SMPTE ST 12-1 time addresses and the ST 2059-1 daily jam.
+//! Time code from PTP time: SMPTE ST 12-1 time addresses, colour framing and the
+//! ST 309 date, from the ST 2059-1 daily jam.
 
 use std::fmt;
 
 use st2110_sdp::Rational;
 
 use crate::epoch::period_index;
-use crate::time::{NANOS, PtpTime};
+use crate::time::{Civil, NANOS, PtpTime};
 
 /// An ST 12-1 time address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,9 @@ pub struct TimeAddress {
     /// Whether it counts in drop-frame, which skips frame numbers 0 and 1 at the start
     /// of each minute except every tenth.
     pub drop_frame: bool,
+    /// The Color Frame Flag of the ST 12-1 codeword: set when the time code is colour
+    /// frame aligned (ST 2059-1 §9.3).
+    pub color_frame: bool,
 }
 
 /// Written `13:00:00:04`, or `13:00:00;04` in drop-frame.
@@ -42,11 +46,13 @@ impl serde::Serialize for TimeAddress {
 const DF_TEN_MINUTES: i128 = 17_982;
 const DF_MINUTE: i128 = 1798;
 
-/// How time code counts: its codeword rate, and whether it drops frame numbers.
+/// How time code counts: its codeword rate, whether it drops frame numbers, and whether
+/// it is colour frame aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimecodeRate {
     rate: Rational,
     drop_frame: bool,
+    color_frame: bool,
 }
 
 impl TimecodeRate {
@@ -55,7 +61,14 @@ impl TimecodeRate {
     pub fn new(rate: Rational, drop_frame: bool) -> Option<Self> {
         let known = matches!((rate.numerator(), rate.denominator()), (24 | 25 | 30, 1) | (24000 | 30000, 1001));
         let drop_ok = !drop_frame || (rate.numerator(), rate.denominator()) == (30000, 1001);
-        (known && drop_ok).then_some(Self { rate, drop_frame })
+        (known && drop_ok).then_some(Self { rate, drop_frame, color_frame: false })
+    }
+
+    /// The same, colour frame aligned to the SMPTE Epoch, as `colorFrameIdentificationMode`
+    /// asks: the daily jam waits for the first codeword of a colour frame sequence.
+    /// ST 2059-1 §9.3.2.1 defines it at 25 and 30000/1001 codewords a second only.
+    pub fn with_color_frame(self) -> Option<Self> {
+        self.color_frames().is_some().then_some(Self { color_frame: true, ..self })
     }
 
     /// Time code for video at `frame_rate`. Above 30 fps, one codeword spans two frames
@@ -76,6 +89,21 @@ impl TimecodeRate {
     /// Whether it counts in drop-frame.
     pub fn drop_frame(self) -> bool {
         self.drop_frame
+    }
+
+    /// Whether it is colour frame aligned.
+    pub fn color_frame(self) -> bool {
+        self.color_frame
+    }
+
+    /// CF, the codewords in a colour frame sequence (ST 2059-1 §9.3.2.1): 2 at
+    /// 30000/1001 and 4 at 25.
+    fn color_frames(self) -> Option<i128> {
+        match (self.rate.numerator(), self.rate.denominator()) {
+            (30000, 1001) => Some(2),
+            (25, 1) => Some(4),
+            _ => None,
+        }
     }
 
     /// Frame numbers in a second: 24, 25 or 30.
@@ -104,6 +132,7 @@ impl TimecodeRate {
             seconds: (count / fps % 60) as u8,
             frames: (count % fps) as u8,
             drop_frame: self.drop_frame,
+            color_frame: self.color_frame,
         }
     }
 
@@ -144,6 +173,29 @@ impl Jam {
     }
 }
 
+/// An ST 309 date: the Gregorian date and Modified Julian Date of Local Time on the
+/// time code's day, which changes as the time address passes 00:00:00:00 (ST 2059-1
+/// §9.3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Date {
+    /// The year, such as 2026.
+    pub year: i64,
+    /// The month, 1 to 12.
+    pub month: u8,
+    /// The day of the month, 1 to 31.
+    pub day: u8,
+    /// Days since 1858-11-17.
+    pub mjd: i64,
+}
+
+/// Written `2026-09-27 (MJD 61310)`.
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04}-{:02}-{:02} (MJD {})", self.year, self.month, self.day, self.mjd)
+    }
+}
+
 /// The time address of the time code codeword in progress at `t` (ST 2059-1 §9.3).
 ///
 /// At the daily jam, time code takes the Local Time of day, and from then it counts
@@ -151,25 +203,63 @@ impl Jam {
 /// and each one after adds a frame. At 1000/1001 rates the count drifts from Local Time
 /// until the next jam sets it again; a change to the local offset also waits for it.
 ///
+/// Colour frame aligned, the jam waits for the first codeword of a colour frame
+/// sequence, and at 25 codewords a second that codeword is frame 1 (§9.3.2.1).
+///
 /// `None` when the codeword in progress at `t` began before that first codeword, so
 /// that the jam before set it, as for up to a frame after a jam at 1000/1001 rates, or
 /// when the jam is not on a whole second.
 pub fn timecode_at(t: PtpTime, rate: TimecodeRate, jam: Jam) -> Option<TimeAddress> {
+    let (count, _) = since_jam(t, rate, jam)?;
+    Some(rate.address(count))
+}
+
+/// The ST 309 date of the time code codeword in progress at `t`: the jam's Local Time
+/// date, and a day more each time the time address has passed midnight since
+/// (ST 2059-1 §9.3.2.5 step 3). `None` when [`timecode_at`] is.
+pub fn date_at(t: PtpTime, rate: TimecodeRate, jam: Jam) -> Option<Date> {
+    let (count, jam_day) = since_jam(t, rate, jam)?;
+    let days = jam_day + count.div_euclid(i128::from(rate.frames_per_day()));
+    let civil = Civil::from_nanos(days.checked_mul(86_400 * NANOS)?)?;
+    let mjd = i64::try_from(days + 40_587).ok()?;
+    Some(Date { year: civil.year, month: civil.month, day: civil.day, mjd })
+}
+
+/// The count of the codeword in progress at `t` from midnight of the jam's day, not
+/// wrapped at the end of the day, and that day, in days since 1970-01-01 Local Time.
+fn since_jam(t: PtpTime, rate: TimecodeRate, jam: Jam) -> Option<(i128, i128)> {
     if jam.time.subsec_nanos() != 0 {
         return None;
     }
     let codewords = rate.rate();
     let now = period_index(t, codewords)?;
-    let jam_index = ceil_index(jam.time, codewords)?;
+    let mut jam_index = ceil_index(jam.time, codewords)?;
+    // The codewords on to the start of the colour frame sequence (§9.3.2.1 step 2).
+    if let (true, Some(cf)) = (rate.color_frame(), rate.color_frames()) {
+        jam_index += (cf - jam_index.rem_euclid(cf)) % cf;
+    }
     if now < jam_index {
         return None;
     }
-    let local = (i128::from(jam.time.seconds()) + i128::from(jam.local_offset)).rem_euclid(86_400);
-    let (hours, minutes, seconds) = ((local / 3600) as u8, (local / 60 % 60) as u8, (local % 60) as u8);
-    // A drop-frame minute not divisible by ten starts at frame 2.
-    let frames = if rate.drop_frame() && seconds == 0 && minutes % 10 != 0 { 2 } else { 0 };
-    let at_jam = rate.count(TimeAddress { hours, minutes, seconds, frames, drop_frame: rate.drop_frame() })?;
-    Some(rate.address(i128::from(at_jam) + now - jam_index))
+    let local = i128::from(jam.time.seconds()) + i128::from(jam.local_offset);
+    let (day, of_day) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+    let (hours, minutes, seconds) = ((of_day / 3600) as u8, (of_day / 60 % 60) as u8, (of_day % 60) as u8);
+    let frames = match (rate.drop_frame(), rate.color_frame() && rate.color_frames() == Some(4)) {
+        // FFpdjam is 1 at 25 codewords a second, colour frame aligned (§9.3.2.1 step 5).
+        (_, true) => 1,
+        // A drop-frame minute not divisible by ten starts at frame 2.
+        (true, false) if seconds == 0 && minutes % 10 != 0 => 2,
+        _ => 0,
+    };
+    let at_jam = rate.count(TimeAddress {
+        hours,
+        minutes,
+        seconds,
+        frames,
+        drop_frame: rate.drop_frame(),
+        color_frame: rate.color_frame(),
+    })?;
+    Some((i128::from(at_jam) + now - jam_index, day))
 }
 
 /// ceil(t × rate): the index of the first period that starts at or after `t`.
@@ -208,7 +298,14 @@ mod tests {
         }
         assert_eq!(df.frames_per_day(), 2_589_408);
         // 00:01:00;00 and ;01 do not exist; 00:10:00;00 does.
-        let at = |minutes, frames| TimeAddress { hours: 0, minutes, seconds: 0, frames, drop_frame: true };
+        let at = |minutes, frames| TimeAddress {
+            hours: 0,
+            minutes,
+            seconds: 0,
+            frames,
+            drop_frame: true,
+            color_frame: false,
+        };
         assert_eq!(df.count(at(1, 0)), None);
         assert_eq!(df.count(at(1, 1)), None);
         assert_eq!(df.count(at(10, 0)), Some(17_982));
@@ -264,6 +361,52 @@ mod tests {
         // A jam off the whole second is not one a grandmaster could send.
         let fraction = Jam { time: jam.time.add_nanos(500_000_000).unwrap(), ..jam };
         assert_eq!(timecode_at(t, rate(25, 1, false), fraction), None);
+    }
+
+    #[test]
+    fn colour_framing_waits_for_the_sequence() {
+        // 2026-09-27 12:00:00.123456789 UTC, from the jam at midnight British Summer Time.
+        let t = PtpTime::parse("1790510437.123456789").unwrap();
+        let jam = Jam::midnight(t, 3563).unwrap();
+        // At 25 codewords a second the jam is codeword 44761590925 since the epoch, 1 into
+        // a sequence of four: time code starts three codewords on, at frame 1.
+        let pal = rate(25, 1, false).with_color_frame().unwrap();
+        let at = |ms: i128| timecode_at(jam.time.add_nanos(ms * 1_000_000).unwrap(), pal, jam);
+        assert_eq!(at(100), None);
+        let first = at(120).unwrap();
+        assert_eq!((first.to_string(), first.color_frame), ("00:00:00:01".into(), true));
+        assert_eq!(timecode_at(t, pal, jam).unwrap().to_string(), "13:00:00:01");
+        // At 30000/1001 the sequence is two codewords. Five seconds after midnight the first
+        // codeword after the jam, 0.4 ms in, is odd: time code starts at the next, 33.7 ms in.
+        let ntsc = rate(30000, 1001, true);
+        let jam = Jam { time: jam.time.add_nanos(5 * NANOS).unwrap(), ..jam };
+        let at = |tc, ms: i128| timecode_at(jam.time.add_nanos(ms * 1_000_000).unwrap(), tc, jam);
+        assert_eq!(at(ntsc, 10).map(|a| a.to_string()).as_deref(), Some("00:00:05;00"));
+        let framed = ntsc.with_color_frame().unwrap();
+        assert_eq!(at(framed, 10), None);
+        assert_eq!(at(framed, 40).map(|a| a.to_string()).as_deref(), Some("00:00:05;00"));
+        // ST 2059-1 defines it at those two rates only.
+        assert_eq!(rate(30, 1, false).with_color_frame(), None);
+        assert_eq!(rate(24000, 1001, false).with_color_frame(), None);
+    }
+
+    #[test]
+    fn the_date_changes_with_the_time_address() {
+        let t = PtpTime::parse("1790510437.123456789").unwrap();
+        let jam = Jam::midnight(t, 3563).unwrap();
+        let date = date_at(t, rate(25, 1, false), jam).unwrap();
+        assert_eq!(date.to_string(), "2026-09-27 (MJD 61310)");
+        // Non-drop time code at 30000/1001 runs 86.4 s a day behind Local Time: jammed at
+        // midnight a day before, it is still on the 26th 30 s into the 27th, and on the
+        // 27th a minute and a half later.
+        let ndf = rate(30000, 1001, false);
+        let before = Jam { time: jam.time.add_nanos(-86_400 * NANOS).unwrap(), ..jam };
+        let at = |s: i128| {
+            let t = before.time.add_nanos(s * NANOS).unwrap();
+            (timecode_at(t, ndf, before).unwrap().to_string(), date_at(t, ndf, before).unwrap().to_string())
+        };
+        assert_eq!(at(86_430), ("23:59:03:19".into(), "2026-09-26 (MJD 61309)".into()));
+        assert_eq!(at(86_520), ("00:00:33:16".into(), "2026-09-27 (MJD 61310)".into()));
     }
 
     #[test]

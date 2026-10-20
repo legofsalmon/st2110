@@ -405,6 +405,9 @@ export interface TimingOptions {
   jamLocalOffset?: number;
   /** Whether 30000/1001 time code drops frames; true when omitted. */
   dropFrame?: boolean;
+  /** Whether 25 and 30000/1001 time code is colour frame aligned (ST 2059-1 §9.3.2.1);
+   *  false when omitted. */
+  colorFrame?: boolean;
 }
 
 /** Times are PTP times, "seconds.nanoseconds", or calendar times, "YYYY-MM-DD hh:mm:ss.nnnnnnnnn". */
@@ -412,6 +415,10 @@ export interface Timecode {
   address: string;
   rate: string;
   drop_frame: boolean;
+  /** The codeword's Color Frame Flag. */
+  color_frame: boolean;
+  /** The ST 309 date: Local Time on the time code's day, and its Modified Julian Date. */
+  date: { year: number; month: number; day: number; mjd: number };
   jam: string;
   jam_local: string;
 }
@@ -650,6 +657,63 @@ export interface PtpDomainReport {
   ports: PtpPortReport[];
   /** From a Sync leaving the grandmaster to its arrival, in microseconds. */
   sync_offset_us: Stats | null;
+  /** The grandmaster and its quality as Announce messages gave them: the first, then each change, up to 64. */
+  quality: GrandmasterQuality[];
+  /** The synchronization metadata TLVs (ST 2059-2 §6.12), when any came. */
+  sync_metadata: SyncMetadataReport | null;
+}
+
+/** `at` is seconds since the capture began. */
+export interface GrandmasterQuality {
+  at: number;
+  grandmaster: string;
+  class: number;
+  accuracy: number;
+  variance: number;
+  time_source: number;
+  ptp_timescale: boolean;
+  time_traceable: boolean;
+}
+
+export interface SyncMetadataReport {
+  messages: number;
+  interval_ms: Stats | null;
+  /** gmLockingStatus: the first, then each change, with when in seconds since the capture began. */
+  locking: { at: number; status: string }[];
+}
+
+/** One second of an ST 2022-7 pair; `second` is whole seconds of PTP time. */
+export interface PairWindow {
+  second: number;
+  copies: number;
+  pd_us: number | null;
+  class: string | null;
+  lost: number;
+}
+
+/** A leg (from 1) that brought nothing while another did, in seconds since the capture began; `to` null when it never came back. */
+export interface Outage {
+  leg: number;
+  from: number;
+  to: number | null;
+}
+
+/** The legs of an SDP file's DUP group, merged as an ST 2022-7 receiver would. */
+export interface PairReport {
+  group: string;
+  /** Each leg's FlowReport index, null for a leg not in the capture. */
+  flows: (number | null)[];
+  packets: number;
+  copies: number;
+  /** The packet time differential, PD = max |Pi − Pj| (ST 2022-7 §7), in microseconds. */
+  pd_us: number | null;
+  /** The tightest receiver class of ST 2022-7 Table 1 that allows it. */
+  class: string | null;
+  /** Packets no leg delivered. */
+  lost: number;
+  restarts: number;
+  seconds: PairWindow[];
+  outages: Outage[];
 }
 
 export interface CapturePtp {
@@ -676,6 +740,7 @@ export interface CaptureReport {
   capture: CaptureFile;
   timescale: CaptureTimescale;
   flows: FlowReport[];
+  pairs: PairReport[];
   ptp: CapturePtp;
   /** Streams in the SDP files that no flow matched. */
   missing: string[];
@@ -882,6 +947,7 @@ struct TimingOptions {
     jam: Option<String>,
     jam_local_offset: Option<i32>,
     drop_frame: Option<bool>,
+    color_frame: Option<bool>,
 }
 
 /// Works out where a PTP time falls, by ST 2059-1: for each video frame rate its frame,
@@ -939,6 +1005,7 @@ pub fn timing(
         jam,
         jam_local_offset: o.jam_local_offset,
         drop_frame: o.drop_frame.unwrap_or(true),
+        color_frame: o.color_frame.unwrap_or(false),
     };
     to_js(&timing::at(t, &options).map_err(|e| JsError::new(&e.to_string()))?)
 }
