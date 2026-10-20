@@ -153,11 +153,14 @@ fn cases() -> Vec<(&'static str, String)> {
         ("maxudp-standard-only", with(AUDIO, "TSMODE=SAMP", "TSMODE=SAMP; MAXUDP=8960")),
         ("aes3-channels", with(AES3, "AM824/48000/8", "AM824/48000/7")),
         ("aes3-ptime", with(AES3, "a=ptime:0.12", "a=ptime:0.125")),
-        // ST 2110-40 and -41.
+        // ST 2110-40, -41 and -43.
         ("anc-tm", with(ANC, "TM=CTM", "TM=FAST")),
         ("anc-param", with(ANC, "DID_SDID={0x61,0x01}", "DID_SDID={61,01}")),
+        ("anc-audio-edh", with(ANC, "DID_SDID={0x60,0x60}", "DID_SDID={0xE7,0x00}")),
         ("fmx-dit", with(FMX, "DIT=100", "DIT=300000")),
         ("fmx-dit-syntax", with(FMX, "DIT=100", "DIT=0x100")),
+        ("fmx-mga-clock", with(FMX, "ST2110-41/48000", "ST2110-41/90000")),
+        ("media-type", with(ANC, "m=video 5008", "m=audio 5008")),
         // Anything else.
         ("essence-unknown", with(AUDIO, "L24/48000/8", "opus/48000/8")),
     ]
@@ -313,6 +316,34 @@ fn valid_variations_raise_nothing() {
     for text in valid {
         assert_eq!(lint(&text).diagnostics, [], "in:\n{text}");
     }
+}
+
+#[test]
+fn aes3_levels_at_44_1_and_96_khz() {
+    let aes3 = |rate: &str, ptime: &str, subframes: u16| {
+        let pairs = vec!["AES3"; usize::from(subframes / 2)].join(",");
+        let text = with(AES3, "AM824/48000/8", &format!("AM824/{rate}/{subframes}"));
+        let text = with(text, "(AES3,AES3,AES3,AES3)", &format!("({pairs})"));
+        with(text, "a=ptime:0.12", &format!("a=ptime:{ptime}"))
+    };
+    let summary = |text: &str| lint(text).streams[0].summary.clone();
+    assert!(summary(&aes3("96000", "1", 2)).contains("level AX"), "{}", summary(&aes3("96000", "1", 2)));
+    assert!(summary(&aes3("44100", "0.14", 60)).contains("level CX"));
+    assert!(summary(&aes3("96000", "0.08", 40)).contains("level DX"));
+    assert_eq!(ids(&aes3("96000", "0.12", 30)), BTreeSet::from(["tsmode-absent"]));
+    // 96 kHz at 1 ms carries 2 subframes at most.
+    let found = lint(&aes3("96000", "1", 4));
+    let level = found.diagnostics.iter().find(|d| d.rule == "audio-level").expect("audio-level");
+    assert!(level.message.starts_with("96 kHz with 1 ms packets and 4 subframes fits no ST 2110-31 level: AX is 1 ms"));
+}
+
+#[test]
+fn data_streams_say_their_media_type() {
+    let found = |text: &str| lint(text).diagnostics.into_iter().filter(|d| d.rule == "media-type").count();
+    assert_eq!(found(&with(FMX, "m=application", "m=video")), 1);
+    assert_eq!(found(&with(TTML, "m=application", "m=text")), 1);
+    assert_eq!(found(&with(ANC, "m=video", "m=application")), 1);
+    assert_eq!(found(FMX) + found(TTML) + found(ANC), 0);
 }
 
 #[test]

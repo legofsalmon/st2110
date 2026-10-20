@@ -1,5 +1,6 @@
 //! ST 2110-40 ancillary data, ST 2110-41 fast metadata and ST 2110-43 timed text.
 
+use crate::data::{audio_or_edh, did_sdid};
 use crate::diag::Diagnostics;
 use crate::fmtp::Fmtp;
 use crate::rules;
@@ -20,7 +21,24 @@ const ANC_NAMES: Names<'static> = Names {
 const FMX_NAMES: Names<'static> = Names { known: &["SSN", "DIT"], strict: false, repeatable: &[] };
 const TTML_NAMES: Names<'static> = Names { known: &["codecs", "charset"], strict: false, repeatable: &[] };
 
+/// Checks the `m=` line's media type against the one the payload format registers.
+fn media_type(m: &Media<'_>, d: &mut Diagnostics, expected: &str, reference: &'static str) {
+    let Some(media) = m.mline.as_ref().map(|l| l.media.as_str()) else { return };
+    if media.eq_ignore_ascii_case(expected) {
+        return;
+    }
+    let encoding = m.rtpmap.as_ref().map_or("", |(_, map)| map.encoding.as_str());
+    d.report(
+        &rules::MEDIA_TYPE,
+        m.index,
+        m.line,
+        format!("m={media} with {encoding}: the media type is {expected}/{encoding}, so the m= line says {expected}"),
+    )
+    .cite(reference);
+}
+
 pub(super) fn check_anc(m: &Media<'_>, d: &mut Diagnostics) {
+    media_type(m, d, "video", "RFC 8331 §4");
     super::clock_rate(m, d, 90_000, "ST 2110-40:2023");
     let Some((line, fmtp)) = m.format() else {
         d.report(
@@ -62,13 +80,25 @@ pub(super) fn check_anc(m: &Media<'_>, d: &mut Diagnostics) {
     anc_edition(m, line, fmtp, timing_model.is_some(), d);
     for param in fmtp.all("DID_SDID") {
         let value = param.value.as_deref().unwrap_or("");
-        if did_sdid(value).is_none() {
-            d.report(
-                &rules::ANC_PARAM,
-                m.index,
-                line,
-                format!("DID_SDID={value} is not {{0xNN,0xNN}}, such as DID_SDID={{0x61,0x01}}"),
-            );
+        match did_sdid(value) {
+            None => {
+                d.report(
+                    &rules::ANC_PARAM,
+                    m.index,
+                    line,
+                    format!("DID_SDID={value} is not {{0xNN,0xNN}}, such as DID_SDID={{0x61,0x01}}"),
+                );
+            }
+            Some((did, _)) => {
+                if let Some(kind) = audio_or_edh(did) {
+                    d.report(
+                        &rules::ANC_AUDIO_EDH,
+                        m.index,
+                        line,
+                        format!("DID_SDID={value} names {kind} packets, which ST 2110-40 says not to carry"),
+                    );
+                }
+            }
         }
     }
     if let Some(param) = fmtp.get("VPID_Code") {
@@ -123,22 +153,6 @@ fn anc_edition(m: &Media<'_>, line: usize, fmtp: &Fmtp, signals_tm: bool, d: &mu
     d.report(&rules::SSN, m.index, line, problem).cite(ANC);
 }
 
-/// Parses `{0x61,0x01}` into its DID and SDID.
-fn did_sdid(value: &str) -> Option<(u8, u8)> {
-    let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
-    let (did, sdid) = inner.split_once(',')?;
-    Some((hex_byte(did)?, hex_byte(sdid)?))
-}
-
-fn hex_byte(text: &str) -> Option<u8> {
-    let text = text.trim();
-    let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))?;
-    if hex.is_empty() || hex.len() > 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u8::from_str_radix(hex, 16).ok()
-}
-
 /// Well-known ANC services, by DID and SDID.
 fn service(did: u8, sdid: u8) -> Option<&'static str> {
     match (did, sdid) {
@@ -154,6 +168,7 @@ fn service(did: u8, sdid: u8) -> Option<&'static str> {
 }
 
 pub(super) fn check_fmx(m: &Media<'_>, d: &mut Diagnostics) {
+    media_type(m, d, "application", "ST 2110-41:2024 §9.2.1");
     let Some((line, fmtp)) = m.format() else {
         d.report(&rules::PARAM_MISSING, m.index, m.line, "no a=fmtp line, so SSN is not given").cite(FMX);
         return;
@@ -200,11 +215,30 @@ pub(super) fn check_fmx(m: &Media<'_>, d: &mut Diagnostics) {
                             format!("data item type {item} is in the reserved range, 300000 to 3FEFFF"),
                         );
                     }
+                    Ok(0x100) => mga_clock(m, d),
                     Ok(_) => {}
                 }
             }
         }
     }
+}
+
+/// MGA audio metadata shares its audio's media clock and RTP clock rate (ST 2127-2:2024
+/// §4.4.1), which is a sampling rate ST 2110-30 or -31 allows.
+fn mga_clock(m: &Media<'_>, d: &mut Diagnostics) {
+    let Some((line, map)) = &m.rtpmap else { return };
+    if matches!(map.clock_rate, 44_100 | 48_000 | 96_000) {
+        return;
+    }
+    d.report(
+        &rules::FMX_MGA_CLOCK,
+        m.index,
+        *line,
+        format!(
+            "{}/{}: DIT 100 carries MGA audio metadata, whose RTP clock runs at its audio's sampling rate, such as ST2110-41/48000",
+            map.encoding, map.clock_rate
+        ),
+    );
 }
 
 /// Parses one `DIT` entry: 22-bit uppercase hex without `0x`.
@@ -240,6 +274,7 @@ fn data_item_name(value: u32) -> Option<&'static str> {
 }
 
 pub(super) fn check_ttml(m: &Media<'_>, d: &mut Diagnostics) {
+    media_type(m, d, "application", "RFC 8759 §11.2");
     super::clock_rate(m, d, 90_000, "ST 2110-43:2021 §4.2");
     let (line, fmtp) = match m.format() {
         Some((line, fmtp)) => {

@@ -41,6 +41,7 @@
 //!     legs: vec![Leg { destination: "239.1.1.1:5004".parse().unwrap(), source: Some("192.168.1.10".parse().unwrap()) }],
 //!     clock: Some(Clock::Traceable),
 //!     ttl: 32,
+//!     rtp_offset: 0,
 //! };
 //! assert!(stream.sdp(1).contains("a=fmtp:96 sampling=YCbCr-4:2:2; width=1280; height=720; exactframerate=50;"));
 //!

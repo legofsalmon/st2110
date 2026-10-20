@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use st2110_pcap::{
-    AudioReport, CinstReport, Clock, FLOW_LIMIT, Finding, FlowReport, Options, PORT_LIMIT, PtpDomainReport, Report,
-    SdpFile, Stats, Timescale, VideoReport, VrxReport,
+    AudioReport, CinstReport, Clock, FLOW_LIMIT, Finding, FlowReport, Options, PORT_LIMIT, PtpDomainReport,
+    RelativeReport, Report, SdpFile, Stats, Timescale, VideoReport, VrxReport,
 };
 use st2110_sdp::{Essence, Severity};
 
@@ -220,6 +220,25 @@ fn write_flow(out: &mut impl Write, flow: &FlowReport) -> io::Result<()> {
     }
     if let Some(audio) = &flow.audio {
         write_audio(out, audio)?;
+    }
+    if let Some(relative) = &flow.relative {
+        write_relative(out, flow.essence, relative)?;
+    }
+    Ok(())
+}
+
+/// How an audio or ancillary data flow lines up with its video, as RP 2110-25 measures it.
+fn write_relative(out: &mut impl Write, essence: Essence, relative: &RelativeReport) -> io::Result<()> {
+    let name = if essence == Essence::Ancillary { "ANC VDL" } else { "AVDL" };
+    let mut parts = Vec::new();
+    if let Some(us) = relative.differential_latency_us {
+        parts.push(format!("{name} {us:.1} µs"));
+    }
+    if let Some(ticks) = relative.rtp_offset {
+        parts.push(format!("relative RTP offset {ticks:.1} ticks"));
+    }
+    if !parts.is_empty() {
+        writeln!(out, "    against flow {}: {}", relative.video, parts.join(", "))?;
     }
     Ok(())
 }

@@ -166,6 +166,7 @@ impl FrameSource for Bars {
 ///     legs: vec![Leg { destination: "239.1.1.1:5004".parse().unwrap(), source: None }],
 ///     clock: Some(Clock::Traceable),
 ///     ttl: 32,
+///     rtp_offset: 0,
 /// };
 /// let mut sender = VideoSender::new(&stream, 0x1234, 0).unwrap();
 /// let start = 1_790_510_437 * 1_000_000_000;
@@ -381,6 +382,7 @@ mod tests {
             legs: vec![Leg { destination: "239.1.1.1:5004".parse().unwrap(), source: Some(Ipv4Addr::LOCALHOST) }],
             clock: Some(Clock::Traceable),
             ttl: 32,
+            rtp_offset: 0,
         }
     }
 

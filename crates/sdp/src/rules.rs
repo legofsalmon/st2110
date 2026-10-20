@@ -208,8 +208,8 @@ rules! {
         "No `a=ptime`, so receivers cannot confirm the packet time.";
     AUDIO_PTIME = "audio-ptime", Error, "RFC 8866 §6.4",
         "`a=ptime` is a packet time in milliseconds.";
-    AUDIO_LEVEL = "audio-level", Warning, "ST 2110-30:2025 §7",
-        "The sampling rate, packet time and channel count fit an ST 2110-30 conformance level.";
+    AUDIO_LEVEL = "audio-level", Warning, "ST 2110-30:2025 §7 · ST 2110-31:2022 §7",
+        "The sampling rate, packet time and channel count fit a conformance level: ST 2110-30's for PCM, ST 2110-31's Table 3 for AM824.";
     AUDIO_PACKET_SIZE = "audio-packet-size", Error, "ST 2110-10:2022",
         "Each packet fits the UDP size limit: 1440 bytes of RTP payload under the standard 1460-octet limit.";
     AUDIO_CHANNEL_ORDER = "audio-channel-order", Warning, "ST 2110-30:2025 §6.2.2",
@@ -219,15 +219,21 @@ rules! {
     AES3_PTIME = "aes3-ptime", Error, "ST 2110-31:2022 Table 1",
         "`a=ptime` is present and written as in Table 1: 1, 0.12 or 0.08 ms (1.09, 0.14 or 0.09 ms at 44.1 kHz).";
 
-    // ST 2110-40 ancillary data, ST 2110-41 fast metadata.
+    // ST 2110-40 ancillary data, ST 2110-41 fast metadata, ST 2110-43 timed text.
     ANC_TM = "anc-tm", Error, "ST 2110-40:2023 §7",
         "`TM` is `CTM` or `LLTM`.";
     ANC_PARAM = "anc-param", Error, "RFC 8331",
         "`DID_SDID` is `{0xNN,0xNN}`, and `VPID_Code` a number from 0 to 255.";
+    ANC_AUDIO_EDH = "anc-audio-edh", Warning, "ST 2110-40:2023 §5.2.1",
+        "`DID_SDID` names no embedded audio (DID E0h–E7h and A0h–A7h, ECh–EFh and F8h–FFh in SD) or EDH (F4h) packets, which ST 2110-40 says not to carry.";
     FMX_DIT = "fmx-dit", Warning, "ST 2110-41:2024",
         "`DIT` lists the stream's data item types, none of them from the reserved range.";
     FMX_DIT_SYNTAX = "fmx-dit-syntax", Error, "ST 2110-41:2024",
         "`DIT` is a comma-separated list of 22-bit uppercase hex values, without `0x` or spaces.";
+    FMX_MGA_CLOCK = "fmx-mga-clock", Error, "ST 2127-2:2024 §4.4",
+        "A fast metadata stream that carries MGA audio metadata (`DIT` 100) runs its RTP clock at its audio's sampling rate: 44.1, 48 or 96 kHz.";
+    MEDIA_TYPE = "media-type", Error, "RFC 8331 §4 · ST 2110-41:2024 §9.2 · RFC 8759 §11.2",
+        "The `m=` line carries the type its payload format registers: `video` for `smpte291`, `application` for `ST2110-41` and `ttml+xml`.";
 
     // Anything else.
     ESSENCE_UNKNOWN = "essence-unknown", Info, "ST 2110",

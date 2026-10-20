@@ -4,9 +4,10 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use st2110_sdp::{Essence, Param, Rule};
+use st2110_sdp::{Essence, MediaClock, Param, Rule};
 
 use crate::audio::{AudioConfig, AudioEngine};
+use crate::data::{DataConfig, DataEngine, Packet};
 use crate::net::Datagram;
 use crate::report::{Finding, FlowReport};
 use crate::rtp::{self, AncField};
@@ -83,6 +84,9 @@ pub(crate) struct SdpStream {
     ptime_ms: Option<f64>,
     video: VideoConfig,
     maxudp: Option<u32>,
+    data: DataConfig,
+    /// The RTP clock's offset from `a=mediaclk:direct=`, modulo 2³².
+    rtp_offset: u32,
     /// Whether a flow has matched it.
     pub matched: bool,
 }
@@ -119,6 +123,28 @@ impl SdpStream {
                     cmax: number("CMAX"),
                     maxudp: number("MAXUDP"),
                 };
+                let data = DataConfig {
+                    did_sdid: params
+                        .iter()
+                        .filter(|p| p.name.eq_ignore_ascii_case("DID_SDID"))
+                        .filter_map(|p| st2110_sdp::data::did_sdid(p.value.as_deref()?))
+                        .collect(),
+                    vpid: param(params, "VPID_Code").is_some(),
+                    tm: value(params, "TM").map(|tm| tm.trim().to_string()),
+                    frame_rate: video.frame_rate,
+                    troff_us: video.troff_us,
+                    channels: stream.channels,
+                };
+                let section = sdp.media.get(stream.index);
+                let rtp_offset = match section
+                    .and_then(|m| m.attribute("mediaclk"))
+                    .or_else(|| sdp.session.attribute("mediaclk"))
+                    .map(|a| MediaClock::parse(a.text()))
+                {
+                    // RTP timestamps count modulo 2³², and so does the offset.
+                    Some(Ok(MediaClock::Direct { offset: Some(offset) })) => offset as u32,
+                    _ => 0,
+                };
                 streams.push(Self {
                     label: format!("{} stream {}", file.name, stream.index),
                     destination: stream.destination.as_deref().and_then(|d| d.parse().ok()),
@@ -132,6 +158,8 @@ impl SdpStream {
                     ptime_ms: ptime,
                     maxudp: video.maxudp,
                     video,
+                    data,
+                    rtp_offset,
                     matched: false,
                 });
             }
@@ -164,6 +192,21 @@ impl SdpStream {
     /// The RTP clock rate the stream declares.
     pub(crate) fn clock_rate(&self) -> Option<u32> {
         self.clock_rate
+    }
+
+    /// What audio timestamps count from: the offset `a=mediaclk:direct=` gives, which
+    /// AES67 allows and ST 2110-10 sets to 0. Other essences are taken at 0, as ST
+    /// 2110-10 requires of them.
+    pub(crate) fn audio_offset(&self) -> u32 {
+        match self.essence {
+            Essence::Audio | Essence::Aes3 => self.rtp_offset,
+            _ => 0,
+        }
+    }
+
+    /// Whether the payload checks read the stream's payloads, which are then kept.
+    pub(crate) fn reads_payloads(&self) -> bool {
+        matches!(self.essence, Essence::Ancillary | Essence::Aes3 | Essence::FastMetadata | Essence::TimedText)
     }
 }
 
@@ -232,6 +275,7 @@ pub(crate) struct Flow {
     oversize: Tally,
     video: Option<Box<VideoEngine>>,
     audio: Option<Box<AudioEngine>>,
+    data: Option<DataEngine>,
 }
 
 impl Flow {
@@ -260,11 +304,13 @@ impl Flow {
             oversize: Tally::default(),
             video: None,
             audio: None,
+            data: None,
         }
     }
 
-    /// Takes the next packet, which arrived at `t` on the analysis timeline.
-    pub(crate) fn push(&mut self, t: i128, p: RtpPacket) {
+    /// Takes the next packet, which arrived at `t` on the analysis timeline. `bytes` is
+    /// the whole RTP packet, kept for a stream whose payloads are read.
+    pub(crate) fn push(&mut self, t: i128, p: RtpPacket, bytes: Option<&[u8]>) {
         self.packets += 1;
         self.bytes += u64::from(p.ip_length);
         if self.first.is_none() {
@@ -273,12 +319,12 @@ impl Flow {
         self.last = self.last.max(t);
         self.payload_type.get_or_insert(p.header.payload_type);
         if self.kind.is_some() {
-            self.process(t, p);
+            self.process(t, p, bytes);
             return;
         }
         if self.sdp.is_some() {
             self.classify();
-            self.process(t, p);
+            self.process(t, p, bytes);
             return;
         }
         if self.pending.last().is_none_or(|(_, last)| last.header.timestamp != p.header.timestamp) {
@@ -309,14 +355,16 @@ impl Flow {
             Kind::Audio(config) => self.audio = Some(Box::new(AudioEngine::new(config.clone(), self.absolute))),
             Kind::Other(_) => {}
         }
+        self.data = self.sdp.as_ref().and_then(|s| DataEngine::new(s.essence, s.data.clone(), self.absolute));
         self.seq.wide = kind.wide_sequence();
         self.kind = Some(kind);
+        // Only flows without an SDP stream are held, and their payloads are not kept.
         for (t, p) in std::mem::take(&mut self.pending) {
-            self.process(t, p);
+            self.process(t, p, None);
         }
     }
 
-    fn process(&mut self, t: i128, p: RtpPacket) {
+    fn process(&mut self, t: i128, p: RtpPacket, bytes: Option<&[u8]>) {
         if p.fragmented {
             self.fragments.hit(t);
         }
@@ -365,16 +413,28 @@ impl Flow {
             });
         }
         if let Some(audio) = &mut self.audio {
-            audio.push(t, seq, h.timestamp, p.payload_len);
+            let offset = self.sdp.as_ref().map_or(0, SdpStream::audio_offset);
+            audio.push(t, seq, h.timestamp.wrapping_sub(offset), p.payload_len);
+        }
+        if let (Some(data), Some(bytes)) = (&mut self.data, bytes) {
+            let end = bytes.len().saturating_sub(h.padding);
+            data.push(&Packet {
+                t,
+                seq,
+                header: h,
+                csrcs: bytes[0] & 0x0F,
+                payload: bytes.get(h.length..end).unwrap_or_default(),
+            });
         }
     }
 
-    /// ST 2110-10's limit on UDP datagrams, in octets. ST 2110-30 PCM audio (§6.2.1) and
-    /// ST 2110-40 ancillary data (§5.2.1) keep to the standard limit whatever `MAXUDP` says.
+    /// ST 2110-10's limit on UDP datagrams, in octets. ST 2110-30 PCM audio (§6.2.1),
+    /// ST 2110-40 ancillary data (§5.2.1) and ST 2110-41 fast metadata (§5.4) keep to the
+    /// standard limit whatever `MAXUDP` says.
     fn udp_limit(&self) -> u32 {
         let Some(sdp) = &self.sdp else { return 1460 };
         let standard_only = match sdp.essence {
-            Essence::Ancillary => true,
+            Essence::Ancillary | Essence::FastMetadata => true,
             Essence::Audio => !sdp.encoding.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("AM824")),
             _ => false,
         };
@@ -480,6 +540,9 @@ impl Flow {
             findings.extend(more);
             report
         });
+        if let Some(engine) = self.data.take() {
+            findings.extend(engine.finish(self.index, timeline));
+        }
         let first = self.first.unwrap_or_default();
         let seconds = (self.last - first) as f64 / 1e9;
         let kind = self.kind.as_ref().expect("classified above");
@@ -502,6 +565,7 @@ impl Flow {
             duplicates: self.seq.duplicates.count,
             video,
             audio,
+            relative: None,
         };
         (report, findings)
     }
