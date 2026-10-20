@@ -173,6 +173,24 @@ impl ConnectionClient {
         self.send(|| self.agent.post(url), url, body, limit)
     }
 
+    /// Replaces a resource, such as a Sender's IS-11 `/constraints/active`. A redirect
+    /// is returned, not followed, as for [`ConnectionClient::patch`].
+    pub fn put(&self, url: &str, body: &Value) -> Result<Reply, Error> {
+        self.send(|| self.agent.put(url), url, body, self.timeout)
+    }
+
+    /// Removes a resource, such as a Sender's IS-11 `/constraints/active` or a pending
+    /// IS-08 activation. A redirect is returned, not followed.
+    pub fn delete(&self, url: &str) -> Result<Reply, Error> {
+        self.authorized(url, |bearer| {
+            let request = self.agent.delete(url).config().max_redirects(0).build().header("Accept", "application/json");
+            match bearer {
+                Some(bearer) => request.header("Authorization", bearer).call(),
+                None => request.call(),
+            }
+        })
+    }
+
     fn send(
         &self,
         request: impl Fn() -> RequestBuilder<WithBody>,

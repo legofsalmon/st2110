@@ -56,6 +56,37 @@ pub struct Expect {
     /// For each of its legs, the stream it receives, or `None` for a leg that is off. Empty
     /// when the legs are not checked, as after a disconnection.
     pub legs: Vec<Option<Leg>>,
+    /// For a Receiver that takes no RTP stream, such as an IS-07 event Receiver, the
+    /// transport parameters of each leg that `/active` should show as they were sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<Map<String, Value>>,
+}
+
+/// The IS-07 transports, which connect a Receiver to a Sender without an SDP file: the
+/// Receiver is given where to find the Sender's events instead.
+pub const EVENT_TRANSPORTS: [&str; 2] = ["urn:x-nmos:transport:websocket", "urn:x-nmos:transport:mqtt"];
+
+/// Which of a Sender's IS-05 transport parameters a Receiver of the same IS-07
+/// transport is given, and under what name (IS-05 v1.2 transport parameter schemas;
+/// IS-07 v1.0.1 Transport: WebSocket and Transport: MQTT).
+fn event_params(transport: &str) -> &'static [(&'static str, &'static str)] {
+    match transport {
+        "urn:x-nmos:transport:websocket" => &[
+            ("connection_uri", "connection_uri"),
+            ("connection_authorization", "connection_authorization"),
+            ("ext_is_07_source_id", "ext_is_07_source_id"),
+            ("ext_is_07_rest_api_url", "ext_is_07_rest_api_url"),
+        ],
+        "urn:x-nmos:transport:mqtt" => &[
+            ("destination_host", "source_host"),
+            ("destination_port", "source_port"),
+            ("broker_protocol", "broker_protocol"),
+            ("broker_authorization", "broker_authorization"),
+            ("broker_topic", "broker_topic"),
+            ("connection_status_broker_topic", "connection_status_broker_topic"),
+        ],
+        _ => &[],
+    }
 }
 
 /// A change to a Receiver: the request that makes it, and what the Receiver should
@@ -178,8 +209,83 @@ impl Plan {
             "transport_file": {"data": sdp, "type": "application/sdp"},
             "transport_params": params,
         });
-        let expect = Expect { sender_id: sender_id.map(str::to_string), master_enable: true, legs: expect };
+        let expect =
+            Expect { sender_id: sender_id.map(str::to_string), master_enable: true, legs: expect, params: Vec::new() };
         Ok(Self { request, expect, notes, problems })
+    }
+
+    /// Plans connecting an IS-07 event Receiver to a Sender of the same transport,
+    /// WebSocket or MQTT, which has no SDP file: the Receiver is given where the
+    /// Sender's events are, from the Sender's `/active` transport parameters (IS-07
+    /// v1.0.1 Transport: WebSocket and Transport: MQTT; IS-05 v1.2 transport parameter
+    /// schemas):
+    ///
+    /// - WebSocket: its `connection_uri` and `connection_authorization`, and the
+    ///   `ext_is_07_source_id` and `ext_is_07_rest_api_url` the Receiver has a place for;
+    /// - MQTT: the broker the Sender publishes to, as the Receiver's `source_host` and
+    ///   `source_port`, its protocol and authorization, and the Sender's topics.
+    ///
+    /// `sender_id` names the Sender, and `master_enable` and the parameters are set
+    /// whatever they were. A parameter the Receiver's `constraints` do not list is left
+    /// out, and values they do not allow are listed in [`Plan::problems`]. Fails when
+    /// `transport` is not an IS-07 transport, or the Sender's `/active` does not say
+    /// where its events are.
+    pub fn connect_events(
+        sender_active: &Value,
+        transport: &str,
+        sender_id: Option<&str>,
+        constraints: &Constraints,
+        activation: Activation,
+    ) -> Result<Self, String> {
+        let names = event_params(transport);
+        if names.is_empty() {
+            return Err(format!("{transport} is not an IS-07 transport (websocket or mqtt)"));
+        }
+        if constraints.legs.is_empty() {
+            return Err("the Receiver's constraints list no legs".into());
+        }
+        let sent = sender_active
+            .get("transport_params")
+            .and_then(|p| p.get(0))
+            .and_then(Value::as_object)
+            .ok_or("the Sender's /active has no transport_params")?;
+        let required = if transport.ends_with("websocket") { "connection_uri" } else { "broker_topic" };
+        match sent.get(required) {
+            Some(Value::String(value)) if value != "auto" => {}
+            other => {
+                return Err(format!(
+                    "the Sender's /active has {required} {}, so it says nowhere for a Receiver to take its events \
+                     from: turn it on first",
+                    other.map_or_else(|| "absent".into(), show)
+                ));
+            }
+        }
+        let mut problems = Vec::new();
+        let mut leg = Map::new();
+        for (from, to) in names {
+            let Some(value) = sent.get(*from) else { continue };
+            // `auto` in /active means the Sender did not say; the Receiver keeps its own.
+            if value.is_null() || value.as_str() == Some("auto") || !constraints.has(0, to) {
+                continue;
+            }
+            if let Some(why) = constraints.check(0, to, value) {
+                problems.push(why);
+            }
+            leg.insert((*to).to_string(), value.clone());
+        }
+        let request = json!({
+            "sender_id": sender_id,
+            "master_enable": true,
+            "activation": activation.to_json(),
+            "transport_params": [leg.clone()],
+        });
+        let expect = Expect {
+            sender_id: sender_id.map(str::to_string),
+            master_enable: true,
+            legs: Vec::new(),
+            params: vec![leg],
+        };
+        Ok(Self { request, expect, notes: Vec::new(), problems })
     }
 
     /// Plans disconnecting a Receiver: turning it off, and naming no Sender (IS-05 v1.2
@@ -187,7 +293,7 @@ impl Plan {
     pub fn disconnect(activation: Activation) -> Self {
         Self {
             request: json!({"sender_id": null, "master_enable": false, "activation": activation.to_json()}),
-            expect: Expect { sender_id: None, master_enable: false, legs: Vec::new() },
+            expect: Expect { sender_id: None, master_enable: false, legs: Vec::new(), params: Vec::new() },
             notes: Vec::new(),
             problems: Vec::new(),
         }
@@ -223,7 +329,8 @@ impl Plan {
             }
             _ => json!({"data": null, "type": null}),
         };
-        let expect = Expect { sender_id: sender_id.map(str::to_string), master_enable, legs: Vec::new() };
+        let expect =
+            Expect { sender_id: sender_id.map(str::to_string), master_enable, legs: Vec::new(), params: Vec::new() };
         Ok(Self { request, expect, notes: Vec::new(), problems: Vec::new() })
     }
 
@@ -253,6 +360,19 @@ impl Plan {
             problems.push(format!("sender_id is {}, not {want}", shown(sender)));
         }
         let params = active.get("transport_params").and_then(Value::as_array);
+        for (i, want) in expect.params.iter().enumerate() {
+            let n = i + 1;
+            let Some(got) = params.and_then(|p| p.get(i)) else {
+                problems.push(format!("it shows no leg {n}"));
+                continue;
+            };
+            for (name, want) in want {
+                let value = got.get(name);
+                if !value.is_some_and(|v| same(v, want)) {
+                    problems.push(format!("leg {n}: {name} is {}, not {}", shown(value), show(want)));
+                }
+            }
+        }
         for (i, want) in expect.legs.iter().enumerate() {
             let n = i + 1;
             let Some(got) = params.and_then(|p| p.get(i)) else {
@@ -458,6 +578,64 @@ mod tests {
         assert_eq!(
             off.verify(&json!({"sender_id": SENDER})),
             ["master_enable is absent, not false".to_string(), format!("sender_id is {SENDER}, not null"),]
+        );
+    }
+
+    #[test]
+    fn event_receivers_are_told_where_the_events_are() {
+        // A WebSocket Sender, and a Receiver with a place for the IS-07 source id.
+        let sender = json!({"master_enable": true, "transport_params": [{
+            "connection_uri": "ws://192.168.10.21:8870/x-nmos/events/1.0/", "connection_authorization": false,
+            "ext_is_07_source_id": "50c00009-0000-4000-8000-000000000009",
+            "ext_is_07_rest_api_url": "http://192.168.10.21/x-nmos/events/v1.0/sources/50c00009-0000-4000-8000-000000000009/",
+        }]});
+        let constraints = Constraints::from_json(&json!([{
+            "connection_uri": {}, "connection_authorization": {"enum": [false, "auto"]}, "ext_is_07_source_id": {}
+        }]))
+        .unwrap();
+        let ws = "urn:x-nmos:transport:websocket";
+        let plan = Plan::connect_events(&sender, ws, Some(SENDER), &constraints, Activation::Immediate).unwrap();
+        assert_eq!(
+            plan.request,
+            json!({"sender_id": SENDER, "master_enable": true,
+                   "activation": {"mode": "activate_immediate", "requested_time": null},
+                   "transport_params": [{"connection_uri": "ws://192.168.10.21:8870/x-nmos/events/1.0/",
+                                         "connection_authorization": false,
+                                         "ext_is_07_source_id": "50c00009-0000-4000-8000-000000000009"}]})
+        );
+        assert!(plan.problems.is_empty() && plan.request.get("transport_file").is_none());
+        let mut active = plan.request.clone();
+        assert_eq!(plan.verify(&active), Vec::<String>::new());
+        active["transport_params"][0]["connection_uri"] = json!("ws://elsewhere/");
+        assert_eq!(
+            plan.verify(&active),
+            ["leg 1: connection_uri is ws://elsewhere/, not ws://192.168.10.21:8870/x-nmos/events/1.0/"]
+        );
+
+        // MQTT: the broker the Sender publishes to, and its topics.
+        let sender = json!({"transport_params": [{
+            "destination_host": "192.168.10.5", "destination_port": 1883, "broker_protocol": "mqtt",
+            "broker_authorization": false, "broker_topic": "x-nmos/events/1.0/50c00009/boolean",
+            "connection_status_broker_topic": "x-nmos/events/1.0/50c00009/connection_status",
+        }]});
+        let constraints = Constraints::from_json(&json!([{
+            "source_host": {}, "source_port": {"enum": [8883]}, "broker_protocol": {}, "broker_authorization": {},
+            "broker_topic": {}, "connection_status_broker_topic": {}
+        }]))
+        .unwrap();
+        let mqtt = "urn:x-nmos:transport:mqtt";
+        let plan = Plan::connect_events(&sender, mqtt, Some(SENDER), &constraints, Activation::Immediate).unwrap();
+        let leg = &plan.request["transport_params"][0];
+        assert_eq!((leg["source_host"].as_str(), leg["source_port"].as_u64()), (Some("192.168.10.5"), Some(1883)));
+        assert_eq!(leg["broker_topic"], "x-nmos/events/1.0/50c00009/boolean");
+        assert_eq!(plan.problems, ["source_port 1883 is not one of 8883"]);
+
+        // A Sender that is not set up says nowhere to go.
+        let off = json!({"transport_params": [{"connection_uri": null}]});
+        let refused = Plan::connect_events(&off, ws, None, &constraints, Activation::Immediate).unwrap_err();
+        assert!(refused.contains("connection_uri null"), "{refused}");
+        assert!(
+            Plan::connect_events(&off, "urn:x-nmos:transport:rtp", None, &constraints, Activation::Immediate).is_err()
         );
     }
 

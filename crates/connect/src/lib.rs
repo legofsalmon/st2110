@@ -42,14 +42,18 @@
 
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
+pub mod compat;
 mod constraints;
 #[cfg(feature = "client")]
 pub mod controller;
 mod legs;
+#[cfg(feature = "client")]
+pub mod mapping;
 mod plan;
 mod sender;
 
 pub use constraints::{Constraint, Constraints};
 pub use legs::{Leg, Legs, legs};
-pub use plan::{Activation, Expect, Plan, tai};
+pub use plan::{Activation, EVENT_TRANSPORTS, Expect, Plan, tai};
 pub use sender::{Destination, SenderChange, SenderPlan, destinations};
