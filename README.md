@@ -25,7 +25,8 @@ Tools for SMPTE ST 2110 media over IP, written in Rust. There are seven so far:
   merging the legs, putting the packets back in order and the frames and samples back
   together, and reporting what arrived, or showing the video in a window as it arrives,
   from the command line or in ST 2110 Viewer, an app for the Mac that lists the streams
-  discovery finds.
+  discovery finds. Either can run as an NMOS Node, registered with the facility's
+  registry, for a controller to route.
 
 Every finding cites the clause behind it.
 
@@ -122,7 +123,7 @@ Registry: http://192.168.10.5:80 (Registry, found by DNS in studio.example)
 
 - They ask the system's DNS servers for `_nmos-query._tcp` in its search domains first (`--dns-server` and `--domain` to choose), and only when that finds none do they ask by multicast DNS, for up to three seconds (`--mdns` to ask a responder's own address instead).
 - Of the registries found, they take the one IS-04's procedure prefers: those found by unicast DNS, then one that asks for no authorization unless a token can be given, then one in use before one for development, the lowest `pri` first, going on to the next when one does not answer.
-- `st2110 router --demo` answers DNS-SD questions on its own address and port over UDP, for its registry and, with `--demo-auth`, its Authorization Server, in any domain: `st2110 nmos --dns-server 127.0.0.1:8110 --domain demo.test` finds it with no network.
+- `st2110 router --demo` answers DNS-SD questions on its own address and port over UDP, for its registry's Query and Registration APIs and, with `--demo-auth`, its Authorization Server, in any domain: `st2110 nmos --dns-server 127.0.0.1:8110 --domain demo.test` finds it with no network.
 
 ## Connect Receivers to Senders
 
@@ -213,7 +214,7 @@ Ctrl-C stops the router.
 - The browser talks only to `st2110 router`, which talks to the registry and the Devices. So Devices need not accept requests from a web page (most refuse them), and no ST 2110 stream reaches the browser.
 - The page hears of each change as it happens. The router subscribes to the registry's Query API for every type of resource (IS-04 Query API subscriptions, over WebSockets) and pushes each change to every open page over a WebSocket of its own, with each connection made from any page. The status at the top right says `Live` when the registry tells the router of each change; a registry without subscriptions is read every 3 seconds while a page is open (`every 3 s`), and a page that cannot hold a WebSocket reads every 3 seconds itself (`Read at`).
 - The connections log is the router's, not the page's: every page shows each take from any page, and it is kept, with the demo facility's connections, in a small file (`--state FILE`; by default `~/Library/Application Support/st2110/router.json` on a Mac, `~/.local/state/st2110/router.json` on Linux; `--no-state` keeps nothing), so a restart loses neither. Crosspoints armed for a salvo are kept in the browser, per registry, and come back armed after a reload.
-- `st2110 router --demo` serves a demo facility instead: an IS-04 registry and each Node's IS-05 Connection API, with four cameras, a graphics machine, a PTZ camera that sends by unicast and starts off, and four monitors, one of which takes only the graphics machine's smaller picture and one of which also takes a unicast stream. Its Senders can be turned on and off and sent elsewhere, and its streams follow. Each camera's video and audio, and each monitor's, are a BCP-002-01 group (the graphics machine gives none), and every Node and Device gives its BCP-002-02 asset tags. The demo sends each Sender's stream from this machine on the loopback interface (small 25 fps pictures, an ST 2022-7 pair for each camera, and a tone at its own level for each camera's sound), so its previews are live on a Mac with no network at all. It is a registry like any other, so `st2110 nmos` and `st2110 connect` work on it too, at `http://127.0.0.1:8110`. Its Query API takes subscriptions, and with `--demo-auth` it asks for IS-10 tokens too (below).
+- `st2110 router --demo` serves a demo facility instead: an IS-04 registry and each Node's IS-05 Connection API, with four cameras, a graphics machine, a PTZ camera that sends by unicast and starts off, and four monitors, one of which takes only the graphics machine's smaller picture and one of which also takes a unicast stream. Its Senders can be turned on and off and sent elsewhere, and its streams follow. Each camera's video and audio, and each monitor's, are a BCP-002-01 group (the graphics machine gives none), and every Node and Device gives its BCP-002-02 asset tags. The demo sends each Sender's stream from this machine on the loopback interface (small 25 fps pictures, an ST 2022-7 pair for each camera, and a tone at its own level for each camera's sound), so its previews are live on a Mac with no network at all. It is a registry like any other, so `st2110 nmos` and `st2110 connect` work on it too, at `http://127.0.0.1:8110`, and Nodes register with it, such as [`st2110 send --nmos`](#as-nmos-nodes). Its Query API takes subscriptions, and with `--demo-auth` it asks for IS-10 tokens too (below).
 
 Anyone who can reach the page can make connections. It listens on `127.0.0.1:8110` unless `--listen` says otherwise (`0.0.0.0:8110` lets other machines in), answers only requests addressed to an IP address or `localhost`, and takes connections only from its own page, so another web site cannot make them through a visitor's browser. The page's WebSocket is held to the same rules: addressed by IP address or `localhost`, and opened only by the router's own page.
 
@@ -391,6 +392,26 @@ bars.sdp: arrived whole
 Both use ordinary sockets, and the sender sends one packet at a time from one thread, waiting for each packet's time. On a quiet machine that keeps a wide sender's pace at HD rates; it does not keep a narrow sender's, and UHD rates need the kernel bypass that Intel MTL brings. The receiver times each datagram by the kernel's receive timestamp on Linux and macOS, and by when it reads it elsewhere. It needs a large socket buffer for video: raise `net.core.rmem_max` on Linux (`sysctl -w net.core.rmem_max=67108864`) or `kern.ipc.maxsockbuf` on macOS; `receive` says when the system allows less than 4 MiB.
 
 Not yet: ST 2110-22 JPEG XS, sent from pre-encoded codestreams or received to files; 4:2:0 interlaced video; and AES3 channel status other than professional linear PCM, or user data.
+
+### As NMOS Nodes
+
+With `--nmos`, `st2110 send` and `st2110 receive` are NMOS Nodes, so a facility's controller sees the Sender or Receiver in its registry and can route it:
+
+```console
+$ st2110 send audio --to 239.10.60.1:5004 --clock traceable --label "Test tone" --nmos
+NMOS: Sender 643981d8-be06-4efe-9d87-8cf309d06ba6 at http://192.168.10.21:39749/x-nmos/node/v1.3/, its Connection API at http://192.168.10.21:39749/x-nmos/connection/v1.2/
+NMOS: registered with http://registry.example/x-nmos/registration/v1.3/ (Registry, found by DNS in studio.example)
+$ st2110 receive --nmos --media audio --label "Test monitor"
+$ st2110 connect --receiver "Test monitor" --sender "Test tone"
+```
+
+- Each serves an IS-04 v1.3 Node API and an IS-05 v1.2 Connection API, on `--nmos-port` or a port the system picks, and registers its Node, Device, Source, Flow and Sender or Receiver with the registry at `--nmos=URL`, or with the one it [finds by DNS-SD](#finding-the-registry) (`_nmos-register._tcp`) as IS-04 has a Node do. It describes the stream as it is sent: the Flow's format, picture or sampling, the Sender's transport and ST 2110-21 sender type, and its PTP clock. `--label` names it. The ids stay the same from one run to the next, for the same stream from the same machine.
+- It heartbeats every 5 s, registers everything again when the registry has forgotten it, goes on to the next registry DNS-SD finds when one stops answering, and deletes what it registered when it finishes. Stopped with Ctrl-C it cannot, and the registry lets it expire after 12 s, as IS-04 has registries do.
+- The Connection API serves `staged`, `active`, `constraints`, `transporttype` and the bulk interface, and activates at once or at a scheduled time, absolute or relative. A Sender's `transportfile` is its SDP file as it sends now.
+- An activation on a Sender takes effect on the stream as it runs: a new `destination_ip` or `destination_port` moves it from the next packet, from the same source port, and `master_enable` false sends nothing while keeping the stream's time, so it comes back lined up; the `--sdp` file, the SAP announcement and the IS-04 `version` follow. A multicast Sender is refused a unicast address and the other way round. An activation on a Receiver takes the SDP file in `transport_file`, joins the groups it names (or those `transport_params` give) and reports what arrived from each Sender in turn. `receive --nmos` receives until stopped, unless `--duration`; given an SDP file, it starts with that stream.
+- It finds the registry with the [IS-10 options](#is-10-access-tokens), asking for the `registration` scope. Its own APIs ask for no token.
+
+Try it on one machine with `st2110 router --demo`, and `--nmos=http://127.0.0.1:8110 --interface 127.0.0.1` on each. Not yet: advertising the Node by multicast DNS for peer-to-peer discovery where there is no registry, which needs a multicast DNS responder this repository does not have; IS-05's `/target` on the Node API, answered 501 (Not Implemented); and IS-10 tokens on its own APIs.
 
 ## Watch a stream
 

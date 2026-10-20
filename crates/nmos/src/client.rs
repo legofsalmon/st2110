@@ -236,16 +236,50 @@ impl Http {
 
     /// Sends a JSON request body, with the token as [`Http::get`] sends it.
     fn post(&self, url: &str, body: &Value) -> Result<Response, Error> {
+        self.authorized(url, |bearer| {
+            let mut request =
+                self.agent.post(url).header("Accept", "application/json").header("Content-Type", "application/json");
+            if let Some(bearer) = bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            request.send(body.to_string())
+        })
+    }
+
+    /// Sends a request with no body, with the token as [`Http::get`] sends it.
+    fn post_empty(&self, url: &str) -> Result<Response, Error> {
+        self.authorized(url, |bearer| {
+            let mut request = self.agent.post(url).header("Accept", "application/json");
+            if let Some(bearer) = bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            request.send_empty()
+        })
+    }
+
+    /// Deletes a resource, with the token as [`Http::get`] sends it.
+    fn delete(&self, url: &str) -> Result<Response, Error> {
+        self.authorized(url, |bearer| {
+            let mut request = self.agent.delete(url).header("Accept", "application/json");
+            if let Some(bearer) = bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            request.call()
+        })
+    }
+
+    /// Makes a request with `send`, giving it the token to send, if any, and asking once
+    /// more with another when the token is refused.
+    fn authorized(
+        &self,
+        url: &str,
+        send: impl Fn(Option<&str>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Response, Error> {
         let token = self.options.token.as_ref().filter(|_| auth::may_send_to(url));
         let mut retried = false;
         loop {
-            let mut request =
-                self.agent.post(url).header("Accept", "application/json").header("Content-Type", "application/json");
             let bearer = token.map(auth::Token::bearer).transpose().map_err(|e| error(url, e.message))?;
-            if let Some(bearer) = &bearer {
-                request = request.header("Authorization", format!("Bearer {bearer}"));
-            }
-            let mut response = request.send(body.to_string()).map_err(|e| error(url, e.to_string()))?;
+            let mut response = send(bearer.as_deref()).map_err(|e| error(url, e.to_string()))?;
             let status = response.status().as_u16();
             if status == 401
                 && !retried
@@ -780,5 +814,94 @@ impl NodeClient {
     /// API serves only its own version, so every resource is at it.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         self.http.snapshot(&self.base, &self.version, |kind| Ok((self.list(kind)?, None)))
+    }
+}
+
+/// A Node's client for a registry's IS-04 Registration API: it registers the Node's
+/// resources, keeps them there with heartbeats, and removes them (IS-04 v1.3 Behaviour:
+/// Registration). Only v1.3 is spoken, since the resources registered are v1.3 ones.
+///
+/// ```no_run
+/// use serde_json::json;
+/// use st2110_nmos::Kind;
+/// use st2110_nmos::client::{Options, RegistrationClient};
+///
+/// let registry = RegistrationClient::connect("http://registry.example:8080", &Options::default())?;
+/// let node = json!({"id": "3b8be755-08ff-452b-b217-c9151eb21193", "version": "1441716120:0"});
+/// assert!(matches!(registry.register(Kind::Node, &node)?.status, 200 | 201));
+/// if registry.heartbeat("3b8be755-08ff-452b-b217-c9151eb21193")?.status == 404 {
+///     // The registry has forgotten the Node: register it, and the rest, again.
+/// }
+/// # Ok::<_, st2110_nmos::client::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct RegistrationClient {
+    http: Http,
+    base: String,
+}
+
+/// What a Registration API answered: its status, and its body when it is JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reply {
+    /// The HTTP status.
+    pub status: u16,
+    /// The body, or `null` when there is none or it is not JSON.
+    pub body: Value,
+}
+
+impl Reply {
+    /// What went wrong, from an IS-04 error response: the status, and its `error`.
+    pub fn error(&self) -> String {
+        match self.body.get("error").and_then(Value::as_str).map(str::trim).filter(|e| !e.is_empty()) {
+            Some(text) => format!("HTTP {}: {text}", self.status),
+            None => format!("HTTP {}", self.status),
+        }
+    }
+}
+
+impl RegistrationClient {
+    /// Connects to a Registration API, which must offer v1.3.
+    ///
+    /// `url` may name the host (`http://registry:8080`), the API's root
+    /// (`…/x-nmos/registration/`) or its v1.3 (`…/x-nmos/registration/v1.3/`).
+    pub fn connect(url: &str, options: &Options) -> Result<Self, Error> {
+        let http = Http::new(options);
+        let (base, version) = http.find(url, "registration", "Registration API")?;
+        if version != "v1.3" {
+            return Err(error(
+                &base,
+                format!("offers {version} at the newest, and this Node registers v1.3 resources"),
+            ));
+        }
+        Ok(Self { http, base })
+    }
+
+    /// The versioned base URL, ending in `/`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    fn reply(response: Response) -> Reply {
+        Reply { status: response.status, body: serde_json::from_str(&response.body).unwrap_or(Value::Null) }
+    }
+
+    /// Registers a resource, or updates it: 201 when it is new, 200 when it was there.
+    pub fn register(&self, kind: Kind, resource: &Value) -> Result<Reply, Error> {
+        let url = format!("{}resource", self.base);
+        let body = serde_json::json!({"type": kind.as_str(), "data": resource});
+        self.http.post(&url, &body).map(Self::reply)
+    }
+
+    /// Tells the registry the Node is still there: 200, or 404 when the registry has
+    /// forgotten it, and it must register again.
+    pub fn heartbeat(&self, node_id: &str) -> Result<Reply, Error> {
+        let url = format!("{}health/nodes/{node_id}", self.base);
+        self.http.post_empty(&url).map(Self::reply)
+    }
+
+    /// Removes a resource: 204, or 404 when it was not there.
+    pub fn delete(&self, kind: Kind, id: &str) -> Result<Reply, Error> {
+        let url = format!("{}resource/{}/{id}", self.base, kind.plural());
+        self.http.delete(&url).map(Self::reply)
     }
 }

@@ -22,7 +22,6 @@
 mod demo;
 mod dnssd;
 mod events;
-mod http;
 mod keep;
 mod preview;
 mod signal;
@@ -47,9 +46,9 @@ use st2110_nmos::{Kind, Manifest, Snapshot, groups, routing};
 
 use self::demo::Facility;
 use self::events::{Hub, Sent, Signal, Subscriptions};
-use self::http::{Request, Response};
 use self::keep::Keeper;
 use self::preview::Previews;
+use crate::http::{self, Request, Response};
 use crate::seconds;
 
 pub(crate) use self::keep::default_path as default_state;
