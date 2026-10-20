@@ -42,9 +42,11 @@ use serde_json::{Value, json};
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
-/// The scopes `st2110 router` and `st2110 connect` ask for: reading the registry and
-/// making connections.
-pub const SCOPES: &str = "query connection";
+/// The scopes `st2110 router`, `st2110 connect` and the other controllers ask for, one
+/// for each API, as IS-10 has it: reading the registry (IS-04 Query API) and a Node peer
+/// to peer (Node API), making connections (IS-05), changing Devices' channel maps
+/// (IS-08) and reading their status monitors (IS-12).
+pub const SCOPES: &str = "query node connection channelmapping ncp";
 
 /// The well-known path of an Authorization Server's metadata (RFC 8414 §3).
 const WELL_KNOWN: &str = "/.well-known/oauth-authorization-server";
@@ -75,7 +77,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn error(message: impl Into<String>) -> Error {
+pub(crate) fn error(message: impl Into<String>) -> Error {
     Error { message: message.into() }
 }
 
@@ -635,7 +637,7 @@ fn subject(token: &str) -> Option<String> {
 
 /// The agent every request to an Authorization Server is made with: no redirects, the
 /// platform's certificates, and `timeout` for each request.
-fn agent(timeout: Duration, env_proxy: bool) -> Agent {
+pub(crate) fn agent(timeout: Duration, env_proxy: bool) -> Agent {
     let proxy = if env_proxy { ureq::Proxy::try_from_env() } else { None };
     Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -828,17 +830,24 @@ impl SigningKey {
     /// A client assertion for the token endpoint `audience` (RFC 7523 §3), good for a
     /// minute.
     pub fn assertion(&self, client_id: &str, audience: &str) -> Result<String, Error> {
-        let random = SystemRandom::new();
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let header = json!({"alg": "ES256", "typ": "JWT", "kid": self.kid()});
-        let claims = json!({
+        self.sign(&json!({
             "iss": client_id, "sub": client_id, "aud": audience,
             "iat": now, "exp": now + 60, "jti": random_id()?,
-        });
+        }))
+    }
+
+    /// A JWT of `claims`, signed with ES256 (RFC 7515), its header naming the key's
+    /// `kid`: an assertion, or an access token from an Authorization Server that signs
+    /// with this key.
+    pub fn sign(&self, claims: &Value) -> Result<String, Error> {
+        let header = json!({"alg": "ES256", "typ": "JWT", "kid": self.kid()});
         let signed =
             format!("{}.{}", base64url(header.to_string().as_bytes()), base64url(claims.to_string().as_bytes()));
-        let signature =
-            self.pair.sign(&random, signed.as_bytes()).map_err(|_| error("the assertion could not be signed"))?;
+        let signature = self
+            .pair
+            .sign(&SystemRandom::new(), signed.as_bytes())
+            .map_err(|_| error("the JWT could not be signed"))?;
         Ok(format!("{signed}.{}", base64url(signature.as_ref())))
     }
 }
@@ -895,11 +904,16 @@ pub fn verify_assertion(assertion: &str, jwks: &Value, client_id: &str, audience
 }
 
 fn get_json(agent: &Agent, url: &str) -> Result<Value, Error> {
+    get_json_of(agent, url, "Authorization Server metadata")
+}
+
+/// The JSON at `url`, which should be `what`.
+pub(crate) fn get_json_of(agent: &Agent, url: &str, what: &str) -> Result<Value, Error> {
     let mut response =
         agent.get(url).header("Accept", "application/json").call().map_err(|e| error(format!("{url}: {e}")))?;
     let status = response.status().as_u16();
     if status != 200 {
-        return Err(error(format!("{url}: HTTP {status}: no Authorization Server metadata here")));
+        return Err(error(format!("{url}: HTTP {status}: no {what} here")));
     }
     let text = response
         .body_mut()
@@ -907,7 +921,7 @@ fn get_json(agent: &Agent, url: &str) -> Result<Value, Error> {
         .limit(LIMIT)
         .read_to_string()
         .map_err(|e| error(format!("{url}: reading the response: {e}")))?;
-    serde_json::from_str(&text).map_err(|e| error(format!("{url}: expected the server's metadata: {e}")))
+    serde_json::from_str(&text).map_err(|e| error(format!("{url}: expected {what}: {e}")))
 }
 
 /// `application/x-www-form-urlencoded`, as RFC 6749 §2.3.1 encodes a client's id and
@@ -1162,7 +1176,7 @@ mod sign_in_tests {
         assert_eq!(
             url,
             "https://auth.example/authorize?response_type=code&client_id=st2110+router\
-             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8110%2Fauth%2Fcallback&scope=query+connection&state=abc\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A8110%2Fauth%2Fcallback&scope=query+node+connection+channelmapping+ncp&state=abc\
              &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
         );
         // An endpoint's own query is kept.

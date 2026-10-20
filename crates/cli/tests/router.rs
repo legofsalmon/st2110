@@ -54,23 +54,7 @@ impl Router {
 
     /// Sends a request, and returns the status, the head and the body.
     fn bytes(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String, Vec<u8>) {
-        let mut stream = TcpStream::connect(&self.address).expect("connects");
-        let mut request = format!("{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
-        if !headers.iter().any(|(name, _)| *name == "Host") {
-            request.push_str(&format!("Host: {}\r\n", self.address));
-        }
-        for (name, value) in headers {
-            request.push_str(&format!("{name}: {value}\r\n"));
-        }
-        request.push_str("\r\n");
-        request.push_str(body);
-        stream.write_all(request.as_bytes()).expect("sends");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("answers");
-        let end = response.windows(4).position(|w| w == b"\r\n\r\n").expect("a response");
-        let head = String::from_utf8(response[..end].to_vec()).expect("a head");
-        let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status");
-        (status, head, response[end + 4..].to_vec())
+        exchange(&self.address, method, path, headers, body)
     }
 
     fn post(&self, path: &str, body: &Value) -> (u16, Value) {
@@ -113,6 +97,27 @@ impl Router {
             })
             .collect()
     }
+}
+
+/// Sends a request to `address`, and returns the status, the head and the body.
+fn exchange(address: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(address).expect("connects");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
+    if !headers.iter().any(|(name, _)| *name == "Host") {
+        request.push_str(&format!("Host: {address}\r\n"));
+    }
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).expect("sends");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("answers");
+    let end = response.windows(4).position(|w| w == b"\r\n\r\n").expect("a response");
+    let head = String::from_utf8(response[..end].to_vec()).expect("a head");
+    let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status");
+    (status, head, response[end + 4..].to_vec())
 }
 
 impl Drop for Router {
@@ -658,7 +663,7 @@ fn signs_a_person_in_with_the_authorization_code_grant() {
     assert_eq!(header(&head, "Location"), Some("/"));
     let state_now = router.get("/api/state");
     assert_eq!(state_now["sign_in"]["signed_in"], true, "{state_now}");
-    assert_eq!(state_now["sign_in"]["scope"], "query connection");
+    assert_eq!(state_now["sign_in"]["scope"], "query node connection channelmapping ncp");
     assert!(state_now["auth"].as_str().unwrap().contains("whoever signs in"), "{state_now}");
     let one = router.take(json!([{"receiver": "MON 3 video", "sender": "CAM 2 video"}]));
     assert_eq!(one["succeeded"], true, "{one:#}");
@@ -759,6 +764,104 @@ fn finds_the_demo_by_dns_sd_and_registers_with_its_authorization_server() {
     let (code, text) = run(&["--register", "--client-file", file.0.with_file_name("other.json").to_str().unwrap()], "");
     assert_eq!(code, Some(2), "{text}");
     assert!(text.contains("invalid_token"), "{text}");
+}
+
+/// `st2110 receive --nmos --require-token` asks for IS-10 tokens on its own APIs and
+/// checks the demo's JWTs against its Authorization Server's keys: it refuses a request
+/// without one, or with one whose scopes do not reach the API, and takes the router's.
+#[test]
+fn a_node_with_require_token_refuses_requests_without_one_and_takes_the_routers() {
+    use st2110_nmos::ncp::client::Connection;
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth"]);
+    let base = format!("http://{}", router.address);
+    let mut receiver = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["receive", &format!("--nmos={base}"), "--media", "audio", "--interface", "127.0.0.1"])
+        .args(["--duration", "30", "--label", "Locked monitor", "--require-token"])
+        .args(["--auth", &format!("{base}/"), "--client-id", "st2110-demo"])
+        .env("ST2110_CLIENT_SECRET", "demo-secret")
+        .env("NO_COLOR", "1")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    // Where its APIs are, as it says; the rest of what it says is kept to show.
+    let mut said = BufReader::new(receiver.stderr.take().expect("stderr"));
+    let mut line = String::new();
+    let node = loop {
+        line.clear();
+        assert!(said.read_line(&mut line).expect("reads") > 0, "the Node stopped");
+        if let Some(rest) = line.split(" at http://").nth(1).filter(|_| line.starts_with("NMOS: Receiver ")) {
+            break rest.split('/').next().unwrap().to_string();
+        }
+    };
+    let rest = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = said.read_to_string(&mut text);
+        text
+    });
+    let node_request = |method: &str, path: &str, token: Option<&str>| {
+        let bearer = token.map(|t| format!("Bearer {t}"));
+        let headers: Vec<(&str, &str)> = bearer.iter().map(|b| ("Authorization", b.as_str())).collect();
+        let (status, head, body) = exchange(&node, method, path, &headers, "");
+        (status, head, String::from_utf8(body).unwrap())
+    };
+    let token = |scope: &str| -> String {
+        let headers = [
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Authorization", "Basic c3QyMTEwLWRlbW86ZGVtby1zZWNyZXQ="),
+        ];
+        let form = format!("grant_type=client_credentials&scope={}", scope.replace(' ', "+"));
+        let (status, body) = router.request("POST", "/x-nmos/auth/v1.0/token", &headers, &form);
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["access_token"].as_str().unwrap().to_string()
+    };
+
+    // Without a token, or with one that is not the server's, it is refused…
+    let (status, head, _) = node_request("GET", "/x-nmos/node/v1.3/self", None);
+    assert_eq!(status, 401, "{head}");
+    assert!(head.contains("WWW-Authenticate: Bearer realm=\"st2110 Node\", error=\"invalid_request\""), "{head}");
+    let (status, head, _) = node_request("GET", "/x-nmos/connection/v1.2/single/receivers/", Some("e30.e30.e30"));
+    assert_eq!(status, 401, "{head}");
+    assert!(head.contains("error=\"invalid_token\""), "{head}");
+    // …and with the demo's, it reads only the APIs the token's scopes reach.
+    let query = token("query");
+    let (status, head, _) = node_request("GET", "/x-nmos/connection/v1.2/single/receivers/", Some(&query));
+    assert_eq!(status, 403, "{head}");
+    assert!(head.contains("error=\"insufficient_scope\""), "{head}");
+    let connection = token("connection");
+    let (status, _, body) = node_request("GET", "/x-nmos/connection/v1.2/single/receivers/", Some(&connection));
+    assert_eq!(status, 200, "{body}");
+    // What lists the APIs asks for none.
+    assert_eq!(node_request("GET", "/x-nmos/", None).0, 200);
+    // It says so in what it registers.
+    let (_, _, device) = node_request("GET", "/x-nmos/node/v1.3/devices/", Some(&token("node")));
+    let device: Value = serde_json::from_str(&device).unwrap();
+    assert_eq!(device[0]["controls"][0]["authorization"], true, "{device:#}");
+
+    // The IS-12 endpoint takes the token in the WebSocket's query.
+    let href = format!("ws://{node}/x-nmos/ncp/v1.0/");
+    assert!(Connection::open(&href, &[], Duration::from_secs(5)).is_err());
+    let ncp = token("ncp");
+    let mut controller =
+        Connection::open(&format!("{href}?access_token={ncp}"), &[], Duration::from_secs(5)).expect("connects");
+    assert_eq!(controller.monitors().expect("reads its monitors").len(), 1);
+    controller.close();
+
+    // The router, with its own token, takes a route to it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !router.routes().iter().any(|(r, _)| r == "Locked monitor") {
+        assert!(Instant::now() < deadline, "the Node never registered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let taken = router.take(json!([{"receiver": "Locked monitor", "sender": "CAM 1 audio"}]));
+    assert_eq!(taken["succeeded"], true, "{taken:#}");
+    assert_eq!(taking(&router.routes(), "Locked monitor").as_deref(), Some("CAM 1 audio"));
+    let _ = receiver.kill();
+    let _ = receiver.wait();
+    let said = rest.join().unwrap();
+    assert!(said.contains("its APIs ask for IS-10 tokens from"), "{said}");
 }
 
 /// A state file of its own, removed when dropped.

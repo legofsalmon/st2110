@@ -7,8 +7,18 @@
 //! named, or the one DNS-SD finds (`_nmos-register._tcp`), heartbeats every 5 seconds,
 //! everything registered again when the registry has forgotten the Node, another
 //! registry tried when it does not answer, and the resources deleted when the command
-//! ends. An IS-10 token is sent where the registry asks for one; the Node's own APIs
-//! ask for none.
+//! ends. An IS-10 token is sent where the registry asks for one.
+//!
+//! With `--require-token` the Node's own APIs ask for an IS-10 token too (IS-10 v1.0.1
+//! Behaviour: Resource Servers, BCP-003-02): every request below an API's version, in
+//! `Authorization: Bearer`, or as `access_token` in the query of the IS-12 WebSocket. It
+//! is checked against the keys of the Authorization Server at `--auth`, or the one
+//! DNS-SD finds (`_nmos-auth._tcp`), as [`st2110_nmos::access`] describes, for this
+//! machine's name or address as its audience, and must let the client read or write the
+//! path through its `x-nmos-node`, `x-nmos-connection` or `x-nmos-ncp` claim. A request
+//! without a good token is refused with 401, and one the token does not reach with 403.
+//! The Node then says so in its resources (`authorization: true`) and in its multicast
+//! DNS advert (`api_auth=true`).
 //!
 //! Where there is no registry to register with, none found by DNS-SD or none that
 //! answers, the Node advertises its Node API by multicast DNS for peer-to-peer
@@ -47,7 +57,8 @@ use st2110_discover::nmos::{self as discovery, Counters};
 use st2110_discover::responder::{self, Instance, Responder};
 use st2110_media::describe::{Clock, Description};
 use st2110_nmos::Kind;
-use st2110_nmos::auth::SCOPES;
+use st2110_nmos::access::{self, Claims, Refusal, Verifier};
+use st2110_nmos::auth::{self, SCOPES};
 use st2110_nmos::client::{Options, RegistrationClient};
 use st2110_ptp::PtpTime;
 
@@ -101,6 +112,13 @@ pub(crate) struct NodeArgs {
     /// and `st2110 receive on <this machine>` for a Receiver, when omitted.
     #[arg(long, value_name = "TEXT", requires = "nmos", help_heading = "NMOS")]
     pub label: Option<String>,
+    /// Ask for an IS-10 access token on the Node API, the Connection API and the IS-12
+    /// control endpoint, from the Authorization Server at --auth, or the one DNS-SD finds
+    /// (_nmos-auth._tcp), and check it against that server's keys. The Node needs
+    /// --client-id or --register only to register with a registry that asks for a token
+    /// too.
+    #[arg(long, requires = "nmos", help_heading = "NMOS")]
+    pub require_token: bool,
     #[command(flatten, next_help_heading = "NMOS")]
     pub auth: crate::auth::Auth,
 }
@@ -145,6 +163,8 @@ struct Shared {
     wake: Condvar,
     /// The controllers connected to the IS-12 endpoint.
     sessions: ncp::Sessions,
+    /// What checks the tokens sent to the Node's APIs, with `--require-token`.
+    verifier: Option<Verifier>,
 }
 
 impl Shared {
@@ -196,6 +216,8 @@ struct State {
     /// The multicast DNS responder that advertises the Node while there is no registry
     /// to register with.
     advertising: Option<Responder>,
+    /// Whether its APIs ask for an IS-10 token.
+    api_auth: bool,
 }
 
 impl State {
@@ -204,9 +226,9 @@ impl State {
     }
 
     /// The text pairs the Node advertises peer to peer: it serves IS-04 v1.3 over HTTP,
-    /// and asks for no token.
+    /// and whether it asks for a token.
     fn txt(&self) -> Vec<(String, String)> {
-        self.counters.txt("http", &["v1.3"], false)
+        self.counters.txt("http", &["v1.3"], self.api_auth)
     }
 }
 
@@ -343,6 +365,30 @@ impl Node {
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let host = addresses.first().copied().unwrap_or(Ipv4Addr::LOCALHOST);
         let name = hostname();
+        // The Authorization Server, the token and the registry are found before anything
+        // is served, so that what goes wrong with them is said first.
+        let mut auth = args.auth.clone();
+        if auth.scope == SCOPES {
+            auth.scope = "registration".into();
+        }
+        let verifier = if args.require_token {
+            let server = auth.server(TIMEOUT)?;
+            // IS-10: a token's audience names the hosts it is for, by name or pattern.
+            let names = vec![name.clone(), host.to_string()];
+            let verifier = Verifier::new(&server, names, TIMEOUT, true).map_err(|e| format!("--require-token: {e}"))?;
+            if let Err(e) = verifier.read_keys() {
+                eprintln!(
+                    "NMOS: the keys of {server} cannot be read yet ({e}); requests are refused until they can be"
+                );
+            }
+            // The Node needs a token of its own only to register with a registry that
+            // asks for one.
+            auth.auth = (auth.client_id.is_some() || auth.register).then_some(server);
+            Some(verifier)
+        } else {
+            None
+        };
+        let token = auth.token(TIMEOUT, true)?;
         let mut interfaces: Vec<(String, String)> = Vec::new();
         let mut bindings = Vec::new();
         for &address in addresses {
@@ -352,7 +398,8 @@ impl Node {
                 interfaces.push(found);
             }
         }
-        let place = Place { host, port, hostname: name.clone(), interfaces };
+        let api_auth = verifier.is_some();
+        let place = Place { host, port, hostname: name.clone(), interfaces, authorization: api_auth };
         let now = crate::timing::now(tai_utc)?;
         let version = tai(now);
         let (seed, label) = match offer {
@@ -420,16 +467,14 @@ impl Node {
             watch: None,
             counters: Counters::default(),
             advertising: None,
+            api_auth,
         };
-        let shared =
-            Arc::new(Shared { state: Mutex::new(state), wake: Condvar::new(), sessions: ncp::Sessions::default() });
-        // The token, and the registry, are found before anything is served, so that
-        // what goes wrong with them is said first.
-        let mut auth = args.auth.clone();
-        if auth.scope == SCOPES {
-            auth.scope = "registration".into();
-        }
-        let token = auth.token(TIMEOUT, true)?;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(state),
+            wake: Condvar::new(),
+            sessions: ncp::Sessions::default(),
+            verifier,
+        });
         let options = Options { timeout: TIMEOUT, token, ..Options::default() };
         let finder = if registry.is_empty() { Finder::Look(args.auth.look.clone()) } else { Finder::Given(registry) };
         let api = format!("http://{host}:{port}/x-nmos/node/v1.3/");
@@ -440,6 +485,13 @@ impl Node {
             ids.endpoint,
             ncp::PATH,
         );
+        if let Some(verifier) = &shared.verifier {
+            eprintln!(
+                "NMOS: its APIs ask for IS-10 tokens from {}, for {}",
+                verifier.server(),
+                verifier.names().join(" or ")
+            );
+        }
         let served = shared.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -535,9 +587,16 @@ fn handle(shared: &Shared, stream: &TcpStream) {
     let Ok(Some(request)) = http::read(stream) else {
         return;
     };
+    let claims = match authorize(shared, &request) {
+        Ok(claims) => claims,
+        Err(refused) => {
+            let _ = http::write(stream, &refused);
+            return;
+        }
+    };
     if under(request.path.trim_end_matches('/'), ncp::PATH).is_some() {
         if request.method == "GET" && http::is_upgrade(&request) {
-            ncp::serve(shared, stream, &request);
+            ncp::serve(shared, stream, &request, claims.as_ref());
             return;
         }
         let message = "the IS-12 control endpoint is a WebSocket: ask with GET and Upgrade: websocket";
@@ -552,6 +611,41 @@ fn handle(shared: &Shared, stream: &TcpStream) {
     response.headers.push(("Access-Control-Allow-Origin", "*".into()));
     let _ = http::write(stream, &response);
     shared.wake.notify_all();
+}
+
+/// Whether a request carries a token that lets it do what it asks, with
+/// `--require-token`: the token's claims when it does, and the refusal when it does not,
+/// with `WWW-Authenticate: Bearer` (RFC 6750 §3). A browser's preflight, which carries
+/// no token, and the paths above an API's version, which only list what is served, need
+/// none. A WebSocket may carry its token as `access_token` in the query, as IS-10
+/// allows, since a browser cannot give one headers.
+fn authorize(shared: &Shared, request: &Request) -> Result<Option<Claims>, Response> {
+    let Some(verifier) = &shared.verifier else {
+        return Ok(None);
+    };
+    let Some((api, rest)) = access::api_path(&request.path).filter(|_| request.method != "OPTIONS") else {
+        return Ok(None);
+    };
+    let write = access::writes(&request.method);
+    let token = request
+        .header("Authorization")
+        .and_then(auth::bearer_token)
+        .map(str::to_string)
+        .or_else(|| http::is_upgrade(request).then(|| request.param("access_token")).flatten());
+    let checked = match token {
+        None => Err(Refusal::missing()),
+        Some(token) => verifier.check(&token).and_then(|claims| match claims.permits(api, write, rest) {
+            true => Ok(claims),
+            false => Err(Refusal::insufficient(api, write, rest)),
+        }),
+    };
+    checked.map(Some).map_err(|refusal| {
+        let reason = if refusal.status == 403 { "Forbidden" } else { "Unauthorized" };
+        let mut response = Response::json(refusal.status, &error(refusal.status, reason, &refusal.description).1);
+        response.headers.push(("WWW-Authenticate", refusal.challenge("st2110 Node", Some(api))));
+        response.headers.push(("Access-Control-Allow-Origin", "*".into()));
+        response
+    })
 }
 
 fn answer(shared: &Shared, request: &Request) -> Response {

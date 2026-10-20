@@ -12,6 +12,10 @@
 //! methods; the root block its searches; the ClassManager every class and datatype
 //! descriptor; the monitor its counters and `ResetCountersAndMessages`. A controller
 //! subscribes to any of them and hears each property change as a notification.
+//!
+//! Where the Node asks for IS-10 tokens, a controller connects with one whose
+//! `x-nmos-ncp` claim lets it read, and may change something only where it lets it
+//! write too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -21,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use st2110_nmos::access::{self, Claims};
 use st2110_nmos::ncp::{self, Class, ElementId, class, message, method, property};
 use st2110_nmos::ws::{self, Frame};
 
@@ -368,8 +373,21 @@ impl Model {
         !self.changes.is_empty() || self.monitor.has_changes()
     }
 
-    /// Answers one message from a controller, keeping its subscriptions.
-    pub(crate) fn message(&mut self, text: &str, subscribed: &mut BTreeSet<u64>, now: Instant) -> Value {
+    /// Whether a method changes something, which a controller whose token lets it only
+    /// read may not call: setting a property or a sequence's items, and resetting the
+    /// monitor.
+    fn changes(&self, method: ElementId) -> bool {
+        let receiver = ncp::derives(self.monitor_class.id, class::RECEIVER_MONITOR);
+        match method {
+            method::SET | method::SET_SEQUENCE_ITEM | method::ADD_SEQUENCE_ITEM | method::REMOVE_SEQUENCE_ITEM => true,
+            _ => method == if receiver { method::RESET_RECEIVER_COUNTERS } else { method::RESET_SENDER_COUNTERS },
+        }
+    }
+
+    /// Answers one message from a controller, keeping its subscriptions. A controller
+    /// that may not `write`, as its IS-10 token has it, has each method that would
+    /// change something refused (401, `Unauthorized`).
+    pub(crate) fn message(&mut self, text: &str, subscribed: &mut BTreeSet<u64>, write: bool, now: Instant) -> Value {
         let error = |status: u16, message: String| json!({"messageType": message::ERROR, "status": status, "errorMessage": message});
         let message: Value = match serde_json::from_str(text) {
             Ok(message) => message,
@@ -390,7 +408,12 @@ impl Model {
                         return error(400, "each command has a numeric handle and oid, and a methodId".into());
                     };
                     let arguments = command.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    responses.push(json!({"handle": handle, "result": self.command(oid, method, &arguments, now)}));
+                    let result = if !write && self.changes(method) {
+                        failed(401, "the controller's token lets it read, and not change anything")
+                    } else {
+                        self.command(oid, method, &arguments, now)
+                    };
+                    responses.push(json!({"handle": handle, "result": result}));
                 }
                 json!({"messageType": message::COMMAND_RESPONSE, "responses": responses})
             }
@@ -482,8 +505,12 @@ impl Sessions {
 }
 
 /// A request to the endpoint: becomes a WebSocket, and answers the controller until it
-/// goes.
-pub(crate) fn serve(shared: &super::Shared, stream: &TcpStream, request: &Request) {
+/// goes. Where the Node asks for IS-10 tokens, `claims` are those of the controller's,
+/// which say whether it may change anything, and the connection is closed when the
+/// token runs out, for the controller to connect again with a fresh one.
+pub(crate) fn serve(shared: &super::Shared, stream: &TcpStream, request: &Request, claims: Option<&Claims>) {
+    let write = claims.is_none_or(|c| c.permits("ncp", true, ""));
+    let until = claims.and_then(Claims::expires).map(|exp| exp + access::LEEWAY.as_secs());
     if let Err((status, why)) = http::accept(stream, request) {
         let message = format!("{why}: the IS-12 control endpoint is a WebSocket");
         let _ = http::write(stream, &Response::json(status, &super::connection::error(status, "", &message).1));
@@ -497,12 +524,22 @@ pub(crate) fn serve(shared: &super::Shared, stream: &TcpStream, request: &Reques
     let mut reader = stream;
     let mut pinged = false;
     loop {
+        if let Some(until) = until {
+            let now = access::unix_now();
+            if now >= until {
+                // 1008, Policy Violation: the token has run out.
+                let _ = session.send(&Frame::Close(Some(1008)));
+                break;
+            }
+            let left = Duration::from_secs(until - now).max(Duration::from_secs(1));
+            let _ = stream.set_read_timeout(Some(QUIET.min(left)));
+        }
         match ws::read_frame(&mut reader, MESSAGE_LIMIT) {
             Ok(Frame::Text(text)) => {
                 pinged = false;
                 let reply = {
                     let mut subscribed = session.subscribed.lock().map(|s| s.clone()).unwrap_or_default();
-                    let reply = shared.lock().ncp.message(&text, &mut subscribed, Instant::now());
+                    let reply = shared.lock().ncp.message(&text, &mut subscribed, write, Instant::now());
                     if let Ok(mut held) = session.subscribed.lock() {
                         *held = subscribed;
                     }
@@ -638,22 +675,33 @@ mod tests {
         let mut m = model();
         let mut subscribed = BTreeSet::new();
         let now = Instant::now();
-        let reply = m.message(r#"{"messageType": 3, "subscriptions": [1, 4, 111]}"#, &mut subscribed, now);
+        let reply = m.message(r#"{"messageType": 3, "subscriptions": [1, 4, 111]}"#, &mut subscribed, true, now);
         assert_eq!(reply, json!({"messageType": 4, "subscriptions": [1, 4]}));
         assert_eq!(subscribed, BTreeSet::from([1, 4]));
         let reply = m.message(
             r#"{"messageType": 0, "commands": [{"handle": 2, "oid": 4, "methodId": {"level": 1, "index": 1},
                 "arguments": {"id": {"level": 3, "index": 3}}}]}"#,
             &mut subscribed,
+            false,
             now,
         );
         assert_eq!(
             reply,
             json!({"messageType": 1, "responses": [{"handle": 2, "result": {"status": 200, "value": 3}}]})
         );
-        assert_eq!(m.message("{", &mut subscribed, now)["messageType"], 5);
-        assert_eq!(m.message(r#"{"messageType": 1}"#, &mut subscribed, now)["status"], 400);
-        let missing = m.message(r#"{"messageType": 0, "commands": [{"oid": 1}]}"#, &mut subscribed, now);
+        // A controller whose token lets it only read reads, and changes nothing.
+        let set = r#"{"messageType": 0, "commands": [{"handle": 3, "oid": 4, "methodId": {"level": 1, "index": 2},
+            "arguments": {"id": {"level": 3, "index": 3}, "value": 0}}, {"handle": 4, "oid": 4,
+            "methodId": {"level": 4, "index": 3}, "arguments": {}}]}"#;
+        let reply = m.message(set, &mut subscribed, false, now);
+        assert_eq!(reply["responses"][0]["result"]["status"], 401, "{reply}");
+        assert_eq!(reply["responses"][1]["result"]["status"], 401, "{reply}");
+        let reply = m.message(set, &mut subscribed, true, now);
+        assert_eq!(reply["responses"][0]["result"]["status"], 200, "{reply}");
+        assert_eq!(reply["responses"][1]["result"]["status"], 200, "{reply}");
+        assert_eq!(m.message("{", &mut subscribed, true, now)["messageType"], 5);
+        assert_eq!(m.message(r#"{"messageType": 1}"#, &mut subscribed, true, now)["status"], 400);
+        let missing = m.message(r#"{"messageType": 0, "commands": [{"oid": 1}]}"#, &mut subscribed, true, now);
         assert_eq!(missing["messageType"], 5);
     }
 }

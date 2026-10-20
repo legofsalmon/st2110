@@ -22,7 +22,8 @@
 //! say how each Receiver and Sender is doing.
 //!
 //! The `client` feature adds [`client::QueryClient`], which reads a snapshot from a
-//! live registry.
+//! live registry, IS-10 tokens for it to send ([`auth`]), and the checks a Node makes of
+//! the tokens sent to it ([`access`]).
 //!
 //! ```
 //! use st2110_nmos::{Snapshot, check};
@@ -46,6 +47,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "client")]
+pub mod access;
 #[cfg(feature = "client")]
 pub mod auth;
 mod caps;
