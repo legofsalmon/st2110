@@ -56,10 +56,10 @@ pub(crate) struct VideoArgs {
     /// 1280x720p25. Progressive only.
     #[arg(value_name = "FORMAT", default_value = "1080p50")]
     format: String,
-    /// The sampling: YCbCr-4:2:2, YCbCr-4:4:4, RGB or KEY.
+    /// The sampling: YCbCr-4:2:2, YCbCr-4:4:4, YCbCr-4:2:0, RGB or KEY.
     #[arg(long, default_value = "YCbCr-4:2:2")]
     sampling: String,
-    /// Bits a sample: 8, 10, 12 or 16.
+    /// Bits a sample: 8, 10, 12 or 16, or 16f for 16-bit floating point.
     #[arg(long, default_value = "10")]
     depth: String,
     /// The colorimetry, such as BT709 or BT2020.

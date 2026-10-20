@@ -131,8 +131,8 @@ impl Range {
     }
 }
 
-/// An ST 2110-20 video format. Only progressive video: interlaced and PsF video, and
-/// the 4:2:0 samplings, whose rows go in pairs, are not supported yet.
+/// An ST 2110-20 video format. Only progressive video: interlaced and PsF video are not
+/// supported yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFormat {
     /// Pixels per row.
@@ -212,14 +212,24 @@ impl VideoFormat {
         pixel_group(self.sampling, self.depth)
     }
 
-    /// Octets of one row of pixel groups.
+    /// Rows of the picture that one row of pixel groups covers: 2 for the 4:2:0
+    /// samplings, whose pixel groups take two pixels from each of two rows (ST 2110-20
+    /// Table 3), and 1 for the others.
+    pub fn group_rows(&self) -> u32 {
+        match self.sampling {
+            Sampling::YCbCr420 | Sampling::ClYCbCr420 | Sampling::ICtCp420 => 2,
+            _ => 1,
+        }
+    }
+
+    /// Octets of one row of pixel groups: of a pair of rows for 4:2:0.
     pub fn row_bytes(&self) -> usize {
-        self.pixel_group().map_or(0, |g| (self.width / g.pixels * g.octets) as usize)
+        self.pixel_group().map_or(0, |g| (self.width / (g.pixels / self.group_rows()) * g.octets) as usize)
     }
 
     /// Octets of one frame of pixel groups, rows one after another.
     pub fn frame_bytes(&self) -> usize {
-        self.row_bytes() * self.height as usize
+        self.row_bytes() * (self.height / self.group_rows()) as usize
     }
 
     /// Bits per second of pixel data.
@@ -235,24 +245,22 @@ impl VideoFormat {
         if self.rate.to_f64() > 1000.0 {
             return Err(format!("{} frames a second is more than this crate paces", self.rate));
         }
-        let unsupported = |what: &str| Err(format!("{what} is not supported yet"));
-        match self.sampling {
-            Sampling::YCbCr420 | Sampling::ClYCbCr420 | Sampling::ICtCp420 => {
-                return unsupported(&format!("{} sampling", self.sampling));
-            }
-            _ => {}
-        }
-        if self.depth == Depth::Bits16Float {
-            return unsupported("16-bit floating point");
-        }
         let Some(group) = self.pixel_group() else {
-            return Err(format!("ST 2110-20 defines no pixel group for {} at {} bits", self.sampling, self.depth));
+            return Err(format!("ST 2110-20 defines no pixel group for {} at {}", self.sampling, self.depth_name()));
         };
-        if !self.width.is_multiple_of(group.pixels) {
+        let rows = self.group_rows();
+        let across = group.pixels / rows;
+        if !self.width.is_multiple_of(across) {
+            let across = if rows == 1 { format!("{across} pixels") } else { format!("{across} pixels across") };
             return Err(format!(
-                "{} pixels is not a whole number of {} {}-bit pixel groups of {} pixels",
-                self.width, self.sampling, self.depth, group.pixels
+                "{} pixels is not a whole number of {} {} pixel groups of {across}",
+                self.width,
+                self.sampling,
+                self.depth_name()
             ));
+        }
+        if !self.height.is_multiple_of(rows) {
+            return Err(format!("{} rows is not a whole number of the row pairs {} takes", self.height, self.sampling));
         }
         if !COLORIMETRY.contains(&self.colorimetry.as_str()) {
             return Err(format!("colorimetry {} is not one of {}", self.colorimetry, COLORIMETRY.join(", ")));
@@ -276,6 +284,14 @@ impl VideoFormat {
             }
         }
         Ok(())
+    }
+
+    /// The depth in words: `10-bit`, or `16-bit float`.
+    pub fn depth_name(&self) -> String {
+        match self.depth {
+            Depth::Bits16Float => "16-bit float".into(),
+            depth => format!("{depth}-bit"),
+        }
     }
 
     /// The edition `SSN` names: the 2022 edition only for what it added, a key's
@@ -353,7 +369,7 @@ impl fmt::Display for VideoFormat {
     /// `1920x1080p50 YCbCr-4:2:2 10-bit`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rate = if self.rate.is_integer() { self.rate.to_string() } else { format!("{:.2}", self.rate.to_f64()) };
-        write!(f, "{}x{}p{} {} {}-bit", self.width, self.height, rate, self.sampling, self.depth)
+        write!(f, "{}x{}p{} {} {}", self.width, self.height, rate, self.sampling, self.depth_name())
     }
 }
 
@@ -521,6 +537,22 @@ mod tests {
         assert!(VideoFormat::from_name("1080i50").unwrap_err().contains("not a format"));
         assert!(VideoFormat::from_name("576p50").unwrap_err().contains("give the width"));
         assert!(VideoFormat::from_name("641x360p25").unwrap_err().contains("pixel groups of 2 pixels"));
+    }
+
+    #[test]
+    fn four_two_zero_and_floating_point() {
+        let mut f = VideoFormat::from_name("1080p50").unwrap();
+        f.sampling = Sampling::YCbCr420;
+        // Pairs of rows of 480 pixel groups of 15 octets, 8 pixels each.
+        assert_eq!((f.group_rows(), f.row_bytes(), f.frame_bytes()), (2, 7200, 3_888_000));
+        f.width = 1922;
+        assert!(f.check().unwrap_err().contains("pixel groups of 4 pixels across"), "{:?}", f.check());
+        f.depth = Depth::Bits16;
+        assert!(f.check().unwrap_err().contains("no pixel group for YCbCr-4:2:0 at 16-bit"));
+        let mut f = VideoFormat::from_name("640x360p25").unwrap();
+        (f.sampling, f.depth) = (Sampling::Rgb, Depth::Bits16Float);
+        assert_eq!((f.row_bytes(), f.to_string()), (3840, "640x360p25 RGB 16-bit float".to_string()));
+        assert!(f.fmtp().contains("sampling=RGB; width=640; height=360; exactframerate=25; depth=16f;"));
     }
 
     #[test]

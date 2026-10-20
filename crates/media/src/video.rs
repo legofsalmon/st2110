@@ -15,10 +15,10 @@ const SRD: usize = 6;
 const BLOCK: usize = 180;
 const BLOCKS: usize = 7;
 
-/// A run of pixels that a packet carries from one row.
+/// A run of pixels that a packet carries from one row, or for 4:2:0 from one pair of rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
-    /// The row, counting from 0 at the top.
+    /// The row, counting from 0 at the top: for 4:2:0, the first of the pair.
     pub row: u16,
     /// The offset of its first pixel in the row.
     pub offset: u16,
@@ -78,14 +78,20 @@ impl Layout {
 
 fn segment(format: &VideoFormat, group: PixelGroup, start: usize, end: usize) -> Segment {
     let row = format.row_bytes();
-    let (octets, pixels) = (group.octets as usize, group.pixels as usize);
+    let rows = format.group_rows() as usize;
+    let (octets, pixels) = (group.octets as usize, group.pixels as usize / rows);
     let r = start / row;
-    Segment { row: r as u16, offset: ((start - r * row) / octets * pixels) as u16, length: (end - start) as u16, start }
+    Segment {
+        row: (r * rows) as u16,
+        offset: ((start - r * row) / octets * pixels) as u16,
+        length: (end - start) as u16,
+        start,
+    }
 }
 
 fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     let row = format.row_bytes();
-    let height = format.height as usize;
+    let height = format.frame_bytes() / row;
     let octets = group.octets as usize;
     // Octets of pixel groups that fit beside `headers` row headers.
     let fits = |headers: usize| (PAYLOAD_LIMIT - ESN - SRD * headers) / octets * octets;
@@ -114,7 +120,7 @@ fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
 
 fn block(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     let row = format.row_bytes();
-    let total = row * format.height as usize;
+    let total = format.frame_bytes();
     // A packet may touch three rows at most, so it may hold no more than two rows' worth.
     let chunk = BLOCKS.min(2 * row / BLOCK) * BLOCK;
     let mut packets = Vec::new();
@@ -256,6 +262,9 @@ struct Assembly {
 pub struct Depacketiser {
     format: VideoFormat,
     group: PixelGroup,
+    /// Rows a row of pixel groups covers, and pixels across a pixel group.
+    group_rows: usize,
+    group_pixels: usize,
     row_bytes: usize,
     row_groups: usize,
     frame_ns: f64,
@@ -280,10 +289,14 @@ impl Depacketiser {
         let group = format.pixel_group().expect("checked");
         let size = format.frame_bytes();
         let groups = size / group.octets as usize;
+        let group_rows = format.group_rows();
+        let group_pixels = group.pixels / group_rows;
         Ok(Self {
             group,
+            group_rows: group_rows as usize,
+            group_pixels: group_pixels as usize,
             row_bytes: format.row_bytes(),
-            row_groups: (format.width / group.pixels) as usize,
+            row_groups: (format.width / group_pixels) as usize,
             frame_ns: 1e9 / format.rate.to_f64(),
             format: format.clone(),
             assembly: None,
@@ -353,9 +366,10 @@ impl Depacketiser {
                 last_arrival: at,
             });
         }
-        let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
+        let (octets, pixels) = (self.group.octets as usize, self.group_pixels);
         let mut offset = 0;
         for (row, pixel, length) in segments.into_iter().flatten() {
+            let row = row / self.group_rows;
             let start = row * self.row_bytes + pixel / pixels * octets;
             self.building[start..start + length].copy_from_slice(&data[offset..offset + length]);
             offset += length;
@@ -396,7 +410,8 @@ impl Depacketiser {
     }
 
     /// Reads the payload header: the extended sequence number and up to three row
-    /// segments as (row, first pixel, octets), checked against the format.
+    /// segments as (row, first pixel, octets), checked against the format. A 4:2:0
+    /// segment names the first row of its pair.
     #[allow(clippy::type_complexity)]
     fn parse<'p>(&self, payload: &'p [u8]) -> Option<(u16, [Option<(usize, usize, usize)>; 3], &'p [u8])> {
         let extended = u16::from_be_bytes([*payload.first()?, *payload.get(1)?]);
@@ -411,9 +426,10 @@ impl Depacketiser {
             let row = usize::from(u16::from_be_bytes([h[2] & 0x7F, h[3]]));
             let more = h[4] & 0x80 != 0;
             let pixel = usize::from(u16::from_be_bytes([h[4] & 0x7F, h[5]]));
-            let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
+            let (octets, pixels) = (self.group.octets as usize, self.group_pixels);
             let fits = !second_field
                 && row < self.format.height as usize
+                && row.is_multiple_of(self.group_rows)
                 && length % octets == 0
                 && pixel % pixels == 0
                 && pixel + length / octets * pixels <= self.format.width as usize;
@@ -569,6 +585,32 @@ mod tests {
     }
 
     #[test]
+    fn four_two_zero_rows_go_in_pairs() {
+        // 1080p 4:2:0 10-bit: 7200 octets a pair of rows, in six packets of 1200.
+        let mut f = format(1920, 1080);
+        f.sampling = Sampling::YCbCr420;
+        let layout = Layout::new(&f).unwrap();
+        assert_eq!(layout.packets(), 540 * 6);
+        assert_eq!(layout.segments(7), [Segment { row: 2, offset: 320, length: 1200, start: 8400 }]);
+        // Short rows go three pairs to a packet, each named by its first row.
+        f.width = 96;
+        let layout = Layout::new(&f).unwrap();
+        assert_eq!(layout.segments(0).iter().map(|s| s.row).collect::<Vec<_>>(), [0, 2, 4]);
+        let mut odd = format(320, 25);
+        odd.sampling = Sampling::YCbCr420;
+        assert!(Layout::new(&odd).unwrap_err().contains("row pairs"));
+        // A segment that names the second row of a pair does not fit.
+        let mut f = format(320, 24);
+        f.sampling = Sampling::YCbCr420;
+        let frame = frame_of(&f);
+        let mut all = packets(&f, &frame, 0, 0);
+        all[0][12 + 5] = 1;
+        let mut d = Depacketiser::new(&f).unwrap();
+        d.push(0, &all[0], |_, _| panic!("no frame"));
+        assert_eq!(d.counts().malformed, 1);
+    }
+
+    #[test]
     fn packets_carry_headers_the_analyser_reads() {
         let f = format(1920, 1080);
         let frame = frame_of(&f);
@@ -590,6 +632,9 @@ mod tests {
             (Sampling::YCbCr422, Depth::Bits10, Packing::Block),
             (Sampling::Rgb, Depth::Bits12, Packing::Block),
             (Sampling::Key, Depth::Bits8, Packing::General),
+            (Sampling::YCbCr420, Depth::Bits10, Packing::General),
+            (Sampling::YCbCr420, Depth::Bits8, Packing::Block),
+            (Sampling::Rgb, Depth::Bits16Float, Packing::General),
         ] {
             let mut f = format(320, 24);
             (f.sampling, f.depth, f.packing) = (sampling, depth, packing);
