@@ -58,17 +58,32 @@ pub fn aes3_samples(sample_rate: u32, ptime: &str) -> Option<u32> {
     }
 }
 
-/// The ST 2110-31:2022 level (Table 3) of a 48 kHz AM824 stream; `None` for other
-/// rates, whose X levels this crate does not model, or if it fits no level.
+/// The lowest ST 2110-31:2022 level (Table 3) whose receivers take an AM824 stream, or
+/// `None` if it fits no level. `ptime` is written as Table 1 writes it.
+///
+/// | Level | 48 kHz | 44.1 kHz | 96 kHz |
+/// |---|---|---|---|
+/// | A | 1 ms, up to 6 subframes | | |
+/// | AX | | 1.09 ms, up to 6 | 1 ms, up to 2 |
+/// | B | 0.12 ms, up to 8 | | |
+/// | BX | | 0.14 ms, up to 8 | 0.12 ms, up to 4 |
+/// | C | 0.12 ms, up to 60 | | |
+/// | CX | | 0.14 ms, up to 60 | 0.12 ms, up to 30 |
+/// | D | 0.08 ms, up to 80 | | |
+/// | DX | | 0.09 ms, up to 80 | 0.08 ms, up to 40 |
+///
+/// Each X level takes what the level without the X does as well, and each level what
+/// the levels before it take.
 pub fn aes3_level(sample_rate: u32, ptime: &str, subframes: u16) -> Option<&'static str> {
-    if sample_rate != 48_000 {
-        return None;
-    }
-    match (ptime, subframes) {
-        ("1", 1..=6) => Some("A"),
-        ("0.12", 1..=8) => Some("B"),
-        ("0.12", 9..=60) => Some("C"),
-        ("0.08", 1..=80) => Some("D"),
+    match (sample_rate, ptime, subframes) {
+        (48_000, "1", 1..=6) => Some("A"),
+        (48_000, "0.12", 1..=8) => Some("B"),
+        (48_000, "0.12", 9..=60) => Some("C"),
+        (48_000, "0.08", 1..=80) => Some("D"),
+        (44_100, "1.09", 1..=6) | (96_000, "1", 1..=2) => Some("AX"),
+        (44_100, "0.14", 1..=8) | (96_000, "0.12", 1..=4) => Some("BX"),
+        (44_100, "0.14", 9..=60) | (96_000, "0.12", 5..=30) => Some("CX"),
+        (44_100, "0.09", 1..=80) | (96_000, "0.08", 1..=40) => Some("DX"),
         _ => None,
     }
 }
@@ -104,6 +119,17 @@ mod tests {
         assert_eq!(aes3_level(48_000, "0.12", 60), Some("C"));
         assert_eq!(aes3_level(48_000, "0.08", 80), Some("D"));
         assert_eq!(aes3_level(48_000, "1", 8), None);
+        // 96 kHz at 1 ms carries at most 2 subframes; 44.1 kHz takes 48 kHz's counts.
+        assert_eq!(aes3_level(96_000, "1", 2), Some("AX"));
+        assert_eq!(aes3_level(96_000, "1", 4), None);
+        assert_eq!(aes3_level(96_000, "0.12", 4), Some("BX"));
+        assert_eq!(aes3_level(96_000, "0.12", 30), Some("CX"));
+        assert_eq!(aes3_level(96_000, "0.08", 40), Some("DX"));
+        assert_eq!(aes3_level(96_000, "0.08", 42), None);
+        assert_eq!(aes3_level(44_100, "1.09", 6), Some("AX"));
+        assert_eq!(aes3_level(44_100, "0.14", 8), Some("BX"));
+        assert_eq!(aes3_level(44_100, "0.14", 60), Some("CX"));
+        assert_eq!(aes3_level(44_100, "0.09", 80), Some("DX"));
         assert_eq!(aes3_samples(44_100, "1.09"), Some(48));
         assert_eq!(aes3_samples(48_000, "0.125"), None);
     }

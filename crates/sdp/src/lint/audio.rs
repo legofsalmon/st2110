@@ -116,14 +116,23 @@ pub(super) fn check_aes3(m: &Media<'_>, d: &mut Diagnostics) {
         return;
     };
     let Some(n) = subframes else { return };
-    if rate == 48_000 && aes3_level(rate, text, n).is_none() {
+    if aes3_level(rate, text, n).is_none() {
+        let levels = match rate {
+            48_000 => {
+                "A is 1 ms with up to 6, B is 0.12 ms with up to 8, C is 0.12 ms with up to 60, D is 0.08 ms with up to 80"
+            }
+            44_100 => {
+                "AX is 1.09 ms with up to 6, BX is 0.14 ms with up to 8, CX is 0.14 ms with up to 60, DX is 0.09 ms with up to 80"
+            }
+            _ => {
+                "AX is 1 ms with up to 2, BX is 0.12 ms with up to 4, CX is 0.12 ms with up to 30, DX is 0.08 ms with up to 40"
+            }
+        };
         d.report(
             &rules::AUDIO_LEVEL,
             m.index,
             line,
-            format!(
-                "48 kHz with {text} ms packets and {n} subframes fits no ST 2110-31 level: A is 1 ms with up to 6, B is 0.12 ms with up to 8, C is 0.12 ms with up to 60, D is 0.08 ms with up to 80"
-            ),
+            format!("{} with {text} ms packets and {n} subframes fits no ST 2110-31 level: {levels}", khz(rate)),
         )
         .cite("ST 2110-31:2022 Table 3");
     }
