@@ -3,7 +3,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::audio::{AudioCounts, AudioDepacketiser};
+use crate::audio::{Aes3Counts, AudioCounts, AudioDepacketiser, describe_status};
 use crate::describe::{Description, Media};
 use crate::merge::{Extender, LegCounts, Merger, Pace, Playout, Released, Skew, Verdict, receiver_class};
 use crate::rtp;
@@ -18,6 +18,15 @@ pub const DEFAULT_MAX_SKEW_NS: i64 = 50_000_000;
 
 /// The longest a receiver will wait: a second, more than class C's 450 ms.
 pub const MOST_SKEW_NS: i64 = 1_000_000_000;
+
+/// A leg that brings none of the stream's packets for longer than the receiver waits,
+/// and at least this long, while another leg brings them, has gone: the stream is
+/// unprotected until it comes back (ST 2022-7:2019 Annex B). The floor keeps the gaps
+/// between a slow stream's packets from counting.
+const OUTAGE_AT_LEAST: i128 = 10_000_000;
+
+/// Outages kept for each leg, at most.
+const OUTAGES: usize = 64;
 
 /// How often receiving reports what has arrived so far: every half second of the
 /// stream.
@@ -88,7 +97,7 @@ impl Accumulator {
 }
 
 /// What arrived on one leg.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct LegReport {
     /// Where the leg goes, and where from.
@@ -105,6 +114,19 @@ pub struct LegReport {
     pub not_rtp: u64,
     /// The stream's packets on this leg.
     pub rtp: LegCounts,
+    /// When the leg went while another brought the stream, and came back, up to 64.
+    pub outages: Vec<Outage>,
+}
+
+/// A time a leg brought nothing while another leg did, in seconds from the stream's
+/// first packet.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Outage {
+    /// The leg's last packet before it went.
+    pub from: f64,
+    /// Its first packet when it came back; `None` while it has not.
+    pub to: Option<f64>,
 }
 
 /// What the video frames showed.
@@ -139,6 +161,10 @@ pub struct AudioReport {
     pub counts: AudioCounts,
     /// The loudest sample on each channel, in dB below full scale; `None` for silence.
     pub peaks: Vec<Option<f64>>,
+    /// For ST 2110-31, what the AES3 bits showed.
+    pub aes3: Option<Aes3Counts>,
+    /// For ST 2110-31, the first signal's last whole block of channel status, in words.
+    pub channel_status: Option<String>,
 }
 
 /// What a receiver found.
@@ -190,13 +216,18 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct LegState {
     datagrams: u64,
     octets: u64,
     other_source: u64,
     other_type: u64,
     not_rtp: u64,
+    /// When the stream's first and last packets came on this leg, and when it went and
+    /// came back between.
+    first: Option<i128>,
+    last: Option<i128>,
+    outages: Vec<(i128, i128)>,
 }
 
 /// What the video frames showed so far.
@@ -374,8 +405,11 @@ impl Session {
             Essence::Audio { extender, .. } => extender.extend(header.sequence),
         };
         self.first.get_or_insert(at);
+        self.leg_arrived(leg, at);
         self.last = self.last.max(at);
-        match self.merger.push(leg, header.ssrc, sequence, header.timestamp, at) {
+        let verdict = self.merger.push(leg, header.ssrc, sequence, header.timestamp, at);
+        self.merger.compare(leg, sequence, verdict, datagram);
+        match verdict {
             Verdict::First => self.play(sequence, at, datagram, sink),
             Verdict::Held => self.held = Some(Held { sequence, at, data: datagram.to_vec() }),
             Verdict::Resumed => {
@@ -401,6 +435,28 @@ impl Session {
             }
             Verdict::Copy | Verdict::TooLate | Verdict::Stale => {}
         }
+    }
+
+    /// Notes a packet of the stream on leg `leg` at `at`, and the outage it ends if the
+    /// leg had gone while another brought packets.
+    fn leg_arrived(&mut self, leg: usize, at: i128) {
+        let gone = self.outage();
+        let others = self.legs.iter().enumerate().filter(|&(i, _)| i != leg).filter_map(|(_, l)| l.last).max();
+        let state = &mut self.legs[leg];
+        state.first.get_or_insert(at);
+        if let Some(last) = state.last
+            && at - last > gone
+            && others.is_some_and(|o| o > last)
+            && state.outages.len() < OUTAGES
+        {
+            state.outages.push((last, at));
+        }
+        state.last = Some(at);
+    }
+
+    /// How long a leg must bring nothing to have gone.
+    fn outage(&self) -> i128 {
+        i128::from(self.max_skew).max(OUTAGE_AT_LEAST)
     }
 
     /// Lets go the packets still waiting for missing ones, and finishes the frame being
@@ -468,6 +524,7 @@ impl Session {
                 other_payload_type: s.other_type,
                 not_rtp: s.not_rtp,
                 rtp,
+                outages: self.outages(s, merged.skew.map_or(0, |skew| skew.max_ns)),
             })
             .collect();
         let mut report = Report {
@@ -503,11 +560,39 @@ impl Session {
                 });
             }
             Essence::Audio { depacketiser, .. } => {
-                report.audio = Some(AudioReport { counts: depacketiser.counts(), peaks: depacketiser.peaks() });
+                report.audio = Some(AudioReport {
+                    counts: depacketiser.counts(),
+                    peaks: depacketiser.peaks(),
+                    aes3: depacketiser.aes3(),
+                    channel_status: depacketiser.channel_status().map(|status| describe_status(&status)),
+                });
             }
         }
         self.judge(&mut report);
         report
+    }
+
+    /// A leg's outages in seconds from the first packet. At the start and the end, a leg
+    /// that runs `skew_ns` behind the others is not gone, so there it must bring nothing
+    /// for that much longer.
+    fn outages(&self, state: &LegState, skew_ns: i64) -> Vec<Outage> {
+        let (Some(first), true) = (self.first, self.legs.len() > 1) else { return Vec::new() };
+        let edge = self.outage() + i128::from(skew_ns);
+        let seconds = |t: i128| (t - first) as f64 / 1e9;
+        let mut outages = Vec::new();
+        match state.first {
+            Some(start) if start - first > edge => outages.push(Outage { from: 0.0, to: Some(seconds(start)) }),
+            None if self.last - first > edge => outages.push(Outage { from: 0.0, to: None }),
+            _ => {}
+        }
+        outages.extend(state.outages.iter().map(|&(from, to)| Outage { from: seconds(from), to: Some(seconds(to)) }));
+        if let Some(last) = state.last
+            && self.last - last > edge
+        {
+            outages.push(Outage { from: seconds(last), to: None });
+        }
+        outages.truncate(OUTAGES);
+        outages
     }
 
     /// Writes the problems and notes.
@@ -526,6 +611,28 @@ impl Session {
                 problems.push(format!("{name} received none of the stream's packets{protection}"));
             } else if two && rtp.lost > 0 {
                 notes.push(format!("{name} lost {}", count(rtp.lost, "packet")));
+            }
+            if rtp.differs > 0 {
+                let copies =
+                    if rtp.differs == 1 { "1 copy differs".into() } else { format!("{} copies differ", rtp.differs) };
+                problems.push(format!(
+                    "{name}: {copies} in RTP header or payload from the first copy, which ST 2022-7 has identical"
+                ));
+            }
+            if rtp.received > 0 {
+                for outage in leg.outages.iter().take(8) {
+                    match outage.to {
+                        Some(to) => notes.push(format!(
+                            "{name} was gone from {:.3} s to {to:.3} s, and the stream unprotected",
+                            outage.from
+                        )),
+                        None => notes
+                            .push(format!("{name} was gone from {:.3} s on, and the stream unprotected", outage.from)),
+                    }
+                }
+                if leg.outages.len() > 8 {
+                    notes.push(format!("{name} was gone {} more", times(leg.outages.len() as u64 - 8)));
+                }
             }
             if rtp.too_late > 0 {
                 problems.push(format!(
@@ -658,6 +765,28 @@ impl Session {
             if c.odd_sized > 0 {
                 let differ = if c.odd_sized == 1 { "differs" } else { "differ" };
                 notes.push(format!("{} {differ} from the packet time", count(c.odd_sized, "packet")));
+            }
+            if let Some(a) = audio.aes3 {
+                if a.parity_errors > 0 {
+                    problems.push(format!("{} failed the AES3 parity check", count(a.parity_errors, "subframe")));
+                }
+                if a.crc_errors > 0 {
+                    problems.push(format!("{} of channel status failed the CRC", count(a.crc_errors, "block")));
+                }
+                if a.framing_errors > 0 {
+                    problems.push(format!(
+                        "the B and F bits misplaced {} or block starts: F marks subframe 1 of each frame, and B \
+                         every 192nd frame",
+                        count(a.framing_errors, "frame")
+                    ));
+                }
+                // Two blocks' time with no block whole: the B bits never came.
+                if a.blocks + a.crc_errors == 0 && c.samples >= 2 * 192 && c.missing == 0 {
+                    problems.push("no whole block of channel status: no B bit marked a block's start".into());
+                }
+                if a.invalid > 0 {
+                    notes.push(format!("{} had the V bit set: not fit to use", count(a.invalid, "subframe")));
+                }
             }
         }
     }

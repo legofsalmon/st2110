@@ -52,7 +52,8 @@ impl Picture {
 
 /// Unpacks a frame into RGBA pixels, in bands of rows across `cores` threads.
 fn unpack(converter: &Converter, frame: &[u8], pixels: &mut [[u8; 4]], width: usize, cores: usize) {
-    let row = converter.row_bytes();
+    // A row of pixel groups unpacks into two rows of pixels for 4:2:0.
+    let (row, width) = (converter.row_bytes(), width * converter.lines());
     let band = (pixels.len() / width).div_ceil(cores).max(1);
     thread::scope(|scope| {
         for (groups, out) in frame.chunks(band * row).zip(pixels.chunks_mut(band * width)) {

@@ -122,12 +122,18 @@ pub(crate) fn rows(seen: &Seen) -> Vec<Row> {
         for (i, leg) in report.legs.iter().enumerate() {
             let rtp = &leg.rtp;
             let mut value = plural(rtp.received, "packet");
-            for (n, what) in [(rtp.lost, "lost"), (rtp.too_late, "too late to merge")] {
+            for (n, what) in
+                [(rtp.lost, "lost"), (rtp.too_late, "too late to merge"), (rtp.differs, "unlike the first copy")]
+            {
                 if n > 0 {
                     value.push_str(&format!(", {} {what}", count(n)));
                 }
             }
-            let tone = if rtp.received == 0 || rtp.lost > 0 || rtp.too_late > 0 { Tone::Warn } else { Tone::Plain };
+            let tone = if rtp.received == 0 || rtp.lost > 0 || rtp.too_late > 0 || rtp.differs > 0 {
+                Tone::Warn
+            } else {
+                Tone::Plain
+            };
             rows.push(row(format!("Leg {}", i + 1), value, tone));
         }
     }

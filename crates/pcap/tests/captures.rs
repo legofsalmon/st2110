@@ -473,6 +473,55 @@ fn a_clean_facility_on_ptp_time() {
     let kinds: Vec<(&str, u64)> = gm.messages.iter().map(|m| (m.kind.as_str(), m.count)).collect();
     assert_eq!(kinds, [("Sync", 8), ("Follow_Up", 8), ("Delay_Resp", 8), ("Announce", 4)]);
     assert!(close(gm.messages[0].interval_ms.unwrap().mean, 125.0));
+    assert_eq!(domain.quality.len(), 1);
+    assert_eq!(domain.sync_metadata, None);
+
+    // The two legs of the video, merged: every packet on both, at the same time.
+    let pair = &report.pairs[0];
+    assert_eq!(pair.group, "video-dup.sdp stream 0 and video-dup.sdp stream 1");
+    assert_eq!(pair.flows, [Some(2), Some(3)]);
+    assert_eq!((pair.packets, pair.copies, pair.lost, pair.pd_us), (2000, 2000, 0, Some(0.0)));
+    assert_eq!(pair.class.as_deref(), Some("D"));
+    assert!(pair.outages.is_empty(), "{:?}", pair.outages);
+}
+
+/// Both legs of the video, leg 2 running 15 µs behind and gone for frames 10 to 19;
+/// both lose packet 5 of frame 30.
+fn with_dup_faults() -> Report {
+    let mut scene = Scene::default();
+    let mut legs =
+        [Video::new("192.168.10.21:5004", "239.10.10.1:5004"), Video::new("192.168.20.21:5004", "239.20.10.1:5004")];
+    for k in 0..50 {
+        for (leg, video) in legs.iter_mut().enumerate() {
+            for (j, (t, packet)) in video.frame(FRAME_50 + k, |_, t| t).into_iter().enumerate() {
+                if (k == 30 && j == 5) || (leg == 1 && (10..20).contains(&k)) {
+                    continue;
+                }
+                let t = if leg == 1 { t + 15_000 } else { t };
+                scene.udp(t, video.source, video.destination, &packet);
+            }
+        }
+    }
+    send_ptp(&mut scene, GM, 1, |_, _| false);
+    scene.analyse(&[fixture("video-dup.sdp")])
+}
+
+#[test]
+fn st_2022_7_legs_are_merged() {
+    let report = with_dup_faults();
+    // Each leg on its own: leg 2 short of 401 packets, and its buffer model upset by the
+    // frames it missed.
+    assert_eq!(rules(&report), ["packet-loss", "packet-loss", "vrx-overflow"]);
+    let pair = &report.pairs[0];
+    assert_eq!((pair.packets, pair.copies, pair.lost), (1999, 1599, 1));
+    assert_eq!((pair.pd_us, pair.class.as_deref()), (Some(15.0), Some("D")));
+    assert_eq!(pair.seconds.len(), 1);
+    assert_eq!((pair.seconds[0].second, pair.seconds[0].lost), (i64::try_from(NOON).unwrap(), 1));
+    // Leg 2's last packet of frame 9, 18.72 ms into it, then its first of frame 20.
+    assert_eq!(pair.outages.len(), 1);
+    let outage = &pair.outages[0];
+    assert_eq!(outage.leg, 2);
+    assert!(close(outage.from, 0.198_72) && close(outage.to.unwrap(), 0.4), "{outage:?}");
 }
 
 #[test]
@@ -1152,6 +1201,167 @@ fn with_slow_syncs() -> Report {
     scene.analyse(&[])
 }
 
+/// A Management COMMAND to every port with the synchronization metadata TLV of
+/// ST 2059-2 §6.12: 25 fps, Local Time on UTC, no jam or jump to come, and
+/// gmLockingStatus `locking`.
+fn sync_metadata(clock: [u8; 8], seq: u16, locking: u8) -> Vec<u8> {
+    let mut body = port([0xFF; 8], 0xFFFF);
+    body.extend([0, 0, 3, 0]);
+    body.extend(0x0003_u16.to_be_bytes());
+    body.extend(48_u16.to_be_bytes());
+    body.extend([0x68, 0x97, 0xE8, 0, 0, 1]);
+    body.extend(25_u32.to_be_bytes());
+    body.extend(1_u32.to_be_bytes());
+    body.extend([locking, 0]);
+    body.extend((-37_i32).to_be_bytes());
+    body.extend(0_i32.to_be_bytes());
+    body.extend([0; 18]);
+    body.extend((-37_i32).to_be_bytes());
+    body.extend([0, 0]);
+    ptp(0x0D, 4, 127, 0, seq, clock, &body)
+}
+
+/// `message` from port 2 of its clock rather than port 1.
+fn from_port_2(mut message: Vec<u8>) -> Vec<u8> {
+    message[28..30].copy_from_slice(&2_u16.to_be_bytes());
+    message
+}
+
+/// Four seconds of a grandmaster that breaks the profile's rules across messages, and
+/// an SDP file that names another grandmaster.
+fn with_ptp_profile_faults() -> Report {
+    let mut scene = Scene::default();
+    // Delay_Resp 7 goes unicast, though its Delay_Req went multicast.
+    send_ptp(&mut scene, GM, 4, |kind, seq| kind == 0x09 && seq == 7);
+    let request = NOON * NANOS + 7 * 125_000_000 + 61_000_000;
+    let mut body = ptp_timestamp(request - 1_000_000 + 5_000);
+    body.extend(port(FOLLOWER, 1));
+    scene.udp(request + 5_000, GM_ADDRESS, "192.168.1.50:320", &ptp(0x09, 3, -3, 0, 7, GM, &body));
+    // Metadata at 0.5 s and 1.5 s, then none until 3.5 s, when the grandmaster has lost
+    // its lock.
+    for (seq, (at, locking)) in [(500, 4), (1500, 4), (3500, 1)].into_iter().enumerate() {
+        let t = NOON * NANOS + at * 1_000_000;
+        scene.udp(t, "192.168.1.1:320", PTP_GENERAL, &sync_metadata(GM, seq as u16, locking));
+    }
+    // An Announce in holdover, between two locked ones.
+    let t = NOON * NANOS + 2_200_000_000;
+    let mut holdover = announce(GM, 1000, t, -2);
+    holdover[34 + 14] = 7;
+    scene.udp(t, "192.168.1.1:320", PTP_GENERAL, &holdover);
+    // Port 2 announces once a second, and sends a logMinDelayReqInterval of 4 beside a
+    // logSyncInterval of −3.
+    for i in 0..4 {
+        let t = NOON * NANOS + i * NANOS + 300_000_000;
+        scene.udp(t, "192.168.1.1:320", PTP_GENERAL, &from_port_2(announce(GM, i as u16, t, 0)));
+        let sync = ptp(0x00, 0, -3, 0, i as u16, GM, &ptp_timestamp(t));
+        scene.udp(t + 1_000, "192.168.1.1:319", PTP_EVENT, &from_port_2(sync));
+        let mut body = ptp_timestamp(t);
+        body.extend(port(OTHER_GM, 1));
+        scene.udp(t + 2_000, "192.168.1.1:320", PTP_GENERAL, &from_port_2(ptp(0x09, 3, 4, 0, i as u16, GM, &body)));
+    }
+    let mut sdp = fixture("audio-pcm.sdp");
+    sdp.text = sdp.text.replace("08-00-11-FF-FE-21-E1-B0:127", "00-1D-C1-FF-FE-0B-33-01:127");
+    scene.analyse(&[sdp])
+}
+
+#[test]
+fn ptp_profile_faults_across_ports() {
+    let report = with_ptp_profile_faults();
+    let mut found = rules(&report);
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        [
+            "gm-clock-class",
+            "ptp-announce-uniform",
+            "ptp-delay-req-range",
+            "ptp-gm-quality",
+            "ptp-masters",
+            "ptp-refclk",
+            "ptp-sm-locking",
+            "ptp-sm-tlv-rate",
+            "ptp-transport-mode",
+        ]
+    );
+    assert_eq!(
+        finding(&report, "ptp-announce-uniform").message,
+        "Announce messages gave logMessageInterval -2 from 08-00-11-FF-FE-21-E1-B0 port 1; 0 from 08-00-11-FF-FE-21-E1-B0 port 2"
+    );
+    assert_eq!(
+        finding(&report, "ptp-delay-req-range").message,
+        "08-00-11-FF-FE-21-E1-B0 port 2 sent Delay_Resp messages with logMinDelayReqInterval 4, outside -3 to 2 for its logSyncInterval -3"
+    );
+    assert_eq!(
+        finding(&report, "ptp-transport-mode").message,
+        "1 Delay_Resp message went otherwise than its Delay_Req came"
+    );
+    let rate = finding(&report, "ptp-sm-tlv-rate");
+    assert_eq!(
+        rate.message,
+        "08-00-11-FF-FE-21-E1-B0 port 1 let more than 1.5 s pass between synchronization metadata TLVs 1 time, at most 2.0 s"
+    );
+    assert!(close(rate.at.unwrap(), 3.5 - 0.001_005), "{:?}", rate.at);
+    assert_eq!(
+        finding(&report, "ptp-sm-locking").message,
+        "gmLockingStatus changed 1 time: at 3.499 s externally locked to internal"
+    );
+    assert_eq!(
+        finding(&report, "ptp-gm-quality").message,
+        "the grandmaster's quality changed 2 times: at 2.199 s class 6 to 7 (in holdover), at 2.250 s class 7 to 6 (locked to a primary reference)"
+    );
+    assert_eq!(
+        finding(&report, "ptp-refclk").message,
+        "audio-pcm.sdp stream 0 names grandmaster 00-1D-C1-FF-FE-0B-33-01 in domain 127, but its Announce messages named 08-00-11-FF-FE-21-E1-B0"
+    );
+    let domain = &report.ptp.domains[0];
+    let classes: Vec<(u8, bool)> = domain.quality.iter().map(|q| (q.class, q.time_traceable)).collect();
+    assert_eq!(classes, [(6, true), (7, true), (6, true)]);
+    let metadata = domain.sync_metadata.as_ref().unwrap();
+    assert_eq!(metadata.messages, 3);
+    let locking: Vec<&str> = metadata.locking.iter().map(|l| l.status.as_str()).collect();
+    assert_eq!(locking, ["externally locked", "internal"]);
+}
+
+#[test]
+fn ptp_transport_modes_and_traceable_clocks() {
+    // Announce, Sync and Follow_Up unicast, as in unicast mode, but a Delay_Req multicast.
+    let mut scene = Scene::default();
+    for seq in 0..4_u16 {
+        let t = NOON * NANOS + i128::from(seq) * 250_000_000;
+        scene.udp(t, GM_ADDRESS, "192.168.1.50:320", &announce(GM, seq, t, -2));
+        scene.udp(t + 1_000, GM_ADDRESS, "192.168.1.50:319", &ptp(0x00, 0, -3, 0, seq, GM, &ptp_timestamp(t)));
+    }
+    scene.udp(NOON * NANOS + 2_000, FOLLOWER_ADDRESS, PTP_EVENT, &ptp(0x01, 1, 127, 0, 0, FOLLOWER, &ptp_timestamp(0)));
+    let mut sdp = fixture("audio-pcm.sdp");
+    sdp.text = sdp.text.replace("08-00-11-FF-FE-21-E1-B0:127", "traceable");
+    let report = scene.analyse(std::slice::from_ref(&sdp));
+    assert_eq!(rules(&report), ["ptp-transport-mode"]);
+    assert_eq!(
+        finding(&report, "ptp-transport-mode").message,
+        "Announce, Sync or Follow_Up messages went unicast, as in unicast mode, beside 1 Delay_Req message sent multicast, as in multicast mode; unicast mode shares a domain with no other"
+    );
+
+    // A grandmaster accurate to 1 µs is not traceable as ST 2110-10 has it; nor, after
+    // 3 s, is one that sends no synchronization metadata.
+    let mut scene = Scene::default();
+    for seq in 0..13_u16 {
+        let t = NOON * NANOS + i128::from(seq) * 250_000_000;
+        let mut message = announce(GM, seq, t, -2);
+        message[34 + 15] = 0x23;
+        scene.udp(t, GM_ADDRESS, PTP_GENERAL, &message);
+    }
+    let report = scene.analyse(&[sdp]);
+    assert_eq!(rules(&report), ["ptp-sm-tlv-rate", "ptp-refclk"]);
+    assert_eq!(
+        finding(&report, "ptp-refclk").message,
+        "audio-pcm.sdp stream 0 says the PTP is traceable, but grandmaster 08-00-11-FF-FE-21-E1-B0: clockAccuracy 23h is not within 250 ns"
+    );
+    assert_eq!(
+        finding(&report, "ptp-sm-tlv-rate").message,
+        "no synchronization metadata TLV came in 3.0 s of Announce messages"
+    );
+}
+
 #[test]
 fn another_profile_on_the_same_domain_number_is_its_own_domain() {
     let mut scene = Scene::default();
@@ -1587,7 +1797,8 @@ fn audio_latency_counts_from_the_signalled_offset() {
     audio.send(&mut scene, NOON * 1000, 1000);
     send_ptp(&mut scene, GM, 1, |_, _| false);
     let report = scene.analyse(&[fixture("aes67-offset.sdp")]);
-    assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    // The Dante fixture names its own grandmaster in domain 0, not this capture's.
+    assert_eq!(rules(&report), ["ptp-refclk"], "{:#?}", report.findings);
     assert_eq!(report.timescale.clock, Clock::Ptp);
     let latency = report.flows[0].audio.as_ref().unwrap().latency.unwrap();
     assert!(close(latency.min, 1150.0) && close(latency.max, 1150.0), "{latency:?}");
@@ -1620,6 +1831,7 @@ fn every_rule_has_a_capture_that_raises_it() {
         with_broken_fast_metadata(),
         with_broken_timed_text(),
         with_jitter_beyond_aes67(),
+        with_ptp_profile_faults(),
     ];
     let raised: BTreeSet<&str> = reports.iter().flat_map(|r| r.findings.iter().map(|f| f.rule)).collect();
     for rule in st2110_pcap::rules::ALL {

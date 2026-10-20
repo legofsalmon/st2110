@@ -38,7 +38,9 @@ use serde_json::{Value, json};
 use st2110_nmos::client::QueryClient;
 use st2110_nmos::routing::{self, Endpoint};
 use st2110_nmos::{Kind, Snapshot};
+use st2110_ptp::epoch::{Signal, next_alignment};
 use st2110_ptp::{PtpTime, TAI_UTC_2017};
+use st2110_sdp::Rational;
 
 use crate::client::{ConnectionClient, Reply, bulk, single};
 use crate::{Activation, Constraints, Plan, tai};
@@ -98,6 +100,10 @@ pub struct Settings {
     pub wait: Duration,
     /// TAI − UTC in seconds, to turn the system clock into PTP time.
     pub tai_utc: i32,
+    /// A frame rate whose frame boundaries a PTP activation time is moved on to: the
+    /// next alignment point (ST 2059-1 §6.2) at or after it, so that a salvo switches
+    /// between frames. `None` leaves the time as it is.
+    pub align: Option<Rational>,
 }
 
 impl Default for Settings {
@@ -109,6 +115,7 @@ impl Default for Settings {
             dry_run: false,
             wait: Duration::from_secs(5),
             tai_utc: TAI_UTC_2017,
+            align: None,
         }
     }
 }
@@ -328,10 +335,15 @@ pub fn connect(
     }
 
     let refused = |job: &Job| job.blocked || (!job.report.problems.is_empty() && !settings.force);
-    let pick = |jobs: &[Job]| match settings.activation {
-        Some(activation) => activation,
-        None if jobs.len() == 1 => Activation::Immediate,
-        None => Activation::At(now(settings.tai_utc).add_nanos(settings.lead.as_nanos() as i128).unwrap_or_default()),
+    let pick = |jobs: &[Job]| {
+        let activation = match settings.activation {
+            Some(activation) => activation,
+            None if jobs.len() == 1 => Activation::Immediate,
+            None => {
+                Activation::At(now(settings.tai_utc).add_nanos(settings.lead.as_nanos() as i128).unwrap_or_default())
+            }
+        };
+        aligned(activation, settings.align)
     };
     if jobs.iter().any(refused) || settings.dry_run {
         let activation = pick(&jobs);
@@ -874,6 +886,19 @@ fn registry_lag(registry: &QueryClient, job: &Job, plan: &Plan, wait: Duration) 
 /// Whether a deadline has passed; `None` is one too far off to reach.
 fn passed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// A PTP activation time moved on to the next frame boundary at `rate`, or left where it
+/// is when it is on one. Times relative to the request, and times past the last
+/// alignment point, stay as they are.
+fn aligned(activation: Activation, rate: Option<Rational>) -> Activation {
+    match (activation, rate) {
+        (Activation::At(t), Some(rate)) => t
+            .add_nanos(-1)
+            .and_then(|before| next_alignment(before, Signal::Video(rate)))
+            .map_or(activation, |(_, boundary)| Activation::At(boundary)),
+        _ => activation,
+    }
 }
 
 /// The system clock's time as PTP time, when TAI − UTC is `tai_utc` seconds.

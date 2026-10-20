@@ -210,15 +210,17 @@ fn shrink(format: &VideoFormat, converter: &Converter, pixels: &[u8], row: &mut 
     let (width, height) = (format.width as usize, format.height as usize);
     let step = width.div_ceil(WIDTH).max(1);
     let (w, h) = (width / step, height / step);
-    let bytes = converter.row_bytes();
-    row.resize(width * 3, 0);
+    // A row of pixel groups covers two rows of pixels for 4:2:0.
+    let (bytes, lines) = (converter.row_bytes(), converter.lines());
+    row.resize(width * 3 * lines, 0);
     let mut rgb = Vec::with_capacity(w * h * 3);
     for y in 0..h {
-        let start = y * step * bytes;
+        let start = y * step / lines * bytes;
         let Some(source) = pixels.get(start..start + bytes) else { break };
         converter.unpack_row(source, row);
+        let line = &row[y * step % lines * width * 3..];
         for x in 0..w {
-            rgb.extend_from_slice(&row[x * step * 3..x * step * 3 + 3]);
+            rgb.extend_from_slice(&line[x * step * 3..x * step * 3 + 3]);
         }
     }
     let h = rgb.len() / (w * 3).max(1);

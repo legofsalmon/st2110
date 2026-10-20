@@ -131,16 +131,48 @@ impl Range {
     }
 }
 
-/// An ST 2110-20 video format. Only progressive video: interlaced and PsF video, and
-/// the 4:2:0 samplings, whose rows go in pairs, are not supported yet.
+/// How a frame's rows are sent (ST 2110-20:2022 §6.1.2–6.1.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scan {
+    /// Progressive: the whole frame at one instant, its rows from the top.
+    #[default]
+    Progressive,
+    /// Interlaced (`interlace`): two fields half a frame apart, each with its own RTP
+    /// timestamp and marker bit, the first with the frame's even rows and the second,
+    /// whose row headers have the F bit set, with its odd ones.
+    Interlaced,
+    /// Progressive segmented frame (`interlace; segmented`): a progressive frame sent as
+    /// two segments, rows split as an interlaced frame's are, that share its timestamp.
+    Segmented,
+}
+
+impl Scan {
+    /// Whether frames go as two fields or segments.
+    pub fn fields(self) -> bool {
+        self != Self::Progressive
+    }
+
+    /// The letter of a format name: `p`, `i` or `psf`.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Progressive => "p",
+            Self::Interlaced => "i",
+            Self::Segmented => "psf",
+        }
+    }
+}
+
+/// An ST 2110-20 video format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFormat {
     /// Pixels per row.
     pub width: u32,
-    /// Rows per frame.
+    /// Rows per frame: of both fields, for interlaced and PsF video.
     pub height: u32,
-    /// Frames per second, `exactframerate`.
+    /// Frames per second, `exactframerate`: for interlaced video, half the fields.
     pub rate: Rational,
+    /// Progressive, interlaced or PsF.
+    pub scan: Scan,
     /// `sampling`.
     pub sampling: Sampling,
     /// `depth`: bits per sample.
@@ -165,6 +197,7 @@ impl VideoFormat {
             width,
             height,
             rate,
+            scan: Scan::Progressive,
             sampling: Sampling::YCbCr422,
             depth: Depth::Bits10,
             colorimetry: "BT709".into(),
@@ -176,16 +209,27 @@ impl VideoFormat {
     }
 
     /// Reads a format name: `1080p50`, `2160p59.94` or `720p60000/1001` for the usual
-    /// widths of 1080, 2160, 4320 and 720-line video, or `1280x720p25` for any size.
-    /// Gives YCbCr-4:2:2 at 10 bits, as [`VideoFormat::new`] does.
+    /// widths of 1080, 2160, 4320, 720, 576 and 486-line video, or `1280x720p25` for any
+    /// size. `1080i50` is interlaced, named by its fields a second as is usual, and
+    /// `1080psf25` PsF, named by its frames. Gives YCbCr-4:2:2 at 10 bits, as
+    /// [`VideoFormat::new`] does.
     pub fn from_name(name: &str) -> Result<Self, String> {
-        let bad = || format!("{name} is not a format such as 1080p50, 2160p59.94 or 1280x720p25");
-        let (size, rate) = name.split_once(['p', 'P']).ok_or_else(bad)?;
+        let bad = || format!("{name} is not a format such as 1080p50, 1080i59.94, 1080psf25 or 1280x720p25");
+        let lower = name.to_ascii_lowercase();
+        let (scan, at, letters) = if let Some(at) = lower.find("psf") {
+            (Scan::Segmented, at, 3)
+        } else if let Some(at) = lower.find('i') {
+            (Scan::Interlaced, at, 1)
+        } else {
+            (Scan::Progressive, lower.find('p').ok_or_else(bad)?, 1)
+        };
+        let (size, rate) = (&name[..at], &name[at + letters..]);
         let (width, height) = match size.split_once(['x', 'X']) {
             Some((w, h)) => (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?),
             None => {
                 let height: u32 = size.parse().map_err(|_| bad())?;
                 let width = match height {
+                    486 | 576 => 720,
                     720 => 1280,
                     1080 => 1920,
                     2160 => 3840,
@@ -202,9 +246,27 @@ impl VideoFormat {
             Err(FrameRateError::Decimal(Some(rate))) => rate,
             Err(_) => return Err(bad()),
         };
-        let format = Self::new(width, height, rate);
+        let rate = match scan {
+            Scan::Interlaced => Rational::new(rate.numerator(), 2 * rate.denominator()).ok_or_else(bad)?,
+            _ => rate,
+        };
+        let format = Self { scan, ..Self::new(width, height, rate) };
         format.check()?;
         Ok(format)
+    }
+
+    /// Rows in each field, the first then the second: half the frame's each, and for an
+    /// odd height one more in the first; the whole frame for progressive video.
+    pub fn field_heights(&self) -> [u32; 2] {
+        if self.scan.fields() { [self.height.div_ceil(2), self.height / 2] } else { [self.height, 0] }
+    }
+
+    /// The rate of fields, twice the frame rate; of frames for progressive video.
+    pub fn field_rate(&self) -> Rational {
+        match self.scan {
+            Scan::Progressive => self.rate,
+            _ => Rational::new(2 * self.rate.numerator(), self.rate.denominator()).expect("not zero"),
+        }
     }
 
     /// The pixel group, when ST 2110-20 defines one for the sampling and depth.
@@ -212,14 +274,24 @@ impl VideoFormat {
         pixel_group(self.sampling, self.depth)
     }
 
-    /// Octets of one row of pixel groups.
+    /// Rows of the picture that one row of pixel groups covers: 2 for the 4:2:0
+    /// samplings, whose pixel groups take two pixels from each of two rows (ST 2110-20
+    /// Table 3), and 1 for the others.
+    pub fn group_rows(&self) -> u32 {
+        match self.sampling {
+            Sampling::YCbCr420 | Sampling::ClYCbCr420 | Sampling::ICtCp420 => 2,
+            _ => 1,
+        }
+    }
+
+    /// Octets of one row of pixel groups: of a pair of rows for 4:2:0.
     pub fn row_bytes(&self) -> usize {
-        self.pixel_group().map_or(0, |g| (self.width / g.pixels * g.octets) as usize)
+        self.pixel_group().map_or(0, |g| (self.width / (g.pixels / self.group_rows()) * g.octets) as usize)
     }
 
     /// Octets of one frame of pixel groups, rows one after another.
     pub fn frame_bytes(&self) -> usize {
-        self.row_bytes() * self.height as usize
+        self.row_bytes() * (self.height / self.group_rows()) as usize
     }
 
     /// Bits per second of pixel data.
@@ -235,23 +307,30 @@ impl VideoFormat {
         if self.rate.to_f64() > 1000.0 {
             return Err(format!("{} frames a second is more than this crate paces", self.rate));
         }
-        let unsupported = |what: &str| Err(format!("{what} is not supported yet"));
-        match self.sampling {
-            Sampling::YCbCr420 | Sampling::ClYCbCr420 | Sampling::ICtCp420 => {
-                return unsupported(&format!("{} sampling", self.sampling));
-            }
-            _ => {}
-        }
-        if self.depth == Depth::Bits16Float {
-            return unsupported("16-bit floating point");
+        if self.scan.fields() && self.height < 2 {
+            return Err(format!("{} row is too few for two fields", self.height));
         }
         let Some(group) = self.pixel_group() else {
-            return Err(format!("ST 2110-20 defines no pixel group for {} at {} bits", self.sampling, self.depth));
+            return Err(format!("ST 2110-20 defines no pixel group for {} at {}", self.sampling, self.depth_name()));
         };
-        if !self.width.is_multiple_of(group.pixels) {
+        let rows = self.group_rows();
+        let across = group.pixels / rows;
+        if !self.width.is_multiple_of(across) {
+            let across = if rows == 1 { format!("{across} pixels") } else { format!("{across} pixels across") };
             return Err(format!(
-                "{} pixels is not a whole number of {} {}-bit pixel groups of {} pixels",
-                self.width, self.sampling, self.depth, group.pixels
+                "{} pixels is not a whole number of {} {} pixel groups of {across}",
+                self.width,
+                self.sampling,
+                self.depth_name()
+            ));
+        }
+        if !self.height.is_multiple_of(rows) {
+            return Err(format!("{} rows is not a whole number of the row pairs {} takes", self.height, self.sampling));
+        }
+        if rows > 1 && self.scan.fields() {
+            return Err(format!(
+                "{} is sent progressive only: its pixel groups pair rows that interlaced and PsF video send in different fields",
+                self.sampling
             ));
         }
         if !COLORIMETRY.contains(&self.colorimetry.as_str()) {
@@ -278,6 +357,14 @@ impl VideoFormat {
         Ok(())
     }
 
+    /// The depth in words: `10-bit`, or `16-bit float`.
+    pub fn depth_name(&self) -> String {
+        match self.depth {
+            Depth::Bits16Float => "16-bit float".into(),
+            depth => format!("{depth}-bit"),
+        }
+    }
+
     /// The edition `SSN` names: the 2022 edition only for what it added, a key's
     /// `ALPHA` colorimetry and the `ST2115LOGS3` transfer (ST 2110-20:2022 §7.2).
     pub fn ssn(&self) -> &'static str {
@@ -302,6 +389,19 @@ impl VideoFormat {
         if self.range != Range::Narrow {
             text.push_str(&format!(" RANGE={};", self.range.as_str()));
         }
+        // 525- and 625-line video signals its pixels' shape, here for a 4:3 picture
+        // (RP 2110-24:2023 §5).
+        let rate = (self.rate.numerator(), self.rate.denominator());
+        match (self.scan.fields() && self.width == 720, rate) {
+            (true, (30_000, 1001)) if self.height <= 512 => text.push_str(" PAR=10:11;"),
+            (true, (25, 1)) if self.height <= 612 => text.push_str(" PAR=12:11;"),
+            _ => {}
+        }
+        match self.scan {
+            Scan::Progressive => {}
+            Scan::Interlaced => text.push_str(" interlace;"),
+            Scan::Segmented => text.push_str(" interlace; segmented;"),
+        }
         text
     }
 
@@ -310,9 +410,12 @@ impl VideoFormat {
     /// `interlace` is.
     pub fn from_fmtp(value: impl Fn(&str) -> Option<String>, has: impl Fn(&str) -> bool) -> Result<Self, String> {
         let need = |name: &str| value(name).ok_or_else(|| format!("the SDP file gives no {name}"));
-        if has("interlace") || has("segmented") {
-            return Err("interlaced and PsF video are not supported yet".into());
-        }
+        let scan = match (has("interlace"), has("segmented")) {
+            (false, false) => Scan::Progressive,
+            (true, false) => Scan::Interlaced,
+            (true, true) => Scan::Segmented,
+            (false, true) => return Err("segmented without interlace: PsF is signalled with both".into()),
+        };
         let number = |name: &str| -> Result<u32, String> {
             let text = need(name)?;
             text.trim().parse().map_err(|_| format!("{name}={text} is not a number"))
@@ -327,6 +430,7 @@ impl VideoFormat {
                 Ok((rate, _)) | Err(FrameRateError::Decimal(Some(rate))) => rate,
                 Err(_) => return Err(format!("exactframerate={rate} is not a frame rate")),
             },
+            scan,
             sampling: sampling
                 .trim()
                 .parse()
@@ -350,10 +454,13 @@ impl VideoFormat {
 }
 
 impl fmt::Display for VideoFormat {
-    /// `1920x1080p50 YCbCr-4:2:2 10-bit`.
+    /// `1920x1080p50 YCbCr-4:2:2 10-bit`, with interlaced video named by its fields a
+    /// second, `1920x1080i50`, and PsF by its frames, `1920x1080psf25`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rate = if self.rate.is_integer() { self.rate.to_string() } else { format!("{:.2}", self.rate.to_f64()) };
-        write!(f, "{}x{}p{} {} {}-bit", self.width, self.height, rate, self.sampling, self.depth)
+        let rate = if self.scan == Scan::Interlaced { self.field_rate() } else { self.rate };
+        let rate = if rate.is_integer() { rate.to_string() } else { format!("{:.2}", rate.to_f64()) };
+        let (width, height, scan) = (self.width, self.height, self.scan.letter());
+        write!(f, "{width}x{height}{scan}{rate} {} {}", self.sampling, self.depth_name())
     }
 }
 
@@ -369,18 +476,50 @@ pub struct AudioFormat {
     /// Samples per channel in each packet: 48 for the 1 ms packets of level A at 48 kHz,
     /// or 6 for the 125 µs of levels B and C.
     pub samples_per_packet: u32,
+    /// Whether the samples go as ST 2110-31 AM824 subframes, those of AES3 signals of two
+    /// channels each, rather than as ST 2110-30 PCM: `bits` is then 24.
+    pub aes3: bool,
 }
+
+/// Samples a packet that ST 2110-31:2022 Table 1 allows at 48 kHz, and the packet times
+/// they make: 1 ms, 125 µs and 83⅓ µs. 96 kHz packets hold twice as many, and 44.1 kHz
+/// packets as many, a little longer.
+const AES3_PACKETS: [(u32, f64); 3] = [(48, 1.0), (6, 0.125), (4, 1.0 / 12.0)];
+
+/// How ST 2110-31:2022 Table 1 writes the packet times.
+const AES3_PTIMES: [&str; 6] = ["1", "0.12", "0.08", "1.09", "0.14", "0.09"];
 
 impl AudioFormat {
     /// Level A: 48 kHz, 24 bits, 1 ms packets.
     pub fn new(channels: u16) -> Self {
-        Self { channels, sample_rate: 48_000, bits: 24, samples_per_packet: 48 }
+        Self { channels, sample_rate: 48_000, bits: 24, samples_per_packet: 48, aes3: false }
+    }
+
+    /// The same channels as AES3 signals in AM824 subframes, as ST 2110-31 carries them.
+    pub fn am824(self) -> Self {
+        Self { aes3: true, bits: 24, ..self }
     }
 
     /// The format with packets of `ms` milliseconds, which must come within 1% of a
     /// whole number of samples: at 44.1 kHz, 1 ms is 44 samples and 1.09 ms is 48.
+    ///
+    /// AM824 takes the packet times of ST 2110-31 Table 1 only: 1, 0.125 or 0.083 ms, or
+    /// as the table writes them, such as 0.12 or, at 44.1 kHz, 1.09.
     pub fn with_packet_time(mut self, ms: f64) -> Result<Self, String> {
         check_rate(self.sample_rate)?;
+        if self.aes3 {
+            let scale = if self.sample_rate == 96_000 { 2 } else { 1 };
+            let samples = AES3_PACKETS.iter().find_map(|&(samples, nominal)| {
+                let samples = samples * scale;
+                let written = aes3_ptime(self.sample_rate, samples).and_then(|text| text.parse::<f64>().ok());
+                (((ms - nominal) / nominal).abs() < 0.05 || written == Some(ms)).then_some(samples)
+            });
+            self.samples_per_packet = samples.ok_or_else(|| {
+                format!("{ms} ms is not an ST 2110-31 packet time: AM824 packets are 1, 0.125 or 0.083 ms")
+            })?;
+            self.check()?;
+            return Ok(self);
+        }
         let khz = f64::from(self.sample_rate) / 1000.0;
         let exact = khz * ms;
         let samples = exact.round();
@@ -404,7 +543,7 @@ impl AudioFormat {
 
     /// Octets per sample.
     pub fn sample_bytes(&self) -> usize {
-        usize::from(self.bits / 8)
+        if self.aes3 { 4 } else { usize::from(self.bits / 8) }
     }
 
     /// Octets of samples in each packet.
@@ -412,15 +551,23 @@ impl AudioFormat {
         self.samples_per_packet as usize * usize::from(self.channels) * self.sample_bytes()
     }
 
-    /// The `a=rtpmap` encoding: `L24` or `L16`.
+    /// The `a=rtpmap` encoding: `L24`, `L16` or `AM824`.
     pub fn encoding(&self) -> &'static str {
-        if self.bits == 16 { "L16" } else { "L24" }
+        match (self.aes3, self.bits) {
+            (true, _) => "AM824",
+            (false, 16) => "L16",
+            (false, _) => "L24",
+        }
     }
 
     /// The `a=ptime` value in milliseconds: exact when the packet time is a whole number
     /// of microseconds, `1` or `0.125`, and otherwise the shortest within 1% that gives
     /// back the samples when a receiver rounds, such as `1.09` for 48 samples at 44.1 kHz.
+    /// AM824 writes it as ST 2110-31 Table 1 does: `0.12` for 125 µs.
     pub fn ptime(&self) -> String {
+        if let Some(text) = self.aes3.then(|| aes3_ptime(self.sample_rate, self.samples_per_packet)).flatten() {
+            return text.into();
+        }
         let trim = |text: String| {
             if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text }
         };
@@ -440,8 +587,12 @@ impl AudioFormat {
             .map_or_else(|| format!("{ms}"), trim)
     }
 
-    /// The `channel-order` value: mono, stereo or undefined channels.
+    /// The `channel-order` value: mono, stereo or undefined channels, or for AM824 one
+    /// `AES3` group of two subframes for each signal (ST 2110-31:2022 Table 2).
     pub fn channel_order(&self) -> String {
+        if self.aes3 {
+            return format!("SMPTE2110.({})", vec!["AES3"; usize::from(self.channels / 2)].join(","));
+        }
         match self.channels {
             1 => "SMPTE2110.(M)".into(),
             2 => "SMPTE2110.(ST)".into(),
@@ -457,6 +608,23 @@ impl AudioFormat {
         check_rate(self.sample_rate)?;
         if self.bits != 16 && self.bits != 24 {
             return Err(format!("{}-bit samples are not 16 or 24 bits", self.bits));
+        }
+        if self.aes3 {
+            if self.bits != 24 {
+                return Err("AM824 carries 24-bit samples".into());
+            }
+            if !self.channels.is_multiple_of(2) {
+                return Err(format!(
+                    "{} channels: AM824 carries AES3 signals of two subframes each, so the count is even",
+                    self.channels
+                ));
+            }
+            if aes3_ptime(self.sample_rate, self.samples_per_packet).is_none() {
+                return Err(format!(
+                    "{} samples a packet at {} Hz is not an ST 2110-31 packet time of 1, 0.125 or 0.083 ms",
+                    self.samples_per_packet, self.sample_rate
+                ));
+            }
         }
         if self.samples_per_packet == 0 || u64::from(self.samples_per_packet) * 250 > u64::from(self.sample_rate) {
             return Err(format!(
@@ -474,6 +642,11 @@ impl AudioFormat {
         }
         Ok(())
     }
+}
+
+/// The `a=ptime` of ST 2110-31 Table 1 for packets of `samples` at `sample_rate`.
+fn aes3_ptime(sample_rate: u32, samples: u32) -> Option<&'static str> {
+    AES3_PTIMES.into_iter().find(|text| st2110_sdp::audio::aes3_samples(sample_rate, text) == Some(samples))
 }
 
 /// Samples in a packet of `ms` milliseconds at `sample_rate`, rounded, as a receiver
@@ -518,9 +691,48 @@ mod tests {
         let f = VideoFormat::from_name("640x360p30000/1001").unwrap();
         assert_eq!((f.width, f.height, f.rate), (640, 360, rate(30000, 1001)));
         assert_eq!(f.to_string(), "640x360p29.97 YCbCr-4:2:2 10-bit");
-        assert!(VideoFormat::from_name("1080i50").unwrap_err().contains("not a format"));
-        assert!(VideoFormat::from_name("576p50").unwrap_err().contains("give the width"));
+        assert!(VideoFormat::from_name("1080x50").unwrap_err().contains("not a format"));
+        assert!(VideoFormat::from_name("600p50").unwrap_err().contains("give the width"));
         assert!(VideoFormat::from_name("641x360p25").unwrap_err().contains("pixel groups of 2 pixels"));
+    }
+
+    #[test]
+    fn interlaced_and_psf_names() {
+        // Interlaced video is named by its fields a second, and carries frames half as often.
+        let f = VideoFormat::from_name("1080i59.94").unwrap();
+        assert_eq!((f.width, f.height, f.rate, f.scan), (1920, 1080, rate(30000, 1001), Scan::Interlaced));
+        assert_eq!((f.field_heights(), f.field_rate()), ([540, 540], rate(60000, 1001)));
+        assert_eq!(f.to_string(), "1920x1080i59.94 YCbCr-4:2:2 10-bit");
+        assert!(f.fmtp().contains("height=1080; exactframerate=30000/1001;"));
+        let f = VideoFormat::from_name("1080PsF25").unwrap();
+        assert_eq!(
+            (f.rate, f.scan, f.to_string()),
+            (rate(25, 1), Scan::Segmented, "1920x1080psf25 YCbCr-4:2:2 10-bit".into())
+        );
+        let f = VideoFormat::from_name("720x487i59.94").unwrap();
+        assert_eq!(f.field_heights(), [244, 243]);
+        let f = VideoFormat::from_name("576i50").unwrap();
+        assert_eq!(f.width, 720);
+        assert!(f.fmtp().ends_with(" PAR=12:11; interlace;"));
+        let mut f = VideoFormat::from_name("1080i50").unwrap();
+        f.sampling = Sampling::YCbCr420;
+        assert!(f.check().unwrap_err().contains("progressive only"));
+    }
+
+    #[test]
+    fn four_two_zero_and_floating_point() {
+        let mut f = VideoFormat::from_name("1080p50").unwrap();
+        f.sampling = Sampling::YCbCr420;
+        // Pairs of rows of 480 pixel groups of 15 octets, 8 pixels each.
+        assert_eq!((f.group_rows(), f.row_bytes(), f.frame_bytes()), (2, 7200, 3_888_000));
+        f.width = 1922;
+        assert!(f.check().unwrap_err().contains("pixel groups of 4 pixels across"), "{:?}", f.check());
+        f.depth = Depth::Bits16;
+        assert!(f.check().unwrap_err().contains("no pixel group for YCbCr-4:2:0 at 16-bit"));
+        let mut f = VideoFormat::from_name("640x360p25").unwrap();
+        (f.sampling, f.depth) = (Sampling::Rgb, Depth::Bits16Float);
+        assert_eq!((f.row_bytes(), f.to_string()), (3840, "640x360p25 RGB 16-bit float".to_string()));
+        assert!(f.fmtp().contains("sampling=RGB; width=640; height=360; exactframerate=25; depth=16f;"));
     }
 
     #[test]
@@ -538,11 +750,16 @@ mod tests {
         let (fmtp, _) = st2110_sdp::Fmtp::parse(&text);
         let back = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name)).unwrap();
         assert_eq!(back, f);
-        for flag in ["interlace", "segmented", "interlace=1"] {
-            let (fmtp, _) = st2110_sdp::Fmtp::parse(&format!("{text} {flag};"));
+        for (flags, scan) in [(" interlace;", Scan::Interlaced), (" interlace; segmented;", Scan::Segmented)] {
+            let interlaced = VideoFormat { scan, ..f.clone() };
+            assert!(interlaced.fmtp().ends_with(flags));
+            let (fmtp, _) = st2110_sdp::Fmtp::parse(&interlaced.fmtp());
             let read = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name));
-            assert!(read.unwrap_err().contains("interlaced"), "{flag}");
+            assert_eq!(read.unwrap(), interlaced);
         }
+        let (fmtp, _) = st2110_sdp::Fmtp::parse(&format!("{text} segmented;"));
+        let read = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name));
+        assert!(read.unwrap_err().contains("segmented without interlace"));
         let mut key = f.clone();
         key.sampling = Sampling::Key;
         key.colorimetry = "ALPHA".into();
@@ -564,6 +781,32 @@ mod tests {
         let f = AudioFormat::new(2).with_packet_time(0.292).unwrap();
         assert_eq!((f.samples_per_packet, f.ptime()), (14, "0.29".to_string()));
         assert!(AudioFormat::new(2).with_packet_time(5.0).unwrap_err().contains("up to 4 ms"));
+    }
+
+    #[test]
+    fn am824_packet_times_and_channel_order() {
+        let f = AudioFormat::new(4).am824();
+        assert_eq!((f.encoding(), f.sample_bytes(), f.ptime()), ("AM824", 4, "1".to_string()));
+        assert_eq!(f.channel_order(), "SMPTE2110.(AES3,AES3)");
+        assert_eq!(f.to_string(), "AM824 48 kHz, 4 channels, 1 ms");
+        for (rate, ms, samples, ptime) in [
+            (48_000, 0.125, 6, "0.12"),
+            (48_000, 0.12, 6, "0.12"),
+            (48_000, 0.083, 4, "0.08"),
+            (96_000, 0.125, 12, "0.12"),
+            (96_000, 1.0, 96, "1"),
+            (44_100, 1.0, 48, "1.09"),
+            (44_100, 1.09, 48, "1.09"),
+            (44_100, 0.125, 6, "0.14"),
+        ] {
+            let f = AudioFormat { sample_rate: rate, ..AudioFormat::new(2).am824() }.with_packet_time(ms).unwrap();
+            assert_eq!((f.samples_per_packet, f.ptime()), (samples, ptime.to_string()), "{rate} {ms}");
+        }
+        assert!(AudioFormat::new(2).am824().with_packet_time(0.25).unwrap_err().contains("not an ST 2110-31"));
+        assert!(AudioFormat::new(3).am824().check().unwrap_err().contains("even"));
+        assert!(AudioFormat { bits: 16, ..AudioFormat::new(2).am824() }.check().unwrap_err().contains("24-bit"));
+        // 1 ms of 8 subframes is 1536 octets, over the limit.
+        assert!(AudioFormat::new(8).am824().check().unwrap_err().contains("UDP size limit"));
     }
 
     #[test]

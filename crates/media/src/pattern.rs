@@ -1,6 +1,6 @@
 //! Test signals: colour bars with a moving box, and a tone.
 
-use crate::format::{AudioFormat, Packing, VideoFormat};
+use crate::format::{AudioFormat, Packing, Scan, VideoFormat};
 use crate::pixels::Converter;
 
 /// EBU colour bars, 100/0/75/0: white at 100%, then yellow, cyan, green, magenta, red
@@ -18,7 +18,7 @@ pub struct Bars {
     row_bytes: usize,
     group_octets: usize,
     group_pixels: usize,
-    /// Rows the box covers.
+    /// Rows of pixel groups the box covers.
     box_rows: std::ops::Range<usize>,
     /// The box's pixel groups for one row.
     box_row: Vec<u8>,
@@ -34,31 +34,38 @@ impl Bars {
     pub fn new(format: &VideoFormat) -> Result<Self, String> {
         let converter = Converter::new(format)?;
         let group = format.pixel_group().expect("checked");
-        let (w, h) = (format.width as usize, format.height as usize);
+        // Rows of pixel groups, each of `lines` rows of the picture.
+        let lines = converter.lines();
+        let (w, h) = (format.width as usize, format.height as usize / lines);
         let row_bytes = converter.row_bytes();
         let bar_rows = (h * 2).div_ceil(3);
         let mut row = vec![0; row_bytes];
         let rgb: Vec<u8> = (0..w).flat_map(|x| BARS[x * 8 / w]).collect();
-        converter.pack_row(&rgb, &mut row);
+        converter.pack_row(&rgb.repeat(lines), &mut row);
         let mut base = Vec::with_capacity(row_bytes * h);
         for _ in 0..bar_rows {
             base.extend_from_slice(&row);
         }
-        converter.pack_row(&vec![0; 3 * w], &mut row);
+        converter.pack_row(&vec![0; 3 * w * lines], &mut row);
         for _ in bar_rows..h {
             base.extend_from_slice(&row);
         }
 
-        let pixels = group.pixels as usize;
+        let pixels = group.pixels as usize / lines;
         let strip = h - bar_rows;
-        let box_pixels = ((strip / 2).max(1).div_ceil(pixels) * pixels).min(w);
+        let box_pixels = ((strip * lines / 2).max(1).div_ceil(pixels) * pixels).min(w);
         let box_top = bar_rows + strip / 4;
         let box_rows = box_top..(box_top + strip / 2).min(h);
-        let mut box_format = VideoFormat { width: box_pixels as u32, packing: Packing::General, ..format.clone() };
-        box_format.height = 1;
+        let mut box_format = VideoFormat {
+            width: box_pixels as u32,
+            packing: Packing::General,
+            scan: Scan::Progressive,
+            ..format.clone()
+        };
+        box_format.height = lines as u32;
         let box_converter = Converter::new(&box_format)?;
         let mut box_row = vec![0; box_converter.row_bytes()];
-        box_converter.pack_row(&vec![255; 3 * box_pixels], &mut box_row);
+        box_converter.pack_row(&vec![255; 3 * box_pixels * lines], &mut box_row);
         let groups = (w - box_pixels) / pixels + 1;
         Ok(Self {
             frame: base.clone(),
@@ -177,13 +184,23 @@ mod tests {
 
     #[test]
     fn bars_in_other_samplings() {
-        for (sampling, depth) in
-            [(Sampling::Rgb, Depth::Bits10), (Sampling::YCbCr444, Depth::Bits12), (Sampling::Key, Depth::Bits8)]
-        {
+        for (sampling, depth) in [
+            (Sampling::Rgb, Depth::Bits10),
+            (Sampling::YCbCr444, Depth::Bits12),
+            (Sampling::Key, Depth::Bits8),
+            (Sampling::YCbCr420, Depth::Bits10),
+            (Sampling::Rgb, Depth::Bits16Float),
+        ] {
             let mut format = VideoFormat::new(640, 360, Rational::new(25, 1).unwrap());
             (format.sampling, format.depth) = (sampling, depth);
             let mut bars = Bars::new(&format).unwrap();
             assert_eq!(bars.frame(3).len(), format.frame_bytes());
+            // White in the first bar and the box, black beside the box.
+            let rgb = to_rgb(&format, bars.frame(0)).unwrap();
+            let pixel = |x: usize, y: usize| &rgb[3 * (640 * y + x)..3 * (640 * y + x) + 3];
+            for (x, y, want) in [(10, 10, 255), (10, 300, 255), (400, 300, 0)] {
+                assert!(pixel(x, y).iter().all(|v| v.abs_diff(want) <= 2), "{sampling} {depth}: {:?}", pixel(x, y));
+            }
         }
     }
 

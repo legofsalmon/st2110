@@ -135,6 +135,20 @@ rules! {
         "Every two-step Sync is followed by a Follow_Up with its `sequenceId`.";
     PTP_DELAY_RESP = "ptp-delay-resp", Warning, "IEEE 1588-2008 §9.5.12 · ST 2059-2:2021 §6.10",
         "Every Delay_Req gets a Delay_Resp.";
+    PTP_ANNOUNCE_UNIFORM = "ptp-announce-uniform", Error, "ST 2059-2:2021 §6.5.2",
+        "Every port of an ST 2059-2 domain sends Announce messages with the same `logMessageInterval`, which the profile has uniform throughout a domain.";
+    PTP_DELAY_REQ_RANGE = "ptp-delay-req-range", Error, "ST 2059-2:2021 §6.5.3",
+        "A port's `logMinDelayReqInterval`, which its Delay_Resp messages carry, is from its own `logSyncInterval` to 5 more.";
+    PTP_TRANSPORT_MODE = "ptp-transport-mode", Error, "ST 2059-2:2021 §6.10",
+        "In an ST 2059-2 domain, Announce, Sync and Follow_Up messages are all multicast or all unicast, synchronization metadata goes the same way, each Delay_Resp goes as its Delay_Req came, and unicast mode shares the domain with no other mode.";
+    PTP_SM_TLV_RATE = "ptp-sm-tlv-rate", Warning, "ST 2059-2:2021 §6.12",
+        "The grandmaster sends the synchronization metadata TLV once a second: no more than 1.5 s passes between two from one port, and a domain announced for 3 s has some.";
+    PTP_SM_LOCKING = "ptp-sm-locking", Info, "ST 2059-2:2021 §6.12, Table 2",
+        "Notes each change of the grandmaster's `gmLockingStatus` in the synchronization metadata, and when it came.";
+    PTP_GM_QUALITY = "ptp-gm-quality", Info, "IEEE 1588-2008 §7.6.2.4, §7.6.2.5 · ST 2059-2:2021 §6.5.4",
+        "Notes each change of a grandmaster's `clockClass` or `clockAccuracy` through the capture, such as into holdover and back, and when it came.";
+    PTP_REFCLK = "ptp-refclk", Warning, "ST 2110-10:2022 §8.2 · RP 2110-25:2023 §4.1",
+        "A stream's `a=ts-refclk` names the grandmaster and domain the capture's PTP messages show, and says `traceable` only when a grandmaster is on the PTP timescale, time-traceable and accurate to 250 ns or better.";
 }
 
 /// Looks a rule up by its identifier.

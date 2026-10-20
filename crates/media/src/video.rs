@@ -4,41 +4,60 @@ use std::sync::Arc;
 
 use st2110_sdp::video::PixelGroup;
 
-use crate::format::{PAYLOAD_LIMIT, Packing, VideoFormat};
+use crate::format::{PAYLOAD_LIMIT, Packing, Scan, VideoFormat};
 use crate::rtp;
 
 /// Octets of the extended sequence number and of one sample row data header.
 const ESN: usize = 2;
 const SRD: usize = 6;
 
+/// IP datagrams under this many octets come only at the end of a field or frame in
+/// general packing mode (ST 2110-20:2022 §6.3.2).
+const SHORT_DATAGRAM: usize = 1000;
+
 /// Octets in a block of block packing mode (ST 2110-20:2022 §6.3.3), and blocks a packet.
 const BLOCK: usize = 180;
 const BLOCKS: usize = 7;
 
-/// A run of pixels that a packet carries from one row.
+/// A run of pixels that a packet carries from one row, or for 4:2:0 from one pair of rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
-    /// The row, counting from 0 at the top.
+    /// The row, counting from 0 at the top of its field or segment, or of the frame for
+    /// progressive video: for 4:2:0, the first of the pair.
     pub row: u16,
     /// The offset of its first pixel in the row.
     pub offset: u16,
     /// Octets of pixel groups.
     pub length: u16,
-    /// Where those octets start in the frame.
+    /// Whether the row is in the second field or segment: the F bit.
+    pub second_field: bool,
+    /// Where those octets start in the frame, whose rows are in picture order.
     pub start: usize,
 }
 
 /// How a format's frames are cut into packets, the same for every frame.
 ///
 /// General packing splits each row evenly into as few packets as the standard UDP size
-/// limit allows, or puts up to three whole rows in a packet when they are short. Block
+/// limit allows, or puts up to three whole rows in a packet when they are short. Where
+/// that would leave an IP datagram under 1000 octets before the end of a field or frame, which
+/// ST 2110-20:2022 §6.3.2 asks senders to avoid, it fills every packet instead, running
+/// on from row to row, so only the last can be short. Block
 /// packing fills every packet but the frame's last with seven 180-octet blocks,
 /// running on from row to row, with a header for each row a packet touches.
+///
+/// Interlaced and PsF frames are cut into their two fields or segments, each packed so
+/// on its own, the first field's packets first: the first field takes the frame's even
+/// rows and the second its odd ones (ST 2110-20:2022 §6.1.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     segments: Vec<Segment>,
     /// Where each packet's segments start in `segments`, and then where they end.
     bounds: Vec<usize>,
+    /// The first packet of the second field or segment.
+    second_field: Option<usize>,
+    /// Whether the first field's last packet carries the marker bit too: interlaced
+    /// video, whose fields each have a timestamp of their own.
+    field_markers: bool,
 }
 
 impl Layout {
@@ -46,21 +65,62 @@ impl Layout {
     pub fn new(format: &VideoFormat) -> Result<Self, String> {
         format.check()?;
         let group = format.pixel_group().expect("checked");
-        let packets = match format.packing {
-            Packing::General => general(format, group),
-            Packing::Block => block(format, group),
+        let mut layout = Self {
+            segments: Vec::new(),
+            bounds: vec![0],
+            second_field: None,
+            field_markers: format.scan == Scan::Interlaced,
         };
-        let mut layout = Self { segments: Vec::new(), bounds: vec![0] };
-        for packet in packets {
-            layout.segments.extend(packet);
-            layout.bounds.push(layout.segments.len());
+        if !format.scan.fields() {
+            layout.extend(cut(format, group));
+            return Ok(layout);
+        }
+        let row = format.row_bytes();
+        for (field, rows) in format.field_heights().into_iter().enumerate() {
+            if field == 1 {
+                layout.second_field = Some(layout.packets());
+            }
+            let one = VideoFormat { height: rows, scan: Scan::Progressive, ..format.clone() };
+            // Each field row into its row of the frame.
+            let packets = cut(&one, group).into_iter().map(|packet| {
+                let to_frame = |s: Segment| {
+                    let r = usize::from(s.row);
+                    Segment { second_field: field == 1, start: (2 * r + field) * row + s.start - r * row, ..s }
+                };
+                packet.into_iter().map(to_frame).collect()
+            });
+            layout.extend(packets.collect());
         }
         Ok(layout)
     }
 
-    /// Packets a frame: NPACKETS.
+    fn extend(&mut self, packets: Vec<Vec<Segment>>) {
+        for packet in packets {
+            self.segments.extend(packet);
+            self.bounds.push(self.segments.len());
+        }
+    }
+
+    /// Packets a frame: NPACKETS, of both fields or segments.
     pub fn packets(&self) -> usize {
         self.bounds.len() - 1
+    }
+
+    /// The first packet of the second field or segment, for interlaced and PsF video.
+    pub fn second_field(&self) -> Option<usize> {
+        self.second_field
+    }
+
+    /// Whether packet `index` carries the second field or segment.
+    pub fn in_second_field(&self, index: usize) -> bool {
+        self.second_field.is_some_and(|first| index >= first)
+    }
+
+    /// Whether packet `index` carries the marker bit: the last of the frame, or of each
+    /// field of interlaced video (ST 2110-20:2022 §6.1.2). A PsF frame's first segment
+    /// shares the frame's timestamp, and its marker bit comes only at the frame's end.
+    pub fn marker(&self, index: usize) -> bool {
+        index + 1 == self.packets() || (self.field_markers && self.second_field == Some(index + 1))
     }
 
     /// The row segments packet `index` carries.
@@ -78,14 +138,36 @@ impl Layout {
 
 fn segment(format: &VideoFormat, group: PixelGroup, start: usize, end: usize) -> Segment {
     let row = format.row_bytes();
-    let (octets, pixels) = (group.octets as usize, group.pixels as usize);
+    let rows = format.group_rows() as usize;
+    let (octets, pixels) = (group.octets as usize, group.pixels as usize / rows);
     let r = start / row;
-    Segment { row: r as u16, offset: ((start - r * row) / octets * pixels) as u16, length: (end - start) as u16, start }
+    Segment {
+        row: (r * rows) as u16,
+        offset: ((start - r * row) / octets * pixels) as u16,
+        length: (end - start) as u16,
+        second_field: false,
+        start,
+    }
+}
+
+/// The packets of a progressive frame.
+fn cut(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
+    match format.packing {
+        Packing::General => general(format, group),
+        Packing::Block => block(format, group),
+    }
 }
 
 fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
+    let packets = even(format, group);
+    let last = packets.len().saturating_sub(1);
+    if packets[..last].iter().all(|p| datagram(p) >= SHORT_DATAGRAM) { packets } else { filled(format, group) }
+}
+
+/// Each row split evenly into as few packets as fit, or up to three whole rows a packet.
+fn even(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     let row = format.row_bytes();
-    let height = format.height as usize;
+    let height = format.frame_bytes() / row;
     let octets = group.octets as usize;
     // Octets of pixel groups that fit beside `headers` row headers.
     let fits = |headers: usize| (PAYLOAD_LIMIT - ESN - SRD * headers) / octets * octets;
@@ -112,9 +194,41 @@ fn general(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     packets
 }
 
+/// Every packet filled with as many whole pixel groups as fit, running on from row to
+/// row with up to three row headers.
+fn filled(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
+    let row = format.row_bytes();
+    let total = format.frame_bytes();
+    let octets = group.octets as usize;
+    let mut packets = Vec::new();
+    let mut at = 0;
+    while at < total {
+        let mut segments = Vec::new();
+        let mut used = ESN;
+        while at < total && segments.len() < 3 {
+            let room = PAYLOAD_LIMIT.saturating_sub(used + SRD) / octets * octets;
+            if room == 0 {
+                break;
+            }
+            let to = ((at / row + 1) * row).min(at + room);
+            segments.push(segment(format, group, at, to));
+            used += SRD + to - at;
+            at = to;
+        }
+        packets.push(segments);
+    }
+    packets
+}
+
+/// Octets of the IP datagram that carries a packet's segments, behind IPv4, UDP and RTP
+/// headers of 20, 8 and 12 octets.
+fn datagram(segments: &[Segment]) -> usize {
+    20 + 8 + 12 + ESN + SRD * segments.len() + segments.iter().map(|s| usize::from(s.length)).sum::<usize>()
+}
+
 fn block(format: &VideoFormat, group: PixelGroup) -> Vec<Vec<Segment>> {
     let row = format.row_bytes();
-    let total = row * format.height as usize;
+    let total = format.frame_bytes();
     // A packet may touch three rows at most, so it may hold no more than two rows' worth.
     let chunk = BLOCKS.min(2 * row / BLOCK) * BLOCK;
     let mut packets = Vec::new();
@@ -161,18 +275,19 @@ impl Packetiser {
         self.sequence
     }
 
-    /// Writes packet `index` of `frame` into `out`, with the frame's RTP timestamp; the
-    /// last packet of the frame carries the marker bit.
+    /// Writes packet `index` of `frame` into `out`, with the RTP timestamp of the frame,
+    /// or of the field for interlaced video; the last packet of the frame, and of each
+    /// interlaced field, carries the marker bit.
     pub fn packet(&mut self, frame: &[u8], index: usize, timestamp: u32, out: &mut Vec<u8>) {
         let segments = self.layout.segments(index);
-        let marker = index + 1 == self.layout.packets();
+        let marker = self.layout.marker(index);
         out.clear();
         rtp::write_header(out, marker, self.payload_type, self.sequence as u16, timestamp, self.ssrc);
         out.extend_from_slice(&((self.sequence >> 16) as u16).to_be_bytes());
         for (i, s) in segments.iter().enumerate() {
             let more = if i + 1 < segments.len() { 0x8000 } else { 0 };
             out.extend_from_slice(&s.length.to_be_bytes());
-            out.extend_from_slice(&s.row.to_be_bytes());
+            out.extend_from_slice(&((u16::from(s.second_field) << 15) | s.row).to_be_bytes());
             out.extend_from_slice(&(more | s.offset).to_be_bytes());
         }
         for s in segments {
@@ -243,7 +358,8 @@ pub struct MalformedCounts {
     pub lengths: u64,
     /// Row segments that start off a pixel group or lie outside the picture.
     pub places: u64,
-    /// Row segments marked as a second field, in progressive video.
+    /// Row segments marked as a second field in progressive video, or a packet whose
+    /// segments name both fields.
     pub fields: u64,
     /// Payloads shorter than their headers say, or with more than three row segments.
     pub headers: u64,
@@ -278,9 +394,19 @@ struct Assembly {
 /// timestamp and an earlier sequence number is late. A frame is whole when its packets
 /// covered every pixel group; its missing packets leave the pixels of an older frame
 /// where they would have gone.
+///
+/// Interlaced and PsF frames come back whole, their fields' rows woven together. An
+/// interlaced second field, with the F bit, belongs with the first field whose
+/// timestamp is half a frame before its own, and only the second field's marker bit
+/// finishes the frame; a PsF frame's segments share its timestamp.
 pub struct Depacketiser {
     format: VideoFormat,
     group: PixelGroup,
+    /// Ticks of the 90 kHz clock from an interlaced frame's first field to its second.
+    half_frame: Option<f64>,
+    /// Rows a row of pixel groups covers, and pixels across a pixel group.
+    group_rows: usize,
+    group_pixels: usize,
     row_bytes: usize,
     row_groups: usize,
     frame_ns: f64,
@@ -305,10 +431,16 @@ impl Depacketiser {
         let group = format.pixel_group().expect("checked");
         let size = format.frame_bytes();
         let groups = size / group.octets as usize;
+        let group_rows = format.group_rows();
+        let group_pixels = group.pixels / group_rows;
+        let half_frame = (format.scan == Scan::Interlaced).then(|| 45_000.0 / format.rate.to_f64());
         Ok(Self {
             group,
+            half_frame,
+            group_rows: group_rows as usize,
+            group_pixels: group_pixels as usize,
             row_bytes: format.row_bytes(),
-            row_groups: (format.width / group.pixels) as usize,
+            row_groups: (format.width / group_pixels) as usize,
             frame_ns: 1e9 / format.rate.to_f64(),
             format: format.clone(),
             assembly: None,
@@ -347,7 +479,7 @@ impl Depacketiser {
             return;
         };
         let payload = rtp::payload(packet, &header);
-        let (extended, segments, data) = match self.parse(payload) {
+        let (extended, second_field, segments, data) = match self.parse(payload) {
             Ok(parsed) => parsed,
             Err(why) => {
                 self.counts.malformed += 1;
@@ -362,8 +494,18 @@ impl Depacketiser {
             }
         };
         let sequence = (u32::from(extended) << 16) | u32::from(header.sequence);
+        // The frame's timestamp: for an interlaced second field, its first field's.
+        let timestamp = match (self.half_frame, &self.assembly) {
+            (Some(half), Some(a))
+                if second_field && (f64::from(header.timestamp.wrapping_sub(a.timestamp)) - half).abs() <= 1.0 =>
+            {
+                a.timestamp
+            }
+            (Some(half), _) if second_field => header.timestamp.wrapping_sub(half as u32),
+            _ => header.timestamp,
+        };
         if let Some(a) = &self.assembly
-            && a.timestamp != header.timestamp
+            && a.timestamp != timestamp
         {
             if (sequence.wrapping_sub(a.highest) as i32) <= 0 {
                 self.counts.late += 1;
@@ -378,7 +520,7 @@ impl Depacketiser {
             }
             self.coverage.fill(0);
             self.assembly = Some(Assembly {
-                timestamp: header.timestamp,
+                timestamp,
                 lowest: sequence,
                 highest: sequence,
                 marker: false,
@@ -388,9 +530,10 @@ impl Depacketiser {
                 last_arrival: at,
             });
         }
-        let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
+        let (octets, pixels) = (self.group.octets as usize, self.group_pixels);
         let mut offset = 0;
         for (row, pixel, length) in segments.into_iter().flatten() {
+            let row = row / self.group_rows;
             let start = row * self.row_bytes + pixel / pixels * octets;
             self.building[start..start + length].copy_from_slice(&data[offset..offset + length]);
             offset += length;
@@ -408,7 +551,8 @@ impl Depacketiser {
         a.first_arrival = a.first_arrival.min(at);
         a.last_arrival = a.last_arrival.max(at);
         self.counts.packets += 1;
-        if header.marker {
+        // A first field's or segment's marker bit does not end the frame.
+        if header.marker && (second_field || !self.format.scan.fields()) {
             a.marker = true;
             self.finish(&mut done, None);
         }
@@ -430,11 +574,20 @@ impl Depacketiser {
         self.started = false;
     }
 
-    /// Reads the payload header: the extended sequence number and up to three row
-    /// segments as (row, first pixel, octets), checked against the format.
+    /// Reads the payload header: the extended sequence number, whether the packet is of
+    /// the second field or segment, and up to three row segments as (row of the frame,
+    /// first pixel, octets), checked against the format. A 4:2:0 segment names the first
+    /// row of its pair, and a field's rows are woven into the frame's. A packet never
+    /// spans fields.
     #[allow(clippy::type_complexity)]
-    fn parse<'p>(&self, payload: &'p [u8]) -> Result<(u16, [Option<(usize, usize, usize)>; 3], &'p [u8]), Malformed> {
+    fn parse<'p>(
+        &self,
+        payload: &'p [u8],
+    ) -> Result<(u16, bool, [Option<(usize, usize, usize)>; 3], &'p [u8]), Malformed> {
         let extended = payload.get(..ESN).map(|b| u16::from_be_bytes([b[0], b[1]])).ok_or(Malformed::Headers)?;
+        let fields = self.format.scan.fields();
+        let heights = self.format.field_heights();
+        let mut field = None;
         let mut segments = [None; 3];
         let mut at = ESN;
         let mut total = 0;
@@ -446,19 +599,22 @@ impl Depacketiser {
             let row = usize::from(u16::from_be_bytes([h[2] & 0x7F, h[3]]));
             let more = h[4] & 0x80 != 0;
             let pixel = usize::from(u16::from_be_bytes([h[4] & 0x7F, h[5]]));
-            let (octets, pixels) = (self.group.octets as usize, self.group.pixels as usize);
-            if second_field {
+            let (octets, pixels) = (self.group.octets as usize, self.group_pixels);
+            if (second_field && !fields) || field.is_some_and(|f| f != second_field) {
                 return Err(Malformed::Field);
             }
             if length % octets != 0 || (length == 0 && (i > 0 || more)) {
                 return Err(Malformed::Length);
             }
-            let inside = row < self.format.height as usize
+            let inside = row < heights[usize::from(second_field)] as usize
+                && row.is_multiple_of(self.group_rows)
                 && pixel % pixels == 0
                 && pixel + length / octets * pixels <= self.format.width as usize;
             if !inside {
                 return Err(Malformed::Place);
             }
+            field = Some(second_field);
+            let row = if fields { 2 * row + usize::from(second_field) } else { row };
             if length > 0 {
                 *slot = Some((row, pixel, length));
             }
@@ -474,7 +630,7 @@ impl Depacketiser {
         if data.len() < total {
             return Err(Malformed::Headers);
         }
-        Ok((extended, segments, data))
+        Ok((extended, field == Some(true), segments, data))
     }
 
     /// Finishes the frame being put together; `end` when receiving has stopped then.
@@ -539,6 +695,7 @@ mod tests {
     use st2110_sdp::video::{Depth, Sampling};
 
     use super::*;
+    use crate::format::Scan;
 
     fn format(width: u32, height: u32) -> VideoFormat {
         VideoFormat::new(width, height, Rational::new(50, 1).unwrap())
@@ -550,7 +707,10 @@ mod tests {
         let f = format(1920, 1080);
         let layout = Layout::new(&f).unwrap();
         assert_eq!(layout.packets(), 4320);
-        assert_eq!(layout.segments(1), [Segment { row: 0, offset: 480, length: 1200, start: 1200 }]);
+        assert_eq!(
+            layout.segments(1),
+            [Segment { row: 0, offset: 480, length: 1200, second_field: false, start: 1200 }]
+        );
         assert_eq!(layout.payload_len(0), 2 + 6 + 1200);
         // 720p: 3200 octets in packets of 1070, 1065 and 1065.
         let layout = Layout::new(&format(1280, 720)).unwrap();
@@ -562,6 +722,38 @@ mod tests {
         assert_eq!(layout.segments(29).iter().map(|s| s.row).collect::<Vec<_>>(), [87, 88, 89]);
         for f in [format(1920, 1080), format(3840, 2160), format(160, 90), format(2, 1)] {
             let layout = Layout::new(&f).unwrap();
+            assert!((0..layout.packets()).all(|i| layout.payload_len(i) <= PAYLOAD_LIMIT));
+            let total: usize = layout.segments.iter().map(|s| usize::from(s.length)).sum();
+            assert_eq!(total, f.frame_bytes());
+        }
+    }
+
+    #[test]
+    fn general_packing_fills_packets_rather_than_send_short_ones() {
+        // 640 wide: 1600 octets a row, which split evenly would make datagrams of 848.
+        let layout = Layout::new(&format(640, 360)).unwrap();
+        assert_eq!(
+            layout.segments(1),
+            [
+                Segment { row: 0, offset: 572, length: 170, second_field: false, start: 1430 },
+                Segment { row: 1, offset: 0, length: 1255, second_field: false, start: 1600 }
+            ]
+        );
+        assert_eq!(layout.payload_len(1), PAYLOAD_LIMIT - 1);
+        for (width, scan, sampling) in [
+            (640, Scan::Progressive, Sampling::YCbCr422),
+            (320, Scan::Progressive, Sampling::YCbCr422),
+            (320, Scan::Interlaced, Sampling::YCbCr422),
+            (640, Scan::Progressive, Sampling::YCbCr420),
+            (1280, Scan::Segmented, Sampling::Rgb),
+        ] {
+            let mut f = format(width, 360);
+            (f.scan, f.sampling) = (scan, sampling);
+            let layout = Layout::new(&f).unwrap();
+            let ends = [layout.second_field().map(|s| s - 1), Some(layout.packets() - 1)];
+            for i in (0..layout.packets()).filter(|i| !ends.contains(&Some(*i))) {
+                assert!(datagram(layout.segments(i)) >= 1000, "{width} {scan:?} {sampling:?}: packet {i}");
+            }
             assert!((0..layout.packets()).all(|i| layout.payload_len(i) <= PAYLOAD_LIMIT));
             let total: usize = layout.segments.iter().map(|s| usize::from(s.length)).sum();
             assert_eq!(total, f.frame_bytes());
@@ -582,8 +774,8 @@ mod tests {
         assert_eq!(
             layout.segments(3),
             [
-                Segment { row: 0, offset: 1512, length: 1020, start: 3780 },
-                Segment { row: 1, offset: 0, length: 240, start: 4800 }
+                Segment { row: 0, offset: 1512, length: 1020, second_field: false, start: 3780 },
+                Segment { row: 1, offset: 0, length: 240, second_field: false, start: 4800 }
             ]
         );
         // Rows of 200 octets: two to a block run, so packets hold two blocks and touch three rows.
@@ -611,6 +803,107 @@ mod tests {
     }
 
     #[test]
+    fn fields_go_one_after_the_other() {
+        let mut f = format(1920, 1080);
+        f.scan = Scan::Interlaced;
+        let layout = Layout::new(&f).unwrap();
+        // 540 rows a field, in four packets each.
+        assert_eq!((layout.packets(), layout.second_field()), (4320, Some(2160)));
+        let marked: Vec<usize> = (0..4320).filter(|&i| layout.marker(i)).collect();
+        assert_eq!(marked, [2159, 4319]);
+        // Row 1 of the first field is row 2 of the frame; row 0 of the second, row 1.
+        assert_eq!(
+            layout.segments(4),
+            [Segment { row: 1, offset: 0, length: 1200, second_field: false, start: 2 * 4800 }]
+        );
+        assert_eq!(
+            layout.segments(2161),
+            [Segment { row: 0, offset: 480, length: 1200, second_field: true, start: 4800 + 1200 }]
+        );
+        let all = packets(&f, &frame_of(&f), 0, 0);
+        let v = st2110_pcap::rtp::video_header(&all[2160][12..]).unwrap();
+        assert_eq!((v.second_field, v.row, v.offset), (true, 0, 0));
+        // PsF marks only the frame's end.
+        f.scan = Scan::Segmented;
+        let layout = Layout::new(&f).unwrap();
+        assert_eq!((0..4320).filter(|&i| layout.marker(i)).collect::<Vec<_>>(), [4319]);
+        // An odd height gives the first field the extra row.
+        let mut odd = format(720, 487);
+        odd.scan = Scan::Interlaced;
+        let layout = Layout::new(&odd).unwrap();
+        let first = layout.second_field().unwrap();
+        let rows = |range: std::ops::Range<usize>| {
+            range.flat_map(|i| layout.segments(i).to_vec()).filter(|s| s.offset == 0).count()
+        };
+        assert_eq!((rows(0..first), rows(first..layout.packets())), (244, 243));
+    }
+
+    #[test]
+    fn interlaced_and_psf_frames_come_back_whole() {
+        for scan in [Scan::Interlaced, Scan::Segmented] {
+            let mut f = format(320, 25);
+            f.scan = scan;
+            let frame = frame_of(&f);
+            let layout = Layout::new(&f).unwrap();
+            let second = layout.second_field().unwrap();
+            let mut all = packets(&f, &frame, 9000, 10);
+            // The second field's timestamp is half a frame on, 900 ticks at 50 frames a second.
+            if scan == Scan::Interlaced {
+                for p in &mut all[second..] {
+                    p[4..8].copy_from_slice(&9900u32.to_be_bytes());
+                }
+            }
+            let next = packets(&f, &frame, 10_800, 10 + all.len() as u32);
+            let mut d = Depacketiser::new(&f).unwrap();
+            let mut got = Vec::new();
+            for p in all.iter().chain(&next[..2]) {
+                d.push(5, p, |info, data| got.push((*info, data.to_vec())));
+            }
+            assert_eq!(got.len(), 1, "{scan:?}");
+            assert!(got[0].0.whole && got[0].0.timestamp == 9000, "{scan:?}: {:?}", got[0].0);
+            assert_eq!(got[0].1, frame);
+            // A second field on its own is the frame of the first field half a frame before.
+            if scan == Scan::Interlaced {
+                let mut d = Depacketiser::new(&f).unwrap();
+                let mut infos = Vec::new();
+                for p in &all[second..] {
+                    d.push(5, p, |info, _| infos.push(*info));
+                }
+                assert_eq!((infos[0].timestamp, infos[0].whole, infos[0].cut), (9000, false, true));
+            }
+        }
+    }
+
+    #[test]
+    fn four_two_zero_rows_go_in_pairs() {
+        // 1080p 4:2:0 10-bit: 7200 octets a pair of rows, in six packets of 1200.
+        let mut f = format(1920, 1080);
+        f.sampling = Sampling::YCbCr420;
+        let layout = Layout::new(&f).unwrap();
+        assert_eq!(layout.packets(), 540 * 6);
+        assert_eq!(
+            layout.segments(7),
+            [Segment { row: 2, offset: 320, length: 1200, second_field: false, start: 8400 }]
+        );
+        // Short rows go three pairs to a packet, each named by its first row.
+        f.width = 96;
+        let layout = Layout::new(&f).unwrap();
+        assert_eq!(layout.segments(0).iter().map(|s| s.row).collect::<Vec<_>>(), [0, 2, 4]);
+        let mut odd = format(320, 25);
+        odd.sampling = Sampling::YCbCr420;
+        assert!(Layout::new(&odd).unwrap_err().contains("row pairs"));
+        // A segment that names the second row of a pair does not fit.
+        let mut f = format(320, 24);
+        f.sampling = Sampling::YCbCr420;
+        let frame = frame_of(&f);
+        let mut all = packets(&f, &frame, 0, 0);
+        all[0][12 + 5] = 1;
+        let mut d = Depacketiser::new(&f).unwrap();
+        d.push(0, &all[0], |_, _| panic!("no frame"));
+        assert_eq!(d.counts().malformed, 1);
+    }
+
+    #[test]
     fn packets_carry_headers_the_analyser_reads() {
         let f = format(1920, 1080);
         let frame = frame_of(&f);
@@ -632,6 +925,9 @@ mod tests {
             (Sampling::YCbCr422, Depth::Bits10, Packing::Block),
             (Sampling::Rgb, Depth::Bits12, Packing::Block),
             (Sampling::Key, Depth::Bits8, Packing::General),
+            (Sampling::YCbCr420, Depth::Bits10, Packing::General),
+            (Sampling::YCbCr420, Depth::Bits8, Packing::Block),
+            (Sampling::Rgb, Depth::Bits16Float, Packing::General),
         ] {
             let mut f = format(320, 24);
             (f.sampling, f.depth, f.packing) = (sampling, depth, packing);
@@ -655,7 +951,7 @@ mod tests {
 
     #[test]
     fn missing_and_late_packets_are_counted() {
-        let f = format(320, 24);
+        let f = format(560, 24);
         let frame = frame_of(&f);
         let first = packets(&f, &frame, 0, u32::MAX - 3);
         let second = packets(&f, &frame, 1800, (u32::MAX - 3).wrapping_add(first.len() as u32));
@@ -709,7 +1005,7 @@ mod tests {
 
     #[test]
     fn a_lost_first_packet_counts_as_missing_once_a_frame_came_whole() {
-        let f = format(320, 24);
+        let f = format(560, 24);
         let frame = frame_of(&f);
         let one = packets(&f, &frame, 0, 100);
         let two = packets(&f, &frame, 1800, 100 + one.len() as u32);
@@ -727,7 +1023,8 @@ mod tests {
     #[test]
     fn overlapping_packets_leave_a_frame_short() {
         // A faulty sender writes packet 1's row header as packet 0's, so row 1 never comes.
-        let f = format(320, 8);
+        // 560 wide: one 1400-octet row a packet.
+        let f = format(560, 8);
         let frame = frame_of(&f);
         let mut all = packets(&f, &frame, 0, 0);
         let header = all[0][12 + 2..12 + 8].to_vec();

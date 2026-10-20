@@ -17,7 +17,7 @@ use st2110_sdp::video::tro_default_progressive;
 
 use crate::audio::AudioPacketiser;
 use crate::describe::{Description, Media};
-use crate::format::{SenderType, VideoFormat};
+use crate::format::{Scan, SenderType, VideoFormat};
 use crate::pattern::{Bars, Tone};
 use crate::video::{Layout, Packetiser};
 
@@ -44,6 +44,12 @@ pub trait Output {
 /// over the active part of the frame only. Each packet is sent `lead` before its read:
 /// half the read offset, so the first packet still comes after the alignment point its
 /// timestamp names, and no more than half the virtual receiver's buffer (VRXFULL).
+///
+/// Interlaced and PsF video take the ST 2110-21:2017 read offsets and active rasters of
+/// 525, 625 and 1125-line video, which ST 2110-21:2022 Table 1 means to keep: 20/525,
+/// 26/625 and 22/1125 of a frame. The gapped schedule reads the second field from half a
+/// frame after the first, leaving out the TLINE ÷ 2 that would put its packets before
+/// the instant its timestamp names; the linear schedule reads straight across the frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Schedule {
     /// TRO in nanoseconds.
@@ -52,17 +58,29 @@ pub struct Schedule {
     pub read_spacing: f64,
     /// How long before its read each packet is sent, in nanoseconds.
     pub lead: f64,
+    /// For the gapped schedule of interlaced and PsF video, the first packet of the
+    /// second field, and how long after the first field's its reads start, in
+    /// nanoseconds.
+    pub second_field: Option<(usize, f64)>,
 }
 
 impl Schedule {
-    /// The schedule for a format sent in `packets` packets a frame.
-    pub fn new(format: &VideoFormat, packets: usize) -> Self {
+    /// The schedule for a format sent in `packets` packets a frame, the second field's
+    /// from packet `second_field` for interlaced and PsF video.
+    pub fn new(format: &VideoFormat, packets: usize, second_field: Option<usize>) -> Self {
         let rate = format.rate.to_f64();
         let frame = 1e9 / rate;
-        let read_offset = tro_default_progressive(format.height, format.rate) * 1e9;
+        let gapped = format.sender_type.gapped();
         // RACTIVE is 1080/1125 for progressive video (ST 2110-21:2022 §6.3.2).
-        let active = if format.sender_type.gapped() { 1080.0 / 1125.0 } else { 1.0 };
+        let (read_offset, active) = match (format.scan.fields(), format.height) {
+            (false, height) => (tro_default_progressive(height, format.rate) * 1e9, 1080.0 / 1125.0),
+            (true, ..=487) => (20.0 / 525.0 * frame, 487.0 / 525.0),
+            (true, ..=576) => (26.0 / 625.0 * frame, 576.0 / 625.0),
+            (true, _) => (22.0 / 1125.0 * frame, 1080.0 / 1125.0),
+        };
+        let active = if gapped { active } else { 1.0 };
         let read_spacing = frame * active / packets as f64;
+        let second_field = second_field.filter(|_| gapped).map(|first| (first, frame / 2.0));
         let np_rate = packets as f64 * rate;
         // ST 2110-21:2022 §6.6.2, with MAXUDP of 1500.
         let vrx_full = if format.sender_type == SenderType::Wide {
@@ -71,12 +89,16 @@ impl Schedule {
             (np_rate / 27_000.0).floor().max(8.0)
         };
         let lead = (read_offset / 2.0).min(vrx_full / 2.0 * read_spacing);
-        Self { read_offset, read_spacing, lead }
+        Self { read_offset, read_spacing, lead, second_field }
     }
 
     /// When to send packet `index`, in nanoseconds after the frame's alignment point.
     pub fn send_offset(&self, index: usize) -> i128 {
-        (self.read_offset + index as f64 * self.read_spacing - self.lead).round() as i128
+        let read = match self.second_field {
+            Some((first, after)) if index >= first => after + (index - first) as f64 * self.read_spacing,
+            _ => index as f64 * self.read_spacing,
+        };
+        (self.read_offset + read - self.lead).round() as i128
     }
 }
 
@@ -197,7 +219,7 @@ impl VideoSender {
             ));
         }
         Ok(Self {
-            schedule: Schedule::new(format, layout.packets()),
+            schedule: Schedule::new(format, layout.packets(), layout.second_field()),
             packetiser: Packetiser::new(layout, description.payload_type, ssrc, first_sequence),
             format: format.clone(),
             buffer: Vec::with_capacity(1500),
@@ -222,7 +244,8 @@ impl VideoSender {
     /// Sends frame after frame, from the first whose alignment point is at `start` or
     /// after, until the one at `end` or until `frames` gives none, in nanoseconds of TAI.
     /// A frame whose time has passed before it can be sent is left out, and `frames` is
-    /// not asked for it.
+    /// not asked for it. An interlaced frame's second field has the timestamp of the
+    /// field period after its first's, half a frame later (ST 2110-10:2022 §7.6.1).
     pub fn run(
         &mut self,
         output: &mut dyn Output,
@@ -248,12 +271,18 @@ impl VideoSender {
                 continue;
             }
             let timestamp = epoch::frame_rtp_timestamp(n, rate, 90_000).ok_or_else(|| bad("the frame"))?;
+            let second = match self.format.scan {
+                Scan::Interlaced => epoch::frame_rtp_timestamp(2 * n + 1, self.format.field_rate(), 90_000)
+                    .ok_or_else(|| bad("the frame"))?,
+                _ => timestamp,
+            };
             let Some(frame) = frames.frame(n as u64) else { break };
             if frame.len() != octets {
                 let e = format!("{} octets is not a frame of {} of {octets}", frame.len(), self.format);
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
             }
             for index in 0..packets {
+                let timestamp = if self.packetiser.layout().in_second_field(index) { second } else { timestamp };
                 self.packetiser.packet(frame, index, timestamp, &mut self.buffer);
                 output.send(&self.buffer, t0 + self.schedule.send_offset(index))?;
                 counts.octets += self.buffer.len() as u64;
@@ -392,17 +421,40 @@ mod tests {
     #[test]
     fn schedules() {
         let mut f = VideoFormat::new(1920, 1080, Rational::new(50, 1).unwrap());
-        let s = Schedule::new(&f, 4320);
+        let s = Schedule::new(&f, 4320, None);
         // TRO = 43/1125 × 20 ms; TRS = 20 ms ÷ 4320; lead = TRO ÷ 2.
         assert!((s.read_offset - 764_444.4).abs() < 0.1, "{s:?}");
         assert!((s.read_spacing - 4629.63).abs() < 0.01, "{s:?}");
         assert!((s.lead - s.read_offset / 2.0).abs() < 1e-6);
         assert_eq!(s.send_offset(0), 382_222);
         f.sender_type = SenderType::Narrow;
-        let s = Schedule::new(&f, 4320);
+        let s = Schedule::new(&f, 4320, None);
         // Gapped: TRS = 20 ms × 1080/1125 ÷ 4320; VRXFULL is 8, so a lead of 4 × TRS.
         assert!((s.read_spacing - 4444.44).abs() < 0.01, "{s:?}");
         assert!((s.lead - 4.0 * s.read_spacing).abs() < 1e-6, "{s:?}");
+    }
+
+    #[test]
+    fn interlaced_fields_go_half_a_frame_apart() {
+        let mut format = VideoFormat::from_name("720x486i59.94").unwrap();
+        format.sender_type = SenderType::Narrow;
+        let mut sender = Sender::new(&description(Media::Video(format.clone())), 1000, -18.0, 1, 0).unwrap();
+        let mut out = Keep::default();
+        sender.run(&mut out, T, T + 33_366_667).unwrap();
+        let layout = Layout::new(&format).unwrap();
+        let second = layout.second_field().unwrap();
+        assert_eq!(out.0.len(), layout.packets());
+        let header = |i: usize| st2110_pcap::rtp::header(&out.0[i].0, true).unwrap();
+        // 3003 ticks a frame: the second field's timestamp is 1501.5 on, truncated.
+        assert_eq!(header(second).timestamp.wrapping_sub(header(0).timestamp), 1501);
+        assert!(header(second - 1).marker && header(layout.packets() - 1).marker && !header(0).marker);
+        // Gapped: the second field is read from half a frame after the first, from TRO of 20/525.
+        let s = sender.schedule().unwrap();
+        let frame = 1001.0 / 30_000.0 * 1e9;
+        assert!((s.read_offset - 20.0 / 525.0 * frame).abs() < 1e-6, "{s:?}");
+        let t0 = out.0[0].1 - s.send_offset(0);
+        assert!((out.0[second].1 - t0 - s.send_offset(0) - (frame / 2.0).round() as i128).abs() <= 1);
+        assert!(out.0.windows(2).all(|w| w[0].1 < w[1].1));
     }
 
     #[test]
