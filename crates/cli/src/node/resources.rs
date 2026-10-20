@@ -127,6 +127,10 @@ pub(crate) fn device(ids: &Ids, place: &Place, version: &str, label: &str) -> Va
             "controls": [{
                 "href": format!("{}/x-nmos/connection/{CONNECTION_VERSION}/", place.base()),
                 "type": format!("urn:x-nmos:control:sr-ctrl/{CONNECTION_VERSION}"), "authorization": false,
+            }, {
+                // IS-12 v1.0.1: the Device's control model, with its status monitor.
+                "href": format!("ws://{}:{}{}/", place.host, place.port, super::ncp::PATH),
+                "type": st2110_nmos::ncp::CONTROL_TYPE, "authorization": false,
             }],
         }),
     )

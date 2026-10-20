@@ -26,6 +26,7 @@ use st2110_media::send::{SendCounts, Sender, default_sender_type};
 use st2110_media::video::FrameInfo;
 
 use crate::node::connection::Endpoint;
+use crate::node::monitor::{ReceiverMeter, SenderMeter};
 use crate::node::{self, Node, NodeArgs, Offer, Receiving, Sending, Switch, Switched, Tuning};
 use crate::{Format, Style, read, seconds};
 
@@ -452,6 +453,10 @@ impl Ready<'_> {
                             return Ok(ExitCode::from(2));
                         }
                     };
+                    // The Sender's monitor reads how the sockets keep time.
+                    let watched = switch.clone();
+                    let mut meter = SenderMeter::default();
+                    node.watch(Box::new(move || meter.observe(watched.counts())));
                     // The grace again, after the time the Node took to start.
                     let start = net::tai_now(args.tai_utc) + NANOS / 10;
                     let counts = self.sender.run(&mut Switched(switch.clone()), start, start + duration)?;
@@ -591,6 +596,18 @@ pub(crate) struct ReceiveArgs {
 enum MediaArg {
     Video,
     Audio,
+}
+
+/// What an NMOS Receiver's monitor hears of the receiving, every half second.
+struct Watcher<'a> {
+    node: &'a Node,
+    meter: &'a mut ReceiverMeter,
+}
+
+impl Sink for Watcher<'_> {
+    fn progress(&mut self, report: &Report) {
+        self.node.observe(self.meter.observe(report));
+    }
 }
 
 /// Where received audio goes, when it is saved.
@@ -870,6 +887,7 @@ fn receive_nmos(args: &ReceiveArgs) -> io::Result<ExitCode> {
     let mut received: Vec<Received> = Vec::new();
     let mut failed = false;
     let style = Style::detect();
+    let mut meter = ReceiverMeter::default();
     while net::tai_now(args.tai_utc) < until {
         let Some(tuned) = tuning.take() else {
             // Nothing to receive: wait for a controller.
@@ -902,8 +920,9 @@ fn receive_nmos(args: &ReceiveArgs) -> io::Result<ExitCode> {
                 continue;
             }
         };
-        let mut saver = Saver { wav: None, error: None };
-        net::receive_until_or_stopped(&mut session, sockets, until, &tuning.changed, args.tai_utc, &mut saver)?;
+        meter.start();
+        let mut watcher = Watcher { node: &node, meter: &mut meter };
+        net::receive_until_or_stopped(&mut session, sockets, until, &tuning.changed, args.tai_utc, &mut watcher)?;
         let report = session.report();
         failed |= !report.problems.is_empty();
         let one = Received { file, sdp_notes: tuned.notes, input: "network".into(), capture_shift: None, report };

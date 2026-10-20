@@ -23,6 +23,7 @@ mod demo;
 mod dnssd;
 mod events;
 mod keep;
+mod monitors;
 mod preview;
 mod signal;
 
@@ -126,6 +127,8 @@ struct Router {
     /// The public key it signs `private_key_jwt` assertions with, as a JSON Web Key
     /// Set, for the Authorization Server to read at `/.well-known/jwks.json`.
     jwks: Option<Value>,
+    /// The status monitors of the Senders and Receivers, live.
+    monitors: monitors::Monitors,
 }
 
 /// Where the router publishes the key it signs IS-10 client assertions with.
@@ -263,6 +266,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
         keeper,
         demo_sockets: Hub::default(),
         jwks,
+        monitors: monitors::Monitors::default(),
         // The demo's streams come over the loopback interface.
         previews: Previews::new(
             if args.demo { Some(Ipv4Addr::LOCALHOST) } else { args.interface },
@@ -360,7 +364,7 @@ fn handle(router: &Arc<Router>, stream: &TcpStream) {
     let Ok(Some(request)) = http::read(stream) else {
         return;
     };
-    if events::is_upgrade(&request) {
+    if http::is_upgrade(&request) {
         return upgrade(router, stream, &request);
     }
     let response = answer(router, &request);
@@ -405,7 +409,7 @@ fn upgrade(router: &Arc<Router>, stream: &TcpStream, request: &Request) {
                 }
                 facility.sync(&uid)
             };
-            if let Err((status, message)) = events::accept(stream, request) {
+            if let Err((status, message)) = http::accept(stream, request) {
                 return refuse(status, &message);
             }
             let Some(client) = router.demo_sockets.add(&uid, stream, 64) else { return };

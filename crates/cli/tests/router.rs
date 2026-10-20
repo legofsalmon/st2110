@@ -702,3 +702,117 @@ fn send_and_receive_register_with_the_demo_and_connect_routes_them() {
     assert!(!labels("senders").contains(&"Test tone".into()), "{:?}", labels("senders"));
     assert!(!labels("receivers").contains(&"Test monitor".into()), "{:?}", labels("receivers"));
 }
+
+/// `st2110 receive --nmos` has an IS-12 control endpoint with a BCP-008-01 Receiver
+/// monitor: a controller finds it, reads it, and hears it change by subscribing; the
+/// router's page hears the same, and `st2110 nmos` shows it.
+#[test]
+fn a_receivers_status_monitor_says_what_the_stream_does_over_is_12() {
+    use st2110_nmos::ncp::{self, client::Connection, property};
+    let router = Router::start();
+    let registry = format!("http://{}", router.address);
+    let nmos = format!("--nmos={registry}");
+    let st2110 = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2110"));
+        command.args(args).env("NO_COLOR", "1").env("NO_PROXY", "127.0.0.1").env("no_proxy", "127.0.0.1");
+        command
+    };
+    let mut receiver = st2110(&["receive", &nmos, "--media", "audio", "--interface", "127.0.0.1"])
+        .args(["--duration", "30", "--label", "Watched monitor"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("runs");
+    let find = |kind: &str, label: &str| -> Option<Value> {
+        let found = router.get(&format!("/x-nmos/query/v1.3/{kind}/"));
+        found.as_array()?.iter().find(|r| r["label"] == label).cloned()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let watched = loop {
+        if let Some(found) = find("receivers", "Watched monitor") {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "not registered");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let id = watched["id"].as_str().unwrap().to_string();
+    let device = router.get(&format!("/x-nmos/query/v1.3/devices/{}", watched["device_id"].as_str().unwrap()));
+    let control = device["controls"].as_array().unwrap().iter().find(|c| c["type"] == ncp::CONTROL_TYPE).cloned();
+    let href = control.expect("an IS-12 control")["href"].as_str().unwrap().to_string();
+
+    // Found by class, read with Get, and subscribed to.
+    let mut controller = Connection::open(&href, &[], Duration::from_secs(5)).expect("connects");
+    let monitors = controller.monitors().expect("reads its monitors");
+    assert_eq!(monitors.len(), 1, "{monitors:?}");
+    let monitor = &monitors[0];
+    assert_eq!(monitor["classId"], json!([1, 2, 2, 1]), "{monitor:#}");
+    assert_eq!(monitor["touchpoints"][0]["resource"], json!({"resourceType": "receiver", "id": id}));
+    assert_eq!(monitor["properties"]["overallStatus"], 0, "inactive until connected: {monitor:#}");
+    assert_eq!(monitor["properties"]["statusReportingDelay"], 3, "{monitor:#}");
+    let oid = monitor["oid"].as_u64().unwrap();
+    let delay = json!({"id": property::STATUS_REPORTING_DELAY.json(), "value": 1});
+    controller.call(oid, ncp::method::SET, delay).expect("sets the delay");
+    assert_eq!(controller.subscribe(&[oid]).expect("subscribes"), [oid]);
+    controller.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let mut page = router.events();
+    let mut overall = |want: u64, within: Duration| {
+        let deadline = Instant::now() + within;
+        let mut heard = Vec::new();
+        while Instant::now() < deadline {
+            match controller.next_change() {
+                Ok(Some(change)) if change.property == property::OVERALL_STATUS => {
+                    heard.push(change.value.clone());
+                    if change.value == want {
+                        return;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the Device closed the connection"),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("overallStatus never became {want}: heard {heard:?}");
+    };
+
+    // Connected to a Sender that sends: healthy at once.
+    let mut sender = st2110(&["send", "audio", "--to", "239.10.60.2:5006", "--interface", "127.0.0.1"])
+        .args(["--clock", "traceable", "--duration", "30", "--label", "Watched tone", &nmos])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("runs");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while find("senders", "Watched tone").is_none() {
+        assert!(Instant::now() < deadline, "the sender is not registered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = st2110(&["connect", &registry, "--receiver", "Watched monitor", "--sender", "Watched tone"])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    overall(1, Duration::from_secs(5));
+
+    // The Sender stops: nothing arrives, which is unhealthy, at once.
+    let _ = sender.kill();
+    let _ = sender.wait();
+    overall(3, Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let message = next(&mut page, "monitors");
+        let status = &message["monitors"][&id];
+        if status["overall"] == "Unhealthy" {
+            assert_eq!(status["kind"], "receiver", "{status:#}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the page never heard it: {message:#}");
+    }
+    let output = st2110(&["nmos", &registry]).output().expect("runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let after = text.split("Watched monitor").nth(1).unwrap_or_default();
+    let line = after.lines().nth(1).unwrap_or_default();
+    assert!(line.trim_start().starts_with("monitor: unhealthy"), "{text}");
+    controller.close();
+    let _ = receiver.kill();
+    let _ = receiver.wait();
+}
