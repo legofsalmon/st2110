@@ -1,9 +1,16 @@
 //! Grouping: ST 2022-7 redundancy (`DUP`), RP 2110-23 multi-stream video and `FID`.
 
 use crate::diag::Diagnostics;
+use crate::rational::digits;
 use crate::rules;
 use crate::sdp::SessionDescription;
 use crate::stream::{Essence, Media, same_address};
+use crate::video::{tro_default_interlaced, tro_default_progressive};
+
+/// The parameters that make up a picture format, which the streams of a multi-stream
+/// group share.
+const FORMAT: [&str; 10] =
+    ["sampling", "depth", "width", "height", "exactframerate", "interlace", "segmented", "colorimetry", "TCS", "RANGE"];
 
 pub(super) fn check(sdp: &SessionDescription, media: &[Media<'_>], d: &mut Diagnostics) {
     for m in media {
@@ -29,6 +36,16 @@ pub(super) fn check(sdp: &SessionDescription, media: &[Media<'_>], d: &mut Diagn
             );
         }
     }
+    // The streams that an ST 2022-7 DUP group protects.
+    let protected: Vec<&str> = sdp
+        .session
+        .attributes_named("group")
+        .filter_map(|attr| {
+            let mut words = attr.text().split_whitespace();
+            words.next().is_some_and(|semantics| semantics.eq_ignore_ascii_case("DUP")).then_some(words)
+        })
+        .flatten()
+        .collect();
     for attr in sdp.session.attributes_named("group") {
         let mut words = attr.text().split_whitespace();
         let Some(semantics) = words.next() else {
@@ -56,7 +73,10 @@ pub(super) fn check(sdp: &SessionDescription, media: &[Media<'_>], d: &mut Diagn
         }
         match semantics.to_ascii_uppercase().as_str() {
             "DUP" => dup(attr.line, mids.len(), &members, d),
-            "MULTI-2SI" | "MULTI-SD" | "PHASED" => multistream(semantics, attr.line, mids.len(), &members, d),
+            "MULTI-2SI" | "MULTI-SD" | "PHASED" => {
+                multistream(semantics, attr.line, mids.len(), &members, d);
+                constituents(semantics, attr.line, &mids, &members, &protected, d);
+            }
             "FID" => {
                 for m in members.iter().filter(|m| m.essence == Essence::Ancillary) {
                     d.report(
@@ -208,5 +228,98 @@ fn multistream(semantics: &str, line: usize, named: usize, members: &[&Media<'_>
                 ),
             );
         }
+    }
+}
+
+/// RP 2110-23 §5.2-5.5: the streams of a multi-stream group carry one format, all
+/// or none of them are protected by ST 2022-7, and split pictures share a read offset.
+fn constituents(
+    semantics: &str,
+    line: usize,
+    mids: &[&str],
+    members: &[&Media<'_>],
+    protected: &[&str],
+    d: &mut Diagnostics,
+) {
+    let duplicated: Vec<&str> = mids.iter().copied().filter(|m| protected.contains(m)).collect();
+    if !duplicated.is_empty() && duplicated.len() < mids.len() {
+        let alone: Vec<&str> = mids.iter().copied().filter(|m| !protected.contains(m)).collect();
+        d.add(
+            &rules::MULTISTREAM_DUP,
+            format!(
+                "a=group:{semantics} protects {} with a=group:DUP but not {}; ST 2022-7 protects every stream of the group or none",
+                duplicated.join(", "),
+                alone.join(", ")
+            ),
+        )
+        .at(line);
+    }
+    let Some((first, rest)) = members.split_first() else { return };
+    let setting = |m: &Media<'_>, name: &str| {
+        m.fmtp.as_ref().and_then(|(_, f)| f.get(name)).map(|p| match &p.value {
+            Some(v) => format!("{name}={v}"),
+            None => name.to_string(),
+        })
+    };
+    let split = !semantics.eq_ignore_ascii_case("PHASED");
+    for other in rest {
+        let difference = FORMAT.iter().find_map(|name| {
+            let (a, b) = (setting(first, name), setting(other, name));
+            (a != b).then(|| {
+                let show = |s: Option<String>| s.unwrap_or_else(|| format!("no {name}"));
+                format!("{} has {} where {} has {}", mid(other), show(b), mid(first), show(a))
+            })
+        });
+        if let Some(difference) = difference {
+            d.report(
+                &rules::MULTISTREAM_FORMAT,
+                other.index,
+                other.line,
+                format!("{difference}; the streams of a {semantics} group carry one format"),
+            );
+            continue;
+        }
+        if split && !same_read_offset(first, other) {
+            let show =
+                |m: &Media<'_>| m.value("TROFF").map_or("the default TROFF".to_string(), |v| format!("TROFF={v}"));
+            d.report(
+                &rules::MULTISTREAM_TROFF,
+                other.index,
+                other.line,
+                format!(
+                    "{} has {} and {} has {}; the parts of a {semantics} picture are read from one offset",
+                    mid(other),
+                    show(other),
+                    mid(first),
+                    show(first)
+                ),
+            );
+        }
+    }
+}
+
+/// Whether two streams of one format read from the same offset, counting a missing
+/// `TROFF` as the default where the default is known.
+fn same_read_offset(a: &Media<'_>, b: &Media<'_>) -> bool {
+    let signalled = |m: &Media<'_>| m.value("TROFF").map(|v| digits(v).map(|us| us as f64));
+    let (sa, sb) = (signalled(a), signalled(b));
+    if sa == sb {
+        return true;
+    }
+    let default = || {
+        let height = digits(a.value("height")?).and_then(|h| u32::try_from(h).ok())?;
+        let rate = super::read_frame_rate(a.value("exactframerate")?)?;
+        let interlaced = a.fmtp.as_ref().is_some_and(|(_, f)| f.has("interlace"));
+        let seconds =
+            if interlaced { tro_default_interlaced(height, rate) } else { Some(tro_default_progressive(height, rate)) };
+        seconds.map(|s| s * 1e6)
+    };
+    let effective = |s: Option<Option<f64>>| match s {
+        Some(value) => value,
+        None => default(),
+    };
+    match (effective(sa), effective(sb)) {
+        (Some(x), Some(y)) => (x - y).abs() < 1.0,
+        _ => false,
     }
 }

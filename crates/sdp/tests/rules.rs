@@ -117,6 +117,15 @@ fn cases() -> Vec<(&'static str, String)> {
         ("multistream-deprecated", with(VIDEO, "a=group:DUP", "a=group:MULTI-SD")),
         ("multistream-count", with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI")),
         ("multistream-addresses", with(with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI"), "239.20.10.1", "239.10.10.1")),
+        ("multistream-format", with_first(with(VIDEO, "a=group:DUP", "a=group:PHASED"), "depth=10", "depth=12")),
+        (
+            "multistream-troff",
+            with_first(with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI"), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500"),
+        ),
+        (
+            "multistream-dup",
+            with(VIDEO, "a=group:DUP primary secondary", "a=group:PHASED primary secondary\na=group:DUP primary"),
+        ),
         (
             "fid-anc",
             with(
@@ -136,6 +145,7 @@ fn cases() -> Vec<(&'static str, String)> {
         ("video-sd-width", sd("width=704; height=486", None)),
         ("video-sd-height", sd("width=720; height=487", Some("10:11"))),
         ("video-sd-par", sd("width=720; height=486", Some("1:1"))),
+        ("video-sd-sampling", with(sd("width=720; height=486", Some("10:11")), "YCbCr-4:2:2", "YCbCr-4:4:4")),
         ("tp", with(VIDEO, "TP=2110TPN", "TP=2110TPX")),
         ("tp-wide", with(VIDEO, "TP=2110TPN", "TP=2110TPW")),
         ("shaping-param", with(VIDEO, "TSMODE=SAMP", "TSMODE=SAMP; TROFF=0")),
@@ -143,6 +153,7 @@ fn cases() -> Vec<(&'static str, String)> {
         // ST 2110-22.
         ("cbr-bandwidth", with(JPEG_XS, "b=AS:116000\n", "")),
         ("jxsv-tr08", with(JPEG_XS, "packetmode=0", "packetmode=1")),
+        ("jxsv-profile", with(JPEG_XS, "level=2k-1", "level=3k-1")),
         // ST 2110-30 and -31.
         ("audio-rate", with(AUDIO, "L24/48000/8", "L24/32000/8")),
         ("audio-ptime-missing", with(AUDIO, "a=ptime:1\n", "")),
@@ -297,6 +308,14 @@ fn valid_variations_raise_nothing() {
         with(VIDEO, "239.20.10.1", "239.10.10.1"),
         // Traceable time needs no grandmaster or domain.
         with(VIDEO, "08-00-11-FF-FE-21-E1-B0:127", "traceable"),
+        // The default read offset for 1080i59.94 is 652.5 µs.
+        with(VIDEO, "exactframerate=50", "exactframerate=30000/1001; interlace; TROFF=652"),
+        // Any TROFF on 525- and 625-line video, whose defaults are misprinted.
+        with(sd("width=720; height=486", Some("10:11")), "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500"),
+        // Phases of a high frame rate camera, each with the same format.
+        with(VIDEO, "a=group:DUP", "a=group:PHASED"),
+        // JPEG XS at a TR-08 profile, level and sublevel, in lower case.
+        with(JPEG_XS, "level=2k-1", "level=2K-1"),
         // 525-line SD as RP 2110-24 carries it.
         sd("width=720; height=486", Some("10:11")),
         // Level C audio: 16 channels in 125 µs packets.
@@ -328,6 +347,17 @@ fn messages_suggest_the_fix() {
     assert!(message(&alpha, "ssn").contains("SSN=ST2110-20:2022"));
     let offset = with(VIDEO, "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500");
     assert!(message(&offset, "troff-nondefault").contains("default of 764 µs"));
+    let interlaced = with(VIDEO, "exactframerate=50", "exactframerate=25; interlace; TROFF=500");
+    assert!(message(&interlaced, "troff-nondefault").contains("default of 782 µs for 1080-line interlaced video"));
+    // A 2SI part that writes out the default read offset reads from the same offset as one
+    // that leaves it out.
+    let split = with(VIDEO, "a=group:DUP", "a=group:MULTI-2SI");
+    assert!(!ids(&with_first(&split, "TSMODE=SAMP", "TSMODE=SAMP; TROFF=764")).contains("multistream-troff"));
+    let troff = with_first(&split, "TSMODE=SAMP", "TSMODE=SAMP; TROFF=500");
+    assert_eq!(
+        message(&troff, "multistream-troff"),
+        "secondary has the default TROFF and primary has TROFF=500; the parts of a MULTI-2SI picture are read from one offset"
+    );
 }
 
 #[test]
