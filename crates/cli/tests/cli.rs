@@ -787,7 +787,10 @@ fn send_writes_a_capture_the_analyser_and_linter_pass() {
     let analysed = st2110(&["pcap", &pcap, "--sdp", &sdp]);
     let report = stdout(&analysed);
     assert_eq!(analysed.status.code(), Some(0), "{report}");
-    assert!(report.contains("2 flows, no problems found"), "{report}");
+    // A 320-pixel row is 800 octets, so general packing sends datagrams under the 1000
+    // octets ST 2110-20 §6.3.2 says senders should avoid; that is all it may find.
+    assert!(report.contains("2 flows, no problems found") || report.contains("2 flows, 0 errors"), "{report}");
+    assert!(report.lines().filter(|l| l.contains("warning[")).all(|l| l.contains("warning[gpm-short]")), "{report}");
 }
 
 #[test]

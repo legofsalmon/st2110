@@ -86,6 +86,65 @@ pub fn video_header(payload: &[u8]) -> Option<VideoHeader> {
     })
 }
 
+/// One sample row data header of an ST 2110-20 payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleRow {
+    /// Octets of sample data.
+    pub length: u16,
+    /// The F bit.
+    pub second_field: bool,
+    /// The row number.
+    pub row: u16,
+    /// The offset of the first pixel in the row.
+    pub offset: u16,
+}
+
+/// The sample row data headers of an ST 2110-20 payload, as many as the C bits chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleRows {
+    /// The first three headers; ST 2110-20 allows no more.
+    pub rows: [Option<SampleRow>; 3],
+    /// Whether the third header's C bit says that a fourth follows.
+    pub more: bool,
+}
+
+impl SampleRows {
+    /// The headers, in order.
+    pub fn iter(&self) -> impl Iterator<Item = SampleRow> + '_ {
+        self.rows.iter().flatten().copied()
+    }
+
+    /// Octets of the payload header: the extended sequence number and the headers.
+    pub fn header_length(&self) -> usize {
+        2 + 6 * self.iter().count()
+    }
+}
+
+/// Reads every sample row data header of an ST 2110-20 payload, up to three (ST
+/// 2110-20:2022 §6.1.4). `None` when `payload` ends before the last one the C bits
+/// promise.
+pub fn sample_rows(payload: &[u8]) -> Option<SampleRows> {
+    let mut rows = [None; 3];
+    let mut at = 2;
+    for (i, slot) in rows.iter_mut().enumerate() {
+        let h = payload.get(at..at + 6)?;
+        at += 6;
+        *slot = Some(SampleRow {
+            length: u16::from_be_bytes([h[0], h[1]]),
+            second_field: h[2] & 0x80 != 0,
+            row: u16::from_be_bytes([h[2] & 0x7F, h[3]]),
+            offset: u16::from_be_bytes([h[4] & 0x7F, h[5]]),
+        });
+        if h[4] & 0x80 == 0 {
+            return Some(SampleRows { rows, more: false });
+        }
+        if i == 2 {
+            return Some(SampleRows { rows, more: true });
+        }
+    }
+    unreachable!("the loop returns on its third pass")
+}
+
 /// Which field an ST 2110-40 packet's data belongs to: the F field of RFC 8331 §2.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AncField {
@@ -144,6 +203,20 @@ mod tests {
             (v.extended_sequence, v.length, v.second_field, v.row, v.continuation, v.offset),
             (1, 1200, true, 2, false, 16)
         );
+        let rows = sample_rows(&packet[12..]).unwrap();
+        assert_eq!((rows.iter().count(), rows.more, rows.header_length()), (1, false, 8));
+
+        // Three rows, the third of which says a fourth follows.
+        let mut three = vec![0x00, 0x01];
+        three.extend([0x00, 0x3C, 0x00, 0x05, 0x83, 0x48]);
+        three.extend([0x00, 0x3C, 0x00, 0x06, 0x80, 0x00]);
+        three.extend([0x00, 0x3C, 0x00, 0x07, 0x80, 0x00]);
+        let rows = sample_rows(&three).unwrap();
+        let read: Vec<(u16, u16, u16)> = rows.iter().map(|r| (r.length, r.row, r.offset)).collect();
+        assert_eq!(read, [(60, 5, 840), (60, 6, 0), (60, 7, 0)]);
+        assert!(rows.more);
+        assert_eq!(sample_rows(&three[..14]), None);
+
         // Two ANC packets in the first field.
         let anc = anc_header(&[0x00, 0x01, 0x00, 0x40, 0x02, 0x80, 0x00, 0x00]).unwrap();
         assert_eq!((anc.extended_sequence, anc.length, anc.count, anc.field), (1, 64, 2, AncField::First));
