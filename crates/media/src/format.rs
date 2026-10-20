@@ -476,18 +476,50 @@ pub struct AudioFormat {
     /// Samples per channel in each packet: 48 for the 1 ms packets of level A at 48 kHz,
     /// or 6 for the 125 µs of levels B and C.
     pub samples_per_packet: u32,
+    /// Whether the samples go as ST 2110-31 AM824 subframes, those of AES3 signals of two
+    /// channels each, rather than as ST 2110-30 PCM: `bits` is then 24.
+    pub aes3: bool,
 }
+
+/// Samples a packet that ST 2110-31:2022 Table 1 allows at 48 kHz, and the packet times
+/// they make: 1 ms, 125 µs and 83⅓ µs. 96 kHz packets hold twice as many, and 44.1 kHz
+/// packets as many, a little longer.
+const AES3_PACKETS: [(u32, f64); 3] = [(48, 1.0), (6, 0.125), (4, 1.0 / 12.0)];
+
+/// How ST 2110-31:2022 Table 1 writes the packet times.
+const AES3_PTIMES: [&str; 6] = ["1", "0.12", "0.08", "1.09", "0.14", "0.09"];
 
 impl AudioFormat {
     /// Level A: 48 kHz, 24 bits, 1 ms packets.
     pub fn new(channels: u16) -> Self {
-        Self { channels, sample_rate: 48_000, bits: 24, samples_per_packet: 48 }
+        Self { channels, sample_rate: 48_000, bits: 24, samples_per_packet: 48, aes3: false }
+    }
+
+    /// The same channels as AES3 signals in AM824 subframes, as ST 2110-31 carries them.
+    pub fn am824(self) -> Self {
+        Self { aes3: true, bits: 24, ..self }
     }
 
     /// The format with packets of `ms` milliseconds, which must come within 1% of a
     /// whole number of samples: at 44.1 kHz, 1 ms is 44 samples and 1.09 ms is 48.
+    ///
+    /// AM824 takes the packet times of ST 2110-31 Table 1 only: 1, 0.125 or 0.083 ms, or
+    /// as the table writes them, such as 0.12 or, at 44.1 kHz, 1.09.
     pub fn with_packet_time(mut self, ms: f64) -> Result<Self, String> {
         check_rate(self.sample_rate)?;
+        if self.aes3 {
+            let scale = if self.sample_rate == 96_000 { 2 } else { 1 };
+            let samples = AES3_PACKETS.iter().find_map(|&(samples, nominal)| {
+                let samples = samples * scale;
+                let written = aes3_ptime(self.sample_rate, samples).and_then(|text| text.parse::<f64>().ok());
+                (((ms - nominal) / nominal).abs() < 0.05 || written == Some(ms)).then_some(samples)
+            });
+            self.samples_per_packet = samples.ok_or_else(|| {
+                format!("{ms} ms is not an ST 2110-31 packet time: AM824 packets are 1, 0.125 or 0.083 ms")
+            })?;
+            self.check()?;
+            return Ok(self);
+        }
         let khz = f64::from(self.sample_rate) / 1000.0;
         let exact = khz * ms;
         let samples = exact.round();
@@ -511,7 +543,7 @@ impl AudioFormat {
 
     /// Octets per sample.
     pub fn sample_bytes(&self) -> usize {
-        usize::from(self.bits / 8)
+        if self.aes3 { 4 } else { usize::from(self.bits / 8) }
     }
 
     /// Octets of samples in each packet.
@@ -519,15 +551,23 @@ impl AudioFormat {
         self.samples_per_packet as usize * usize::from(self.channels) * self.sample_bytes()
     }
 
-    /// The `a=rtpmap` encoding: `L24` or `L16`.
+    /// The `a=rtpmap` encoding: `L24`, `L16` or `AM824`.
     pub fn encoding(&self) -> &'static str {
-        if self.bits == 16 { "L16" } else { "L24" }
+        match (self.aes3, self.bits) {
+            (true, _) => "AM824",
+            (false, 16) => "L16",
+            (false, _) => "L24",
+        }
     }
 
     /// The `a=ptime` value in milliseconds: exact when the packet time is a whole number
     /// of microseconds, `1` or `0.125`, and otherwise the shortest within 1% that gives
     /// back the samples when a receiver rounds, such as `1.09` for 48 samples at 44.1 kHz.
+    /// AM824 writes it as ST 2110-31 Table 1 does: `0.12` for 125 µs.
     pub fn ptime(&self) -> String {
+        if let Some(text) = self.aes3.then(|| aes3_ptime(self.sample_rate, self.samples_per_packet)).flatten() {
+            return text.into();
+        }
         let trim = |text: String| {
             if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text }
         };
@@ -547,8 +587,12 @@ impl AudioFormat {
             .map_or_else(|| format!("{ms}"), trim)
     }
 
-    /// The `channel-order` value: mono, stereo or undefined channels.
+    /// The `channel-order` value: mono, stereo or undefined channels, or for AM824 one
+    /// `AES3` group of two subframes for each signal (ST 2110-31:2022 Table 2).
     pub fn channel_order(&self) -> String {
+        if self.aes3 {
+            return format!("SMPTE2110.({})", vec!["AES3"; usize::from(self.channels / 2)].join(","));
+        }
         match self.channels {
             1 => "SMPTE2110.(M)".into(),
             2 => "SMPTE2110.(ST)".into(),
@@ -564,6 +608,23 @@ impl AudioFormat {
         check_rate(self.sample_rate)?;
         if self.bits != 16 && self.bits != 24 {
             return Err(format!("{}-bit samples are not 16 or 24 bits", self.bits));
+        }
+        if self.aes3 {
+            if self.bits != 24 {
+                return Err("AM824 carries 24-bit samples".into());
+            }
+            if !self.channels.is_multiple_of(2) {
+                return Err(format!(
+                    "{} channels: AM824 carries AES3 signals of two subframes each, so the count is even",
+                    self.channels
+                ));
+            }
+            if aes3_ptime(self.sample_rate, self.samples_per_packet).is_none() {
+                return Err(format!(
+                    "{} samples a packet at {} Hz is not an ST 2110-31 packet time of 1, 0.125 or 0.083 ms",
+                    self.samples_per_packet, self.sample_rate
+                ));
+            }
         }
         if self.samples_per_packet == 0 || u64::from(self.samples_per_packet) * 250 > u64::from(self.sample_rate) {
             return Err(format!(
@@ -581,6 +642,11 @@ impl AudioFormat {
         }
         Ok(())
     }
+}
+
+/// The `a=ptime` of ST 2110-31 Table 1 for packets of `samples` at `sample_rate`.
+fn aes3_ptime(sample_rate: u32, samples: u32) -> Option<&'static str> {
+    AES3_PTIMES.into_iter().find(|text| st2110_sdp::audio::aes3_samples(sample_rate, text) == Some(samples))
 }
 
 /// Samples in a packet of `ms` milliseconds at `sample_rate`, rounded, as a receiver
@@ -715,6 +781,32 @@ mod tests {
         let f = AudioFormat::new(2).with_packet_time(0.292).unwrap();
         assert_eq!((f.samples_per_packet, f.ptime()), (14, "0.29".to_string()));
         assert!(AudioFormat::new(2).with_packet_time(5.0).unwrap_err().contains("up to 4 ms"));
+    }
+
+    #[test]
+    fn am824_packet_times_and_channel_order() {
+        let f = AudioFormat::new(4).am824();
+        assert_eq!((f.encoding(), f.sample_bytes(), f.ptime()), ("AM824", 4, "1".to_string()));
+        assert_eq!(f.channel_order(), "SMPTE2110.(AES3,AES3)");
+        assert_eq!(f.to_string(), "AM824 48 kHz, 4 channels, 1 ms");
+        for (rate, ms, samples, ptime) in [
+            (48_000, 0.125, 6, "0.12"),
+            (48_000, 0.12, 6, "0.12"),
+            (48_000, 0.083, 4, "0.08"),
+            (96_000, 0.125, 12, "0.12"),
+            (96_000, 1.0, 96, "1"),
+            (44_100, 1.0, 48, "1.09"),
+            (44_100, 1.09, 48, "1.09"),
+            (44_100, 0.125, 6, "0.14"),
+        ] {
+            let f = AudioFormat { sample_rate: rate, ..AudioFormat::new(2).am824() }.with_packet_time(ms).unwrap();
+            assert_eq!((f.samples_per_packet, f.ptime()), (samples, ptime.to_string()), "{rate} {ms}");
+        }
+        assert!(AudioFormat::new(2).am824().with_packet_time(0.25).unwrap_err().contains("not an ST 2110-31"));
+        assert!(AudioFormat::new(3).am824().check().unwrap_err().contains("even"));
+        assert!(AudioFormat { bits: 16, ..AudioFormat::new(2).am824() }.check().unwrap_err().contains("24-bit"));
+        // 1 ms of 8 subframes is 1536 octets, over the limit.
+        assert!(AudioFormat::new(8).am824().check().unwrap_err().contains("UDP size limit"));
     }
 
     #[test]

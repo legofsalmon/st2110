@@ -114,9 +114,15 @@ pub(crate) struct AudioArgs {
     #[arg(long, default_value_t = 24)]
     bits: u8,
     /// Milliseconds of audio in each packet: 1, or 0.125 as levels B and C have. At
-    /// 44.1 kHz, the nearest whole number of samples: 1 ms is 44 of them.
+    /// 44.1 kHz, the nearest whole number of samples: 1 ms is 44 of them. AM824 takes 1,
+    /// 0.125 or 0.083, and at 44.1 kHz makes them 48, 6 or 4 samples.
     #[arg(long, value_name = "MS", default_value_t = 1.0)]
     packet_time: f64,
+    /// Send the channels as AES3 signals, a pair each, in ST 2110-31 AM824 subframes,
+    /// with the B, F, P and C bits and channel status of professional linear PCM, rather
+    /// than as ST 2110-30 PCM. Needs an even number of channels and 24 bits.
+    #[arg(long)]
+    am824: bool,
     /// The tone's frequency in Hz.
     #[arg(long, value_name = "HZ", default_value_t = 1000)]
     tone: u32,
@@ -236,9 +242,17 @@ fn video_format(args: &VideoArgs) -> Result<VideoFormat, String> {
 }
 
 fn audio_format(args: &AudioArgs) -> Result<AudioFormat, String> {
-    let format =
-        AudioFormat { channels: args.channels, sample_rate: args.sample_rate, bits: args.bits, ..AudioFormat::new(1) }
-            .with_packet_time(args.packet_time)?;
+    if args.am824 && args.bits != 24 {
+        return Err(format!("--am824 carries 24-bit samples, not {}", args.bits));
+    }
+    let format = AudioFormat {
+        channels: args.channels,
+        sample_rate: args.sample_rate,
+        bits: args.bits,
+        aes3: args.am824,
+        ..AudioFormat::new(1)
+    }
+    .with_packet_time(args.packet_time)?;
     format.check()?;
     Ok(format)
 }
@@ -757,6 +771,10 @@ pub(crate) fn write_text(
             plural(audio.counts.packets, "packet"),
             peaks.join(", ")
         )?;
+        if let Some(aes3) = &audio.aes3 {
+            let status = audio.channel_status.as_ref().map(|s| format!(", channel status: {s}")).unwrap_or_default();
+            writeln!(out, "  AES3: {}{status}", plural(aes3.blocks, "whole block"))?;
+        }
     }
     if let Some(latency) = &report.latency {
         writeln!(
