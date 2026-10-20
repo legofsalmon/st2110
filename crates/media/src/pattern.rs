@@ -1,6 +1,6 @@
 //! Test signals: colour bars with a moving box, and a tone.
 
-use crate::format::{AudioFormat, Packing, VideoFormat};
+use crate::format::{AudioFormat, Packing, Scan, VideoFormat};
 use crate::pixels::Converter;
 
 /// EBU colour bars, 100/0/75/0: white at 100%, then yellow, cyan, green, magenta, red
@@ -56,7 +56,12 @@ impl Bars {
         let box_pixels = ((strip * lines / 2).max(1).div_ceil(pixels) * pixels).min(w);
         let box_top = bar_rows + strip / 4;
         let box_rows = box_top..(box_top + strip / 2).min(h);
-        let mut box_format = VideoFormat { width: box_pixels as u32, packing: Packing::General, ..format.clone() };
+        let mut box_format = VideoFormat {
+            width: box_pixels as u32,
+            packing: Packing::General,
+            scan: Scan::Progressive,
+            ..format.clone()
+        };
         box_format.height = lines as u32;
         let box_converter = Converter::new(&box_format)?;
         let mut box_row = vec![0; box_converter.row_bytes()];

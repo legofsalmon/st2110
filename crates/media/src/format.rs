@@ -131,16 +131,48 @@ impl Range {
     }
 }
 
-/// An ST 2110-20 video format. Only progressive video: interlaced and PsF video are not
-/// supported yet.
+/// How a frame's rows are sent (ST 2110-20:2022 §6.1.2–6.1.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scan {
+    /// Progressive: the whole frame at one instant, its rows from the top.
+    #[default]
+    Progressive,
+    /// Interlaced (`interlace`): two fields half a frame apart, each with its own RTP
+    /// timestamp and marker bit, the first with the frame's even rows and the second,
+    /// whose row headers have the F bit set, with its odd ones.
+    Interlaced,
+    /// Progressive segmented frame (`interlace; segmented`): a progressive frame sent as
+    /// two segments, rows split as an interlaced frame's are, that share its timestamp.
+    Segmented,
+}
+
+impl Scan {
+    /// Whether frames go as two fields or segments.
+    pub fn fields(self) -> bool {
+        self != Self::Progressive
+    }
+
+    /// The letter of a format name: `p`, `i` or `psf`.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Progressive => "p",
+            Self::Interlaced => "i",
+            Self::Segmented => "psf",
+        }
+    }
+}
+
+/// An ST 2110-20 video format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFormat {
     /// Pixels per row.
     pub width: u32,
-    /// Rows per frame.
+    /// Rows per frame: of both fields, for interlaced and PsF video.
     pub height: u32,
-    /// Frames per second, `exactframerate`.
+    /// Frames per second, `exactframerate`: for interlaced video, half the fields.
     pub rate: Rational,
+    /// Progressive, interlaced or PsF.
+    pub scan: Scan,
     /// `sampling`.
     pub sampling: Sampling,
     /// `depth`: bits per sample.
@@ -165,6 +197,7 @@ impl VideoFormat {
             width,
             height,
             rate,
+            scan: Scan::Progressive,
             sampling: Sampling::YCbCr422,
             depth: Depth::Bits10,
             colorimetry: "BT709".into(),
@@ -176,16 +209,27 @@ impl VideoFormat {
     }
 
     /// Reads a format name: `1080p50`, `2160p59.94` or `720p60000/1001` for the usual
-    /// widths of 1080, 2160, 4320 and 720-line video, or `1280x720p25` for any size.
-    /// Gives YCbCr-4:2:2 at 10 bits, as [`VideoFormat::new`] does.
+    /// widths of 1080, 2160, 4320, 720, 576 and 486-line video, or `1280x720p25` for any
+    /// size. `1080i50` is interlaced, named by its fields a second as is usual, and
+    /// `1080psf25` PsF, named by its frames. Gives YCbCr-4:2:2 at 10 bits, as
+    /// [`VideoFormat::new`] does.
     pub fn from_name(name: &str) -> Result<Self, String> {
-        let bad = || format!("{name} is not a format such as 1080p50, 2160p59.94 or 1280x720p25");
-        let (size, rate) = name.split_once(['p', 'P']).ok_or_else(bad)?;
+        let bad = || format!("{name} is not a format such as 1080p50, 1080i59.94, 1080psf25 or 1280x720p25");
+        let lower = name.to_ascii_lowercase();
+        let (scan, at, letters) = if let Some(at) = lower.find("psf") {
+            (Scan::Segmented, at, 3)
+        } else if let Some(at) = lower.find('i') {
+            (Scan::Interlaced, at, 1)
+        } else {
+            (Scan::Progressive, lower.find('p').ok_or_else(bad)?, 1)
+        };
+        let (size, rate) = (&name[..at], &name[at + letters..]);
         let (width, height) = match size.split_once(['x', 'X']) {
             Some((w, h)) => (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?),
             None => {
                 let height: u32 = size.parse().map_err(|_| bad())?;
                 let width = match height {
+                    486 | 576 => 720,
                     720 => 1280,
                     1080 => 1920,
                     2160 => 3840,
@@ -202,9 +246,27 @@ impl VideoFormat {
             Err(FrameRateError::Decimal(Some(rate))) => rate,
             Err(_) => return Err(bad()),
         };
-        let format = Self::new(width, height, rate);
+        let rate = match scan {
+            Scan::Interlaced => Rational::new(rate.numerator(), 2 * rate.denominator()).ok_or_else(bad)?,
+            _ => rate,
+        };
+        let format = Self { scan, ..Self::new(width, height, rate) };
         format.check()?;
         Ok(format)
+    }
+
+    /// Rows in each field, the first then the second: half the frame's each, and for an
+    /// odd height one more in the first; the whole frame for progressive video.
+    pub fn field_heights(&self) -> [u32; 2] {
+        if self.scan.fields() { [self.height.div_ceil(2), self.height / 2] } else { [self.height, 0] }
+    }
+
+    /// The rate of fields, twice the frame rate; of frames for progressive video.
+    pub fn field_rate(&self) -> Rational {
+        match self.scan {
+            Scan::Progressive => self.rate,
+            _ => Rational::new(2 * self.rate.numerator(), self.rate.denominator()).expect("not zero"),
+        }
     }
 
     /// The pixel group, when ST 2110-20 defines one for the sampling and depth.
@@ -245,6 +307,9 @@ impl VideoFormat {
         if self.rate.to_f64() > 1000.0 {
             return Err(format!("{} frames a second is more than this crate paces", self.rate));
         }
+        if self.scan.fields() && self.height < 2 {
+            return Err(format!("{} row is too few for two fields", self.height));
+        }
         let Some(group) = self.pixel_group() else {
             return Err(format!("ST 2110-20 defines no pixel group for {} at {}", self.sampling, self.depth_name()));
         };
@@ -261,6 +326,12 @@ impl VideoFormat {
         }
         if !self.height.is_multiple_of(rows) {
             return Err(format!("{} rows is not a whole number of the row pairs {} takes", self.height, self.sampling));
+        }
+        if rows > 1 && self.scan.fields() {
+            return Err(format!(
+                "{} is sent progressive only: its pixel groups pair rows that interlaced and PsF video send in different fields",
+                self.sampling
+            ));
         }
         if !COLORIMETRY.contains(&self.colorimetry.as_str()) {
             return Err(format!("colorimetry {} is not one of {}", self.colorimetry, COLORIMETRY.join(", ")));
@@ -318,6 +389,19 @@ impl VideoFormat {
         if self.range != Range::Narrow {
             text.push_str(&format!(" RANGE={};", self.range.as_str()));
         }
+        // 525- and 625-line video signals its pixels' shape, here for a 4:3 picture
+        // (RP 2110-24:2023 §5).
+        let rate = (self.rate.numerator(), self.rate.denominator());
+        match (self.scan.fields() && self.width == 720, rate) {
+            (true, (30_000, 1001)) if self.height <= 512 => text.push_str(" PAR=10:11;"),
+            (true, (25, 1)) if self.height <= 612 => text.push_str(" PAR=12:11;"),
+            _ => {}
+        }
+        match self.scan {
+            Scan::Progressive => {}
+            Scan::Interlaced => text.push_str(" interlace;"),
+            Scan::Segmented => text.push_str(" interlace; segmented;"),
+        }
         text
     }
 
@@ -326,9 +410,12 @@ impl VideoFormat {
     /// `interlace` is.
     pub fn from_fmtp(value: impl Fn(&str) -> Option<String>, has: impl Fn(&str) -> bool) -> Result<Self, String> {
         let need = |name: &str| value(name).ok_or_else(|| format!("the SDP file gives no {name}"));
-        if has("interlace") || has("segmented") {
-            return Err("interlaced and PsF video are not supported yet".into());
-        }
+        let scan = match (has("interlace"), has("segmented")) {
+            (false, false) => Scan::Progressive,
+            (true, false) => Scan::Interlaced,
+            (true, true) => Scan::Segmented,
+            (false, true) => return Err("segmented without interlace: PsF is signalled with both".into()),
+        };
         let number = |name: &str| -> Result<u32, String> {
             let text = need(name)?;
             text.trim().parse().map_err(|_| format!("{name}={text} is not a number"))
@@ -343,6 +430,7 @@ impl VideoFormat {
                 Ok((rate, _)) | Err(FrameRateError::Decimal(Some(rate))) => rate,
                 Err(_) => return Err(format!("exactframerate={rate} is not a frame rate")),
             },
+            scan,
             sampling: sampling
                 .trim()
                 .parse()
@@ -366,10 +454,13 @@ impl VideoFormat {
 }
 
 impl fmt::Display for VideoFormat {
-    /// `1920x1080p50 YCbCr-4:2:2 10-bit`.
+    /// `1920x1080p50 YCbCr-4:2:2 10-bit`, with interlaced video named by its fields a
+    /// second, `1920x1080i50`, and PsF by its frames, `1920x1080psf25`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rate = if self.rate.is_integer() { self.rate.to_string() } else { format!("{:.2}", self.rate.to_f64()) };
-        write!(f, "{}x{}p{} {} {}", self.width, self.height, rate, self.sampling, self.depth_name())
+        let rate = if self.scan == Scan::Interlaced { self.field_rate() } else { self.rate };
+        let rate = if rate.is_integer() { rate.to_string() } else { format!("{:.2}", rate.to_f64()) };
+        let (width, height, scan) = (self.width, self.height, self.scan.letter());
+        write!(f, "{width}x{height}{scan}{rate} {} {}", self.sampling, self.depth_name())
     }
 }
 
@@ -534,9 +625,32 @@ mod tests {
         let f = VideoFormat::from_name("640x360p30000/1001").unwrap();
         assert_eq!((f.width, f.height, f.rate), (640, 360, rate(30000, 1001)));
         assert_eq!(f.to_string(), "640x360p29.97 YCbCr-4:2:2 10-bit");
-        assert!(VideoFormat::from_name("1080i50").unwrap_err().contains("not a format"));
-        assert!(VideoFormat::from_name("576p50").unwrap_err().contains("give the width"));
+        assert!(VideoFormat::from_name("1080x50").unwrap_err().contains("not a format"));
+        assert!(VideoFormat::from_name("600p50").unwrap_err().contains("give the width"));
         assert!(VideoFormat::from_name("641x360p25").unwrap_err().contains("pixel groups of 2 pixels"));
+    }
+
+    #[test]
+    fn interlaced_and_psf_names() {
+        // Interlaced video is named by its fields a second, and carries frames half as often.
+        let f = VideoFormat::from_name("1080i59.94").unwrap();
+        assert_eq!((f.width, f.height, f.rate, f.scan), (1920, 1080, rate(30000, 1001), Scan::Interlaced));
+        assert_eq!((f.field_heights(), f.field_rate()), ([540, 540], rate(60000, 1001)));
+        assert_eq!(f.to_string(), "1920x1080i59.94 YCbCr-4:2:2 10-bit");
+        assert!(f.fmtp().contains("height=1080; exactframerate=30000/1001;"));
+        let f = VideoFormat::from_name("1080PsF25").unwrap();
+        assert_eq!(
+            (f.rate, f.scan, f.to_string()),
+            (rate(25, 1), Scan::Segmented, "1920x1080psf25 YCbCr-4:2:2 10-bit".into())
+        );
+        let f = VideoFormat::from_name("720x487i59.94").unwrap();
+        assert_eq!(f.field_heights(), [244, 243]);
+        let f = VideoFormat::from_name("576i50").unwrap();
+        assert_eq!(f.width, 720);
+        assert!(f.fmtp().ends_with(" PAR=12:11; interlace;"));
+        let mut f = VideoFormat::from_name("1080i50").unwrap();
+        f.sampling = Sampling::YCbCr420;
+        assert!(f.check().unwrap_err().contains("progressive only"));
     }
 
     #[test]
@@ -570,11 +684,16 @@ mod tests {
         let (fmtp, _) = st2110_sdp::Fmtp::parse(&text);
         let back = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name)).unwrap();
         assert_eq!(back, f);
-        for flag in ["interlace", "segmented", "interlace=1"] {
-            let (fmtp, _) = st2110_sdp::Fmtp::parse(&format!("{text} {flag};"));
+        for (flags, scan) in [(" interlace;", Scan::Interlaced), (" interlace; segmented;", Scan::Segmented)] {
+            let interlaced = VideoFormat { scan, ..f.clone() };
+            assert!(interlaced.fmtp().ends_with(flags));
+            let (fmtp, _) = st2110_sdp::Fmtp::parse(&interlaced.fmtp());
             let read = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name));
-            assert!(read.unwrap_err().contains("interlaced"), "{flag}");
+            assert_eq!(read.unwrap(), interlaced);
         }
+        let (fmtp, _) = st2110_sdp::Fmtp::parse(&format!("{text} segmented;"));
+        let read = VideoFormat::from_fmtp(|name| fmtp.value(name).map(str::to_string), |name| fmtp.has(name));
+        assert!(read.unwrap_err().contains("segmented without interlace"));
         let mut key = f.clone();
         key.sampling = Sampling::Key;
         key.colorimetry = "ALPHA".into();

@@ -53,7 +53,8 @@ pub(crate) enum Signal {
 #[derive(Args)]
 pub(crate) struct VideoArgs {
     /// The picture: 1080p50, 2160p59.94, 720p60000/1001, or any size, such as
-    /// 1280x720p25. Progressive only.
+    /// 1280x720p25; 1080i50 or 1080i59.94 for interlaced video, named by its fields a
+    /// second, and 1080psf25 for PsF.
     #[arg(value_name = "FORMAT", default_value = "1080p50")]
     format: String,
     /// The sampling: YCbCr-4:2:2, YCbCr-4:4:4, YCbCr-4:2:0, RGB or KEY.
