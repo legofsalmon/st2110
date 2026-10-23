@@ -122,7 +122,12 @@ pub(crate) fn node(ids: &Ids, place: &Place, version: &str, label: &str, referen
             "api": {"versions": ["v1.3"], "endpoints": [
                 {"host": place.host.to_string(), "port": place.port, "protocol": place.protocol(), "authorization": place.authorization},
             ]},
-            "caps": {}, "services": [], "clocks": [clock(reference)], "interfaces": interfaces,
+            // IS-13 (v1.0 draft): the Annotation API, on the Node's own port.
+            "caps": {}, "services": [{
+                "href": format!("{}/x-nmos/annotation/{}/", place.base(), st2110_nmos::annotation::VERSION),
+                "type": st2110_nmos::annotation::SERVICE_TYPE, "authorization": place.authorization,
+            }],
+            "clocks": [clock(reference)], "interfaces": interfaces,
         }),
     )
 }
@@ -141,6 +146,10 @@ pub(crate) fn device(ids: &Ids, place: &Place, version: &str, label: &str) -> Va
                 // IS-12 v1.0.1: the Device's control model, with its status monitor.
                 "href": format!("{}://{}:{}{}/", if place.secure { "wss" } else { "ws" }, place.host, place.port, super::ncp::PATH),
                 "type": st2110_nmos::ncp::CONTROL_TYPE, "authorization": place.authorization,
+            }, {
+                // IS-14 v1.0: the same model by role path over HTTP, with backup and restore.
+                "href": format!("{}/x-nmos/configuration/{}/", place.base(), super::configuration::VERSION),
+                "type": super::configuration::CONTROL_TYPE, "authorization": place.authorization,
             }],
         }),
     )
@@ -306,6 +315,11 @@ mod tests {
         assert_eq!(device["controls"][1]["href"], "wss://192.168.10.21:8080/x-nmos/ncp/v1.0/");
         let plain = super::device(&ids, &place(), "1:0", "test");
         assert_eq!(plain["controls"][1]["href"], "ws://192.168.10.21:8080/x-nmos/ncp/v1.0/");
+        assert_eq!(device["controls"][2]["href"], "https://192.168.10.21:8080/x-nmos/configuration/v1.0/");
+        assert_eq!(device["controls"][2]["type"], "urn:x-nmos:control:configuration/v1.0");
+        let service = &node["services"][0];
+        assert_eq!(service["href"], "https://192.168.10.21:8080/x-nmos/annotation/v1.0/");
+        assert_eq!(st2110_nmos::annotation::service_href(&node).as_deref(), service["href"].as_str());
     }
 
     #[test]

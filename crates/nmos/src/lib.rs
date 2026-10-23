@@ -19,7 +19,10 @@
 //! matrix of which Senders each Receiver can take. [`groups`] reads the BCP-002-01
 //! natural groups, such as a camera's video and audio, so a controller can take one as
 //! a whole. [`ncp`] holds the IS-12 control model, and the BCP-008 status monitors that
-//! say how each Receiver and Sender is doing.
+//! say how each Receiver and Sender is doing. [`annotation`] holds the IS-13 rules for
+//! changing a resource's label, description and tags, [`edid`] maps a display's EDID to
+//! Receiver capabilities (BCP-005-01), and [`mxl`] reads MXL Senders and Receivers
+//! (BCP-007-03).
 //!
 //! The `client` feature adds [`client::QueryClient`], which reads a snapshot from a
 //! live registry, IS-10 tokens for it to send ([`auth`]), and the checks a Node makes of
@@ -49,6 +52,7 @@
 
 #[cfg(feature = "client")]
 pub mod access;
+pub mod annotation;
 #[cfg(feature = "client")]
 pub mod auth;
 mod caps;
@@ -56,9 +60,11 @@ mod check;
 #[cfg(feature = "client")]
 pub mod client;
 mod controls;
+pub mod edid;
 pub mod groups;
 mod model;
 pub mod monitors;
+pub mod mxl;
 pub mod ncp;
 mod report;
 pub mod routing;

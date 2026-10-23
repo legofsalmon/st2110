@@ -71,11 +71,11 @@ pub(crate) struct Model {
     changes: Vec<(u64, ElementId, Value)>,
 }
 
-fn ok(value: Value) -> Value {
+pub(super) fn ok(value: Value) -> Value {
     json!({"status": 200, "value": value})
 }
 
-fn failed(status: u16, message: impl Into<String>) -> Value {
+pub(super) fn failed(status: u16, message: impl Into<String>) -> Value {
     json!({"status": status, "errorMessage": message.into()})
 }
 
@@ -168,11 +168,11 @@ impl Model {
         }
     }
 
-    fn class_of(&self, oid: u64) -> Option<&'static Class> {
+    pub(super) fn class_of(&self, oid: u64) -> Option<&'static Class> {
         if oid == MONITOR { Some(self.monitor_class) } else { self.objects.get(&oid).map(|(c, _)| *c) }
     }
 
-    fn value(&self, oid: u64, id: ElementId) -> Option<Value> {
+    pub(super) fn value(&self, oid: u64, id: ElementId) -> Option<Value> {
         if oid == ROOT && id == property::MEMBERS {
             return Some(json!(self.members()));
         }
@@ -330,36 +330,76 @@ impl Model {
         }
     }
 
-    /// Sets a property that is not read only.
-    fn set(&mut self, oid: u64, p: ncp::Property, value: Value, now: Instant) -> Value {
+    /// Why a property may not be set to `value`, as the `NcMethodResultError` a `Set`
+    /// gives; `None` when it may.
+    pub(super) fn refuse_set(&self, oid: u64, p: ncp::Property, value: &Value) -> Option<Value> {
+        if p.read_only {
+            return Some(failed(405, format!("{} is read only", p.name)));
+        }
         let text = value.is_null() || value.is_string();
         match (oid, p.id) {
-            (_, property::USER_LABEL) if !text => return failed(417, "userLabel is a string or null"),
-            (MONITOR, property::USER_LABEL) => self.monitor.set_label(value),
+            (_, property::USER_LABEL) if !text => Some(failed(417, "userLabel is a string or null")),
+            (MONITOR, property::USER_LABEL) => None,
             (MONITOR, property::ENABLED) => {
-                return failed(406, "a monitor's enabled has no meaning (BCP-008), so it stays true");
+                Some(failed(406, "a monitor's enabled has no meaning (BCP-008), so it stays true"))
             }
-            (MONITOR, property::STATUS_REPORTING_DELAY) => match value.as_u64().filter(|s| *s <= MOST_DELAY) {
-                Some(seconds) => self.monitor.set_delay(seconds, now),
-                None => return failed(417, format!("statusReportingDelay is 0 to {MOST_DELAY} seconds")),
-            },
-            (MONITOR, property::AUTO_RESET) => match value.as_bool() {
-                Some(on) => self.monitor.set_auto_reset(on),
-                None => return failed(417, "autoResetCountersAndMessages is true or false"),
-            },
-            (MONITOR, _) => return failed(405, format!("{} cannot be set", p.name)),
+            (MONITOR, property::STATUS_REPORTING_DELAY) => value
+                .as_u64()
+                .filter(|s| *s <= MOST_DELAY)
+                .is_none()
+                .then(|| failed(417, format!("statusReportingDelay is 0 to {MOST_DELAY} seconds"))),
+            (MONITOR, property::AUTO_RESET) => {
+                (!value.is_boolean()).then(|| failed(417, "autoResetCountersAndMessages is true or false"))
+            }
+            (MONITOR, _) => Some(failed(405, format!("{} cannot be set", p.name))),
             (DEVICE_MANAGER, id) if id.level == 3 && !text => {
-                return failed(417, format!("{} is a string or null", p.name));
+                Some(failed(417, format!("{} is a string or null", p.name)))
             }
+            _ if !self.objects.contains_key(&oid) => Some(failed(404, "no such object")),
+            _ => None,
+        }
+    }
+
+    /// Sets a property that is not read only.
+    fn set(&mut self, oid: u64, p: ncp::Property, value: Value, now: Instant) -> Value {
+        if let Some(refused) = self.refuse_set(oid, p, &value) {
+            return refused;
+        }
+        match (oid, p.id) {
+            (MONITOR, property::USER_LABEL) => self.monitor.set_label(value),
+            (MONITOR, property::STATUS_REPORTING_DELAY) => {
+                self.monitor.set_delay(value.as_u64().unwrap_or_default(), now);
+            }
+            (MONITOR, property::AUTO_RESET) => self.monitor.set_auto_reset(value.as_bool().unwrap_or_default()),
             (_, id) => {
-                let Some((_, values)) = self.objects.get_mut(&oid) else { return failed(404, "no such object") };
-                if values.get(&id) != Some(&value) {
+                if let Some((_, values)) = self.objects.get_mut(&oid)
+                    && values.get(&id) != Some(&value)
+                {
                     values.insert(id, value.clone());
                     self.changes.push((oid, id, value));
                 }
             }
         }
         json!({"status": 200})
+    }
+
+    /// Every object's role path, from the root block, and its oid, the root first
+    /// (IS-14 v1.0 API requests: URL and usage).
+    pub(super) fn role_paths(&self) -> Vec<(Vec<String>, u64)> {
+        let mut paths = vec![(vec!["root".to_string()], ROOT)];
+        for oid in [DEVICE_MANAGER, CLASS_MANAGER, MONITOR] {
+            let role = self.value(oid, property::ROLE);
+            paths.push((
+                vec!["root".into(), role.and_then(|r| r.as_str().map(str::to_string)).unwrap_or_default()],
+                oid,
+            ));
+        }
+        paths
+    }
+
+    /// Whether `oid` is the ClassManager's.
+    pub(super) fn is_class_manager(oid: u64) -> bool {
+        oid == CLASS_MANAGER
     }
 
     /// Every property that changed since this was last asked, by object.

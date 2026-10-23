@@ -11,6 +11,168 @@ use st2110_sdp::Severity;
 
 use crate::{Format, Style, describe, plural, read, seconds};
 
+/// What `st2110 nmos` does besides checking.
+#[derive(clap::Subcommand)]
+pub(crate) enum Action {
+    /// Print the Receiver capabilities a display's EDID gives, as BCP-005-01 maps them.
+    ///
+    /// Prints JSON: `video.constraint_sets` from the EDID's timings and CTA-861 video
+    /// data blocks, `audio.constraint_sets` from its LPCM audio, and `notes` on what it
+    /// does not map (BCP-005-01 v1.0).
+    ///
+    /// FILE is the EDID, binary or as hex text (as `edid-decode` or a sysfs dump gives
+    /// it); `-` reads standard input. Exits with 0 when it was read, and 2 when it
+    /// cannot be.
+    Edid {
+        /// The EDID file.
+        file: PathBuf,
+    },
+    /// Relabel, describe or tag a Node or one of its resources, through IS-13.
+    ///
+    /// Changes them through the Node's IS-13 Annotation API (a work-in-progress draft
+    /// upstream), or resets them to what the Node gave. NODE is the Node's address, its Node API URL, or its Annotation API URL. RESOURCE
+    /// is the id of a Device, Source, Flow, Sender or Receiver, or the start of one; the
+    /// Node itself when omitted. Without a change, prints the annotations as they are.
+    /// Exits with 0 when the Node took the change, 1 when it refused it, and 2 when the
+    /// Node cannot be reached or has no such resource.
+    Annotate(Box<AnnotateArgs>),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct AnnotateArgs {
+    /// The Node: http://camera.example:8080, its Node API or its Annotation API.
+    node: String,
+    /// The resource's id, or the start of it; the Node itself when omitted.
+    resource: Option<String>,
+    /// The new label.
+    #[arg(long, value_name = "TEXT")]
+    label: Option<String>,
+    /// The new description.
+    #[arg(long, value_name = "TEXT")]
+    description: Option<String>,
+    /// A tag to set, NAME=VALUE[,VALUE…], or NAME= to remove it (or reset it to what
+    /// the Node gave). A NAME without a namespace is a user tag, urn:x-nmos:tag:user:NAME.
+    #[arg(long, value_name = "NAME=VALUES")]
+    tag: Vec<String>,
+    /// Reset the label, description and tags to what the Node gave; read-only tags stay.
+    #[arg(long, conflicts_with_all = ["label", "description", "tag"])]
+    reset: bool,
+    /// Seconds to wait for each response.
+    #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+    timeout: f64,
+    #[command(flatten)]
+    pub auth: crate::auth::Auth,
+}
+
+/// Runs `st2110 nmos edid` or `st2110 nmos annotate`.
+pub(crate) fn act(action: &Action) -> io::Result<ExitCode> {
+    match action {
+        Action::Edid { file } => edid(file),
+        Action::Annotate(args) => annotate(args),
+    }
+}
+
+fn edid(file: &Path) -> io::Result<ExitCode> {
+    let caps = crate::read_bytes(file)
+        .map_err(|e| format!("{}: {e}", file.display()))
+        .and_then(|contents| st2110_nmos::edid::read(&contents).map_err(|e| format!("{}: {e}", file.display())))
+        .and_then(|bytes| st2110_nmos::edid::receiver_caps(&bytes).map_err(|e| format!("{}: {e}", file.display())));
+    match caps {
+        Ok(caps) => {
+            let mut out = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut out, &caps.to_json())?;
+            writeln!(out)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(message) => {
+            eprintln!("st2110: {message}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+/// The `PATCH` that `st2110 nmos annotate` sends: `None` when it changes nothing.
+fn annotation_patch(args: &AnnotateArgs) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::{Map, Value, json};
+    if args.reset {
+        return Ok(Some(json!({"label": null, "description": null, "tags": null})));
+    }
+    let mut patch = Map::new();
+    if let Some(label) = &args.label {
+        patch.insert("label".into(), json!(label));
+    }
+    if let Some(description) = &args.description {
+        patch.insert("description".into(), json!(description));
+    }
+    let mut tags = Map::new();
+    for tag in &args.tag {
+        let (name, values) = tag.split_once('=').ok_or_else(|| format!("--tag {tag} is not NAME=VALUE"))?;
+        if name.is_empty() {
+            return Err(format!("--tag {tag} has no name"));
+        }
+        let name =
+            if name.contains(':') { name.to_string() } else { format!("{}{name}", st2110_nmos::annotation::USER_TAG) };
+        let values = if values.is_empty() { Value::Null } else { json!(values.split(',').collect::<Vec<_>>()) };
+        tags.insert(name, values);
+    }
+    if !tags.is_empty() {
+        patch.insert("tags".into(), Value::Object(tags));
+    }
+    Ok((!patch.is_empty()).then_some(Value::Object(patch)))
+}
+
+fn annotate(args: &AnnotateArgs) -> io::Result<ExitCode> {
+    use st2110_nmos::Kind;
+    use st2110_nmos::client::AnnotationClient;
+    let fail = |message: String| {
+        eprintln!("st2110: {message}");
+        Ok(ExitCode::from(2))
+    };
+    let patch = match annotation_patch(args) {
+        Ok(patch) => patch,
+        Err(message) => return fail(message),
+    };
+    let timeout = match seconds("--timeout", args.timeout) {
+        Ok(timeout) if !timeout.is_zero() => timeout,
+        Ok(_) => return fail(format!("--timeout {} is not a number of seconds above 0", args.timeout)),
+        Err(message) => return fail(message),
+    };
+    let token = match args.auth.token(timeout, true) {
+        Ok(token) => token,
+        Err(message) => return fail(message),
+    };
+    let options = Options { timeout, token, ..Options::default() };
+    let client = match AnnotationClient::connect(&args.node, &options) {
+        Ok(client) => client,
+        Err(e) => return fail(e.to_string()),
+    };
+    let (kind, id) = match &args.resource {
+        None => (Kind::Node, String::new()),
+        Some(id) => match client.find(id) {
+            Ok(Some(found)) => found,
+            Ok(None) => return fail(format!("{} has no resource whose id starts with {id}", client.base())),
+            Err(e) => return fail(e.to_string()),
+        },
+    };
+    let reply = match &patch {
+        Some(patch) => client.annotate(kind, &id, patch),
+        None => client.get(kind, &id),
+    };
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(e) => return fail(e.to_string()),
+    };
+    let mut out = io::stdout().lock();
+    if reply.status == 200 {
+        serde_json::to_writer_pretty(&mut out, &reply.body)?;
+        writeln!(out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let what = if kind == Kind::Node { "the Node".to_string() } else { format!("{} {id}", kind.as_str()) };
+    eprintln!("st2110: {} refused the change to {what}: {}", client.base(), reply.error());
+    Ok(ExitCode::from(if reply.status == 404 { 2 } else { 1 }))
+}
+
 /// How to read a live registry.
 pub(crate) struct Fetch {
     /// Where to save the snapshot.
@@ -349,4 +511,38 @@ fn write_inventory(out: &mut impl Write, report: &Report, style: Style) -> io::R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn args(tags: &[&str]) -> AnnotateArgs {
+        AnnotateArgs {
+            node: "http://127.0.0.1:9".into(),
+            resource: None,
+            label: Some("Camera 1".into()),
+            description: None,
+            tag: tags.iter().map(|t| t.to_string()).collect(),
+            reset: false,
+            timeout: 1.0,
+            auth: crate::auth::Auth::default(),
+        }
+    }
+
+    #[test]
+    fn annotate_sends_what_it_is_given() {
+        let patch = annotation_patch(&args(&["room=B2,B3", "urn:x-nmos:tag:user:desk=", "urn:example:x=1"])).unwrap();
+        assert_eq!(
+            patch,
+            Some(json!({"label": "Camera 1", "tags": {
+                "urn:x-nmos:tag:user:room": ["B2", "B3"], "urn:x-nmos:tag:user:desk": null, "urn:example:x": ["1"]}}))
+        );
+        let reset = AnnotateArgs { reset: true, label: None, ..args(&[]) };
+        assert_eq!(annotation_patch(&reset).unwrap(), Some(json!({"label": null, "description": null, "tags": null})));
+        assert_eq!(annotation_patch(&AnnotateArgs { label: None, ..args(&[]) }).unwrap(), None);
+        assert!(annotation_patch(&args(&["=x"])).is_err());
+    }
 }

@@ -67,7 +67,14 @@ enum Command {
     /// by multicast DNS. Exits with 0 when nothing is an error, 1 when something is (or
     /// is a warning, with --deny-warnings), and 2 when the registry, Node or file cannot
     /// be read.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_value_name = "ACTION",
+        subcommand_help_heading = "Actions"
+    )]
     Nmos {
+        #[command(subcommand)]
+        action: Option<nmos::Action>,
         /// Query API URL, such as http://registry.example:8080, Node API URL, such as
         /// http://camera.example/x-nmos/node/, or a saved snapshot; found by DNS-SD when
         /// omitted.
@@ -516,6 +523,7 @@ impl Command {
     /// The IS-10 options of a command that takes them.
     fn auth(&self) -> Option<&auth::Auth> {
         match self {
+            Command::Nmos { action: Some(nmos::Action::Annotate(args)), .. } => Some(&args.auth),
             Command::Nmos { auth, .. } | Command::Connect { auth, .. } | Command::Router { auth, .. } => Some(auth),
             Command::Discover(args) => Some(args.auth()),
             Command::Send { signal } => Some(signal.auth()),
@@ -533,7 +541,8 @@ fn main() -> ExitCode {
     }
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
-        Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, system, auth } => {
+        Command::Nmos { action: Some(action), .. } => nmos::act(&action),
+        Command::Nmos { action: None, target, format, quiet, deny_warnings, save, timeout, no_sdp, system, auth } => {
             match registry(target, &auth, timeout) {
                 Ok(target) => {
                     let fetch = nmos::Fetch { save, timeout, sdp: !no_sdp, system, auth };

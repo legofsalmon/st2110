@@ -241,7 +241,8 @@ pub struct Property {
 }
 
 impl Property {
-    fn descriptor(&self) -> Value {
+    /// Its `NcPropertyDescriptor`.
+    pub fn descriptor(&self) -> Value {
         json!({
             "description": self.description, "id": self.id.json(), "name": self.name, "typeName": self.type_name,
             "isReadOnly": self.read_only, "isNullable": self.nullable, "isSequence": self.sequence,
@@ -332,6 +333,12 @@ impl Class {
     /// The property with this name, its own or inherited.
     pub fn property_named(&self, name: &str) -> Option<Property> {
         self.properties().into_iter().find(|p| p.name == name)
+    }
+
+    /// The ids of its methods, its own and those it inherits, in the order of its
+    /// class descriptor.
+    pub fn methods(&self) -> Vec<ElementId> {
+        self.lineage().iter().flat_map(|class| class.methods.iter().map(|m| ElementId::new(m.0, m.1))).collect()
     }
 
     /// Whether it has, or inherits, the method `id`.

@@ -267,6 +267,52 @@ fn nmos_json_and_exit_codes() {
     assert!(String::from_utf8_lossy(&not_json.stderr).contains("not a registry snapshot"));
 }
 
+/// An EDID 1.4 base block whose one timing is 1920x1080p60 (CTA-861 VIC 16), built by
+/// hand.
+fn edid_1080p60() -> Vec<u8> {
+    let mut block = vec![0u8; 128];
+    block[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+    block[18..21].copy_from_slice(&[1, 4, 0xa2]);
+    block[38..54].fill(0x01);
+    // 148.5 MHz; 1920 + 280; 1080 + 45.
+    block[54..62].copy_from_slice(&[0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40]);
+    block[71] = 0x18;
+    for d in 1..4 {
+        block[54 + 18 * d + 3] = 0x10;
+    }
+    let sum = block.iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
+    block[127] = sum.wrapping_neg();
+    block
+}
+
+#[test]
+fn nmos_edid_prints_receiver_caps() {
+    let output = with_stdin_bytes(&["nmos", "edid", "-"], &edid_1080p60());
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let caps: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let set = &caps["video"]["constraint_sets"][0];
+    assert_eq!(set["urn:x-nmos:cap:format:frame_width"]["enum"], serde_json::json!([1920]), "{caps:#}");
+    assert_eq!(set["urn:x-nmos:cap:format:frame_height"]["enum"], serde_json::json!([1080]));
+    assert_eq!(set["urn:x-nmos:cap:format:grain_rate"]["enum"][0], serde_json::json!({"numerator": 60}));
+    // As hex text, too.
+    let hex: String = edid_1080p60().iter().map(|b| format!("{b:02x}")).collect();
+    let again = with_stdin(&["nmos", "edid", "-"], &hex);
+    assert_eq!(again.stdout, output.stdout);
+    let refused = with_stdin(&["nmos", "edid", "-"], "not an EDID");
+    assert_eq!(refused.status.code(), Some(2));
+}
+
+#[test]
+fn nmos_annotate_needs_a_node() {
+    let output = st2110(&["nmos", "annotate", "http://127.0.0.1:9", "--label", "x", "--timeout", "1"]);
+    assert_eq!(output.status.code(), Some(2));
+    let bad = st2110(&["nmos", "annotate", "http://127.0.0.1:9", "--tag", "room"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("NAME=VALUE"));
+    let both = st2110(&["nmos", "annotate", "http://127.0.0.1:9", "--reset", "--label", "x"]);
+    assert_eq!(both.status.code(), Some(2), "clap refuses --reset with a change");
+}
+
 #[test]
 fn nmos_saves_what_it_read() {
     let saved = std::env::temp_dir().join(format!("st2110-nmos-{}.json", std::process::id()));

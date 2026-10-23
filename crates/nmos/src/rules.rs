@@ -115,6 +115,10 @@ rules! {
         "A Sender's SDP file describes the stream its Flow and Source advertise: media type, picture, rate, colour and audio format.";
     SENDER_SDP = "sender-sdp", Warning, "NMOS Parameter Registers: Capabilities",
         "A Sender's `st2110_21_sender_type`, `packet_transmission_mode` and `bit_rate` agree with `TP`, `packetmode` and `b=AS` in its SDP file.";
+
+    // MXL (BCP-007-03).
+    MXL_TRANSPORT = "mxl-transport", Warning, "BCP-007-03 v1.0",
+        "An MXL (`urn:x-nmos:transport:mxl`) Sender has `manifest_href` null and no `interface_bindings`, an MXL Receiver no `interface_bindings` and at least one of `caps.media_types`, and the IS-05 `/active` of each holds one set of transport parameters, `mxl_domain_id` and `mxl_flow_id`, each null or a lowercase UUID.";
 }
 
 /// Looks a rule up by its identifier.

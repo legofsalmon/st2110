@@ -43,6 +43,7 @@ pub fn check(snapshot: &Snapshot) -> Report {
     let channel_maps = controls::channel_maps(&model, snapshot, &mut findings);
     let system = controls::system(&model, snapshot, &sender_sdps, &mut findings);
     crate::monitors::check(&model, snapshot, &mut findings);
+    crate::mxl::check(&model, snapshot, &mut findings);
 
     let summary = Summary {
         nodes: model.nodes.len(),
