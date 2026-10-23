@@ -20,6 +20,12 @@
 //! The Node then says so in its resources (`authorization: true`) and in its multicast
 //! DNS advert (`api_auth=true`).
 //!
+//! With `--tls-cert` and `--tls-key` it serves its APIs over TLS ([`tls`]), as BCP-003-01
+//! has it: HTTPS, and WSS for IS-12, with `https` and `wss` in every href it gives, its
+//! Node API endpoint's `protocol` `https`, and `api_proto=https` in its advert, so that
+//! a controller on another machine sends it tokens, which this program's own send only
+//! over TLS or to this machine.
+//!
 //! Where there is no registry to register with, none found by DNS-SD or none that
 //! answers, the Node advertises its Node API by multicast DNS for peer-to-peer
 //! discovery (IS-04 v1.3 Discovery: Peer to Peer), with the version counters that
@@ -43,9 +49,11 @@ mod ncp;
 mod receiving;
 mod resources;
 mod sending;
+mod tls;
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -67,6 +75,7 @@ pub(crate) use self::sending::{Sending, Switch, Switched};
 
 use self::connection::{Control, Endpoint, Side, error, tai};
 use self::resources::{CONNECTION_VERSION, Ids, Place};
+use self::tls::Conn;
 use crate::find::{self, LookArgs};
 use crate::http::{self, Request, Response};
 
@@ -119,6 +128,15 @@ pub(crate) struct NodeArgs {
     /// too.
     #[arg(long, requires = "nmos", help_heading = "NMOS")]
     pub require_token: bool,
+    /// Serve the Node API, the Connection API and the IS-12 control endpoint over TLS
+    /// (HTTPS and WSS), as BCP-003-01 has it, with the certificate chain in FILE, PEM, the
+    /// Node's own first; its key in --tls-key. The hrefs the Node gives name its address,
+    /// so the certificate should too (an IP address in its subjectAltName).
+    #[arg(long, value_name = "FILE", requires_all = ["nmos", "tls_key"], help_heading = "NMOS")]
+    pub tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert, PEM (PKCS #8, PKCS #1 or SEC1).
+    #[arg(long, value_name = "FILE", requires = "tls_cert", help_heading = "NMOS")]
+    pub tls_key: Option<PathBuf>,
     #[command(flatten, next_help_heading = "NMOS")]
     pub auth: crate::auth::Auth,
 }
@@ -218,6 +236,8 @@ struct State {
     advertising: Option<Responder>,
     /// Whether its APIs ask for an IS-10 token.
     api_auth: bool,
+    /// Whether it serves them over TLS.
+    secure: bool,
 }
 
 impl State {
@@ -225,10 +245,10 @@ impl State {
         &mut self.resources.last_mut().expect("a Sender or Receiver").1
     }
 
-    /// The text pairs the Node advertises peer to peer: it serves IS-04 v1.3 over HTTP,
-    /// and whether it asks for a token.
+    /// The text pairs the Node advertises peer to peer: it serves IS-04 v1.3 over HTTP or
+    /// HTTPS, and whether it asks for a token.
     fn txt(&self) -> Vec<(String, String)> {
-        self.counters.txt("http", &["v1.3"], self.api_auth)
+        self.counters.txt(if self.secure { "https" } else { "http" }, &["v1.3"], self.api_auth)
     }
 }
 
@@ -360,6 +380,11 @@ impl Node {
                 return Err(format!("--nmos={registry} is not a registry's http:// or https:// URL"));
             }
         }
+        let served_tls = match (&args.tls_cert, &args.tls_key) {
+            (Some(cert), Some(key)) => Some(tls::server_config(cert, key)?),
+            _ => None,
+        };
+        let secure = served_tls.is_some();
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, args.nmos_port))
             .map_err(|e| format!("--nmos-port {}: {e}", args.nmos_port))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -399,7 +424,7 @@ impl Node {
             }
         }
         let api_auth = verifier.is_some();
-        let place = Place { host, port, hostname: name.clone(), interfaces, authorization: api_auth };
+        let place = Place { host, port, hostname: name.clone(), interfaces, authorization: api_auth, secure };
         let now = crate::timing::now(tai_utc)?;
         let version = tai(now);
         let (seed, label) = match offer {
@@ -468,6 +493,7 @@ impl Node {
             counters: Counters::default(),
             advertising: None,
             api_auth,
+            secure,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
@@ -477,10 +503,11 @@ impl Node {
         });
         let options = Options { timeout: TIMEOUT, token, ..Options::default() };
         let finder = if registry.is_empty() { Finder::Look(args.auth.look.clone()) } else { Finder::Given(registry) };
-        let api = format!("http://{host}:{port}/x-nmos/node/v1.3/");
+        let (http, ws) = if secure { ("https", "wss") } else { ("http", "ws") };
+        let api = format!("{http}://{host}:{port}/x-nmos/node/v1.3/");
         eprintln!(
-            "NMOS: {} {} at {api}, its Connection API at http://{host}:{port}/x-nmos/connection/{CONNECTION_VERSION}/, \
-             its IS-12 control at ws://{host}:{port}{}/",
+            "NMOS: {} {} at {api}, its Connection API at {http}://{host}:{port}/x-nmos/connection/{CONNECTION_VERSION}/, \
+             its IS-12 control at {ws}://{host}:{port}{}/",
             side.name(),
             ids.endpoint,
             ncp::PATH,
@@ -495,7 +522,7 @@ impl Node {
         let served = shared.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
+                let Ok(stream) = stream.and_then(|tcp| Conn::new(tcp, served_tls.as_ref())) else { continue };
                 let shared = served.clone();
                 thread::spawn(move || handle(&shared, &stream));
             }
@@ -583,7 +610,7 @@ fn tick(shared: &Shared) {
     }
 }
 
-fn handle(shared: &Shared, stream: &TcpStream) {
+fn handle(shared: &Shared, stream: &Conn) {
     let Ok(Some(request)) = http::read(stream) else {
         return;
     };
@@ -591,6 +618,7 @@ fn handle(shared: &Shared, stream: &TcpStream) {
         Ok(claims) => claims,
         Err(refused) => {
             let _ = http::write(stream, &refused);
+            stream.shutdown();
             return;
         }
     };
@@ -603,6 +631,7 @@ fn handle(shared: &Shared, stream: &TcpStream) {
         let mut response = Response::json(426, &error(426, "Upgrade Required", message).1);
         response.headers.push(("Upgrade", "websocket".into()));
         let _ = http::write(stream, &response);
+        stream.shutdown();
         return;
     }
     let mut response = answer(shared, &request);
@@ -610,6 +639,7 @@ fn handle(shared: &Shared, stream: &TcpStream) {
     // Resource Sharing).
     response.headers.push(("Access-Control-Allow-Origin", "*".into()));
     let _ = http::write(stream, &response);
+    stream.shutdown();
     shared.wake.notify_all();
 }
 
@@ -985,7 +1015,7 @@ fn send(method: &str, url: &str, body: Option<&Value>) -> std::io::Result<String
     use std::io::{Read, Write};
     let rest = url.strip_prefix("http://").unwrap_or(url);
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let mut stream = TcpStream::connect(host)?;
+    let mut stream = std::net::TcpStream::connect(host)?;
     let body = body.map(Value::to_string).unwrap_or_default();
     write!(stream, "{method} /{path} HTTP/1.1\r\nHost: {host}\r\n")?;
     if !body.is_empty() {
@@ -1232,6 +1262,122 @@ mod tests {
         let response = send("POST", &format!("{}receivers/{id}/target", node.api), Some(&json!({}))).unwrap();
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
         assert_eq!(found("1").counters["ver_slf"], "0");
+        assert_eq!(node.finish(), None, "never registered");
+    }
+
+    /// The test certificate authority, and a certificate it signed for 127.0.0.1, with
+    /// its key: test material only.
+    fn test_tls() -> (PathBuf, PathBuf) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tls");
+        st2110_nmos::tls::trust_only(&std::fs::read(dir.join("ca.pem")).unwrap()).unwrap();
+        (dir.join("node.pem"), dir.join("node.key"))
+    }
+
+    /// With --tls-cert and --tls-key, the Node serves HTTPS and WSS, and says so in its
+    /// resources; this program's clients reach it when they trust its certificate.
+    #[test]
+    fn serves_its_apis_over_tls() {
+        use st2110_connect::client::{ConnectionClient, Options};
+        let (cert, key) = test_tls();
+        let mut args = NodeArgs {
+            nmos: Some("http://127.0.0.1:9".into()),
+            tls_cert: Some(cert),
+            tls_key: Some(key),
+            ..NodeArgs::default()
+        };
+        args.auth.look.mdns = Some(test_group());
+        let (mut node, _tuning) = receiver_node(&args);
+        assert!(node.api.starts_with("https://127.0.0.1:"), "{}", node.api);
+        let txt = node.shared.lock().txt();
+        assert!(txt.contains(&("api_proto".into(), "https".into())), "{txt:?}");
+        let client = ConnectionClient::new(&Options { timeout: TIMEOUT, ..Options::default() });
+        let read = |url: &str| {
+            let reply = client.get(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(reply.status, 200, "{url}: {}", reply.body);
+            reply.body
+        };
+        let this = read(&format!("{}self", node.api));
+        assert_eq!(this["api"]["endpoints"][0]["protocol"], "https", "{this}");
+        assert!(this["href"].as_str().unwrap().starts_with("https://127.0.0.1:"), "{this}");
+        let device = read(&format!("{}devices/", node.api));
+        let controls = &device[0]["controls"];
+        let connection = controls[0]["href"].as_str().unwrap();
+        assert!(connection.starts_with("https://"), "{controls}");
+        assert!(read(&format!("{connection}single/receivers/")).as_array().is_some_and(|r| r.len() == 1));
+        // Plain HTTP gets no answer from it.
+        assert!(!get(&node.api.replace("https://", "http://")).is_ok_and(|r| r.starts_with("HTTP/")));
+
+        // The IS-12 endpoint is a secure WebSocket, which takes commands and sends
+        // notifications as before.
+        let href = controls[1]["href"].as_str().unwrap();
+        assert!(href.starts_with("wss://") && href.ends_with("/x-nmos/ncp/v1.0/"), "{controls}");
+        let mut ncp = st2110_nmos::ncp::client::Connection::open(href, &[], TIMEOUT).unwrap();
+        let monitors = ncp.monitors().unwrap();
+        assert_eq!(ncp.read_monitor(&monitors[0]).unwrap()["role"], "receiver-monitor");
+        assert_eq!(ncp.subscribe(&[4]).unwrap(), [4]);
+        let delay = st2110_nmos::ncp::property::STATUS_REPORTING_DELAY;
+        ncp.call(4, st2110_nmos::ncp::method::SET, json!({"id": delay.json(), "value": 1})).unwrap();
+        let heard = std::iter::from_fn(|| ncp.next_change().ok().flatten()).find(|n| n.property == delay).unwrap();
+        assert_eq!((heard.oid, heard.value), (4, json!(1)));
+        ncp.close();
+        assert_eq!(node.finish(), None, "never registered");
+    }
+
+    /// An Authorization Server on this machine that publishes `key`: gives its issuer.
+    fn authorization_server(key: &auth::SigningKey) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let issuer = format!("http://{}/", listener.local_addr().unwrap());
+        let metadata = json!({"issuer": issuer, "jwks_uri": format!("{issuer}jwks")});
+        let jwks = key.jwks();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let Ok(Some(request)) = http::read(&stream) else { continue };
+                let body = if request.path == "/jwks" { &jwks } else { &metadata };
+                let _ = http::write(&stream, &Response::json(200, body));
+            }
+        });
+        issuer
+    }
+
+    /// With --require-token, an IS-12 controller is let go with 1008 (Policy Violation)
+    /// when its token runs out, give or take the leeway for clocks, for it to connect
+    /// again with a fresh one.
+    #[test]
+    fn closes_an_is_12_connection_with_1008_when_its_token_runs_out() {
+        use st2110_nmos::ws::{self, Frame};
+        let key = auth::SigningKey::generate().unwrap();
+        let issuer = authorization_server(&key);
+        let mut args = NodeArgs { nmos: Some("http://127.0.0.1:9".into()), require_token: true, ..NodeArgs::default() };
+        args.auth.look.mdns = Some(test_group());
+        args.auth.auth = Some(issuer.clone());
+        let (mut node, _tuning) = receiver_node(&args);
+        let href = node.api.replace("http://", "ws://").replace("/x-nmos/node/v1.3/", "/x-nmos/ncp/v1.0/");
+        // Run out but for the last two seconds of the leeway.
+        let exp = access::unix_now() + 2 - access::LEEWAY.as_secs();
+        let token = key
+            .sign(&json!({"iss": issuer, "sub": "test", "aud": "*", "exp": exp, "x-nmos-ncp": {"read": ["*"]}}))
+            .unwrap();
+        let begun = Instant::now();
+        let mut socket =
+            ws::connect(&format!("{href}?access_token={token}"), &[], TIMEOUT).expect("taken while it lasts");
+        // Pinged while it lasts, which the client answers, then closed; generously
+        // timed, for slow machines.
+        socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let closed = loop {
+            match socket.read_any().expect("closed with a code") {
+                Frame::Close(code) => break code,
+                Frame::Ping(_) | Frame::Pong(_) => {}
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(closed, Some(1008));
+        assert!(begun.elapsed() < Duration::from_secs(15), "closed after {:?}", begun.elapsed());
+        // A token that ran out longer ago than the leeway is refused at the start.
+        let gone = key
+            .sign(&json!({"iss": issuer, "sub": "test", "aud": "*", "exp": exp - 5, "x-nmos-ncp": {"read": ["*"]}}))
+            .unwrap();
+        let refused = ws::connect(&format!("{href}?access_token={gone}"), &[], TIMEOUT).unwrap_err();
+        assert!(refused.to_string().contains("401"), "{refused}");
         assert_eq!(node.finish(), None, "never registered");
     }
 }

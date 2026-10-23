@@ -26,7 +26,6 @@ use std::time::Duration;
 use serde_json::Value;
 use st2110_nmos::Kind;
 use st2110_nmos::auth::{self, Token};
-use ureq::tls::{RootCerts, TlsConfig};
 use ureq::typestate::WithBody;
 use ureq::{Agent, RequestBuilder};
 
@@ -129,7 +128,7 @@ impl ConnectionClient {
             .timeout_global(Some(options.timeout))
             .http_status_as_error(false)
             .proxy(proxy)
-            .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+            .tls_config(st2110_nmos::tls::tls_config())
             .user_agent(concat!("st2110-connect/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();

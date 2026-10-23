@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use ureq::Agent;
-use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::auth;
 use crate::check::is_http;
@@ -149,7 +148,7 @@ impl Http {
             .timeout_global(Some(options.timeout))
             .http_status_as_error(false)
             .proxy(proxy)
-            .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+            .tls_config(crate::tls::tls_config())
             .user_agent(concat!("st2110-nmos/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();

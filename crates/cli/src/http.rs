@@ -1,7 +1,8 @@
 //! Just enough HTTP/1.1 to serve the router page, its API and the demo facility, and
 //! the Node API and Connection API of `st2110 send --nmos` and `st2110 receive --nmos`:
 //! one request per connection, with limits on what a request may hold, or one that
-//! becomes a WebSocket.
+//! becomes a WebSocket. It is read from and written to a [`Stream`]: a TCP stream, or
+//! TLS over one.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -16,6 +17,31 @@ const BODY_LIMIT: usize = 1 << 20;
 
 /// How long a client may take to send its request.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a request is read from and a response written to.
+pub(crate) trait Stream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// What reads from the stream.
+    fn reader(&self) -> impl Read + '_;
+
+    /// What writes to it.
+    fn writer(&self) -> impl Write + '_;
+}
+
+impl Stream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn reader(&self) -> impl Read + '_ {
+        self
+    }
+
+    fn writer(&self) -> impl Write + '_ {
+        self
+    }
+}
 
 /// A request, as read.
 pub(crate) struct Request {
@@ -112,9 +138,9 @@ fn reason(status: u16) -> &'static str {
 
 /// Reads one request. `Ok(None)` when the client sent nothing, or something that is not
 /// an HTTP request.
-pub(crate) fn read(stream: &TcpStream) -> io::Result<Option<Request>> {
+pub(crate) fn read(stream: &impl Stream) -> io::Result<Option<Request>> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.take(u64::try_from(HEAD_LIMIT + BODY_LIMIT).unwrap_or(u64::MAX)));
+    let mut reader = BufReader::new(stream.reader().take(u64::try_from(HEAD_LIMIT + BODY_LIMIT).unwrap_or(u64::MAX)));
     let mut head = 0;
     let mut line = String::new();
     let mut lines = Vec::new();
@@ -160,7 +186,7 @@ pub(crate) fn read(stream: &TcpStream) -> io::Result<Option<Request>> {
 }
 
 /// Sends a response, and closes the connection.
-pub(crate) fn write(mut stream: &TcpStream, response: &Response) -> io::Result<()> {
+pub(crate) fn write(stream: &impl Stream, response: &Response) -> io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         response.status,
@@ -172,6 +198,7 @@ pub(crate) fn write(mut stream: &TcpStream, response: &Response) -> io::Result<(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
+    let mut stream = stream.writer();
     stream.write_all(head.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()
@@ -185,7 +212,7 @@ pub(crate) fn is_upgrade(request: &Request) -> bool {
 
 /// Answers a WebSocket handshake: `Err` with the status to refuse it with, when it is
 /// not one this server takes.
-pub(crate) fn accept(mut stream: &TcpStream, request: &Request) -> Result<(), (u16, String)> {
+pub(crate) fn accept(stream: &impl Stream, request: &Request) -> Result<(), (u16, String)> {
     if request.method != "GET" || !is_upgrade(request) {
         return Err((400, "not a WebSocket request".into()));
     }
@@ -199,6 +226,7 @@ pub(crate) fn accept(mut stream: &TcpStream, request: &Request) -> Result<(), (u
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
         st2110_nmos::ws::accept_key(key)
     );
+    let mut stream = stream.writer();
     stream.write_all(head.as_bytes()).and_then(|()| stream.flush()).map_err(|e| (500, e.to_string()))
 }
 

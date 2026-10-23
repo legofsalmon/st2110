@@ -864,6 +864,120 @@ fn a_node_with_require_token_refuses_requests_without_one_and_takes_the_routers(
     assert!(said.contains("its APIs ask for IS-10 tokens from"), "{said}");
 }
 
+/// `st2110 receive --nmos --require-token --tls-cert --tls-key` serves its APIs over TLS,
+/// as BCP-003-01 has it, and registers `https` and `wss` hrefs, so that a controller on
+/// another machine may send it a token. The router, trusting the test certificate
+/// authority with --ca, takes a route to it over HTTPS with its token, and `st2110 nmos`
+/// reads it alone; without --ca, the certificate is not trusted.
+#[test]
+fn a_node_served_over_tls_registers_https_and_the_router_takes_it() {
+    // Test material only: a CA of the tests' own, and a certificate for 127.0.0.1.
+    let tls = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tls");
+    let ca = tls.join("ca.pem").to_str().unwrap().to_string();
+    let router = Router::with(&["--previews", "0", "--no-state", "--demo-auth", "--ca", &ca]);
+    let base = format!("http://{}", router.address);
+    let mut receiver = Command::new(env!("CARGO_BIN_EXE_st2110"))
+        .args(["receive", &format!("--nmos={base}"), "--media", "audio", "--interface", "127.0.0.1"])
+        .args(["--duration", "30", "--label", "Secure monitor", "--require-token"])
+        .args(["--auth", &format!("{base}/"), "--client-id", "st2110-demo"])
+        .args([
+            "--tls-cert",
+            tls.join("node.pem").to_str().unwrap(),
+            "--tls-key",
+            tls.join("node.key").to_str().unwrap(),
+        ])
+        .env("ST2110_CLIENT_SECRET", "demo-secret")
+        .env("NO_COLOR", "1")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    let mut said = BufReader::new(receiver.stderr.take().expect("stderr"));
+    let mut line = String::new();
+    let node = loop {
+        line.clear();
+        assert!(said.read_line(&mut line).expect("reads") > 0, "the Node stopped");
+        if let Some(rest) = line.split(" at https://").nth(1).filter(|_| line.starts_with("NMOS: Receiver ")) {
+            assert!(
+                line.contains(&format!("its IS-12 control at wss://{}", rest.split('/').next().unwrap())),
+                "{line}"
+            );
+            break rest.split('/').next().unwrap().to_string();
+        }
+    };
+    let rest = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = said.read_to_string(&mut text);
+        text
+    });
+
+    // It registers its Node API as HTTPS, and its controls as HTTPS and WSS.
+    let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Authorization", "Basic c3QyMTEwLWRlbW86ZGVtby1zZWNyZXQ="),
+    ];
+    let (status, body) =
+        router.request("POST", "/x-nmos/auth/v1.0/token", &headers, "grant_type=client_credentials&scope=query");
+    assert_eq!(status, 200, "{body}");
+    let query = serde_json::from_str::<Value>(&body).unwrap()["access_token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {query}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let device = loop {
+        let (status, body) = router.request("GET", "/x-nmos/query/v1.3/devices/", &[("Authorization", &bearer)], "");
+        assert_eq!(status, 200, "{body}");
+        let devices: Value = serde_json::from_str(&body).unwrap();
+        if let Some(device) = devices.as_array().unwrap().iter().find(|d| d["label"] == "Secure monitor") {
+            break device.clone();
+        }
+        assert!(Instant::now() < deadline, "the Node never registered");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(device["controls"][0]["href"], format!("https://{node}/x-nmos/connection/v1.2/"), "{device:#}");
+    assert_eq!(device["controls"][1]["href"], format!("wss://{node}/x-nmos/ncp/v1.0/"), "{device:#}");
+    let (_, body) = router.request("GET", "/x-nmos/query/v1.3/nodes/", &[("Authorization", &bearer)], "");
+    let nodes: Value = serde_json::from_str(&body).unwrap();
+    let this = nodes.as_array().unwrap().iter().find(|n| n["id"] == device["node_id"]).expect("its Node");
+    assert_eq!(this["api"]["endpoints"][0]["protocol"], "https", "{this:#}");
+    assert_eq!(this["href"], format!("https://{node}/"), "{this:#}");
+
+    // The router takes a route to it, sending its token over HTTPS.
+    while !router.routes().iter().any(|(r, _)| r == "Secure monitor") {
+        assert!(Instant::now() < deadline, "the router never saw the Node");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let taken = router.take(json!([{"receiver": "Secure monitor", "sender": "CAM 2 audio"}]));
+    assert_eq!(taken["succeeded"], true, "{taken:#}");
+    assert_eq!(taking(&router.routes(), "Secure monitor").as_deref(), Some("CAM 2 audio"));
+
+    // `st2110 nmos` reads the Node alone over HTTPS, trusting the test CA, and does not
+    // without it.
+    let read = |more: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_st2110"))
+            .args(["nmos", &format!("https://{node}/x-nmos/node/"), "--quiet", "--no-sdp"])
+            .args(["--auth", &format!("{base}/"), "--client-id", "st2110-demo"])
+            .args(more)
+            .env("ST2110_CLIENT_SECRET", "demo-secret")
+            .env("NO_COLOR", "1")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .output()
+            .expect("runs")
+    };
+    let trusted = read(&["--ca", &ca, "--format", "json"]);
+    let text = String::from_utf8_lossy(&trusted.stdout);
+    assert_ne!(trusted.status.code(), Some(2), "{text}{}", String::from_utf8_lossy(&trusted.stderr));
+    assert!(text.contains("Secure monitor"), "{text}");
+    let untrusted = read(&[]);
+    assert_eq!(untrusted.status.code(), Some(2), "{}", String::from_utf8_lossy(&untrusted.stdout));
+
+    let _ = receiver.kill();
+    let _ = receiver.wait();
+    let said = rest.join().unwrap();
+    assert!(said.contains("its APIs ask for IS-10 tokens from"), "{said}");
+}
+
 /// A state file of its own, removed when dropped.
 struct StateFile(PathBuf);
 

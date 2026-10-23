@@ -65,6 +65,8 @@ pub mod routing;
 pub mod rules;
 mod snapshot;
 #[cfg(feature = "client")]
+pub mod tls;
+#[cfg(feature = "client")]
 pub mod ws;
 
 pub use check::check;

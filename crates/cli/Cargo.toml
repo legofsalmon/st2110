@@ -28,6 +28,9 @@ st2110-discover.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# TLS on the APIs of `st2110 send --nmos` and `st2110 receive --nmos`: the same as the
+# clients', through st2110-nmos.
+rustls.workspace = true
 minifb = { version = "0.28", optional = true }
 
 [lints]

@@ -512,8 +512,25 @@ enum RulesFormat {
     Json,
 }
 
+impl Command {
+    /// The IS-10 options of a command that takes them.
+    fn auth(&self) -> Option<&auth::Auth> {
+        match self {
+            Command::Nmos { auth, .. } | Command::Connect { auth, .. } | Command::Router { auth, .. } => Some(auth),
+            Command::Discover(args) => Some(args.auth()),
+            Command::Send { signal } => Some(signal.auth()),
+            Command::Receive(args) => Some(args.auth()),
+            _ => None,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Err(e)) = cli.command.auth().map(auth::Auth::trust) {
+        eprintln!("st2110: {e}");
+        return ExitCode::from(2);
+    }
     let result = match cli.command {
         Command::Lint { files, format, quiet, deny_warnings } => lint(&files, format, quiet, deny_warnings),
         Command::Nmos { target, format, quiet, deny_warnings, save, timeout, no_sdp, system, auth } => {

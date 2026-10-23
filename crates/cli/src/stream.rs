@@ -137,6 +137,15 @@ pub(crate) struct AudioArgs {
     level: f64,
 }
 
+impl Signal {
+    /// The IS-10 options, for `--nmos`.
+    pub(crate) fn auth(&self) -> &crate::auth::Auth {
+        match self {
+            Signal::Video { send, .. } | Signal::Audio { send, .. } => &send.node.auth,
+        }
+    }
+}
+
 #[derive(Args)]
 pub(crate) struct SendArgs {
     /// Where to send: a multicast group or a unicast address, and a port, such as
@@ -541,6 +550,13 @@ impl Ready<'_> {
 
 fn plural(count: u64, noun: &str) -> String {
     crate::plural(count as usize, noun)
+}
+
+impl ReceiveArgs {
+    /// The IS-10 options, for `--nmos`.
+    pub(crate) fn auth(&self) -> &crate::auth::Auth {
+        &self.node.auth
+    }
 }
 
 #[derive(Args)]

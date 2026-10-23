@@ -61,8 +61,8 @@ impl Ids {
 }
 
 /// Where the Node is: its address, the port its APIs are on, its name, and its network
-/// interfaces, each a name and a MAC address; and whether its APIs ask for an IS-10
-/// token.
+/// interfaces, each a name and a MAC address; whether its APIs ask for an IS-10 token,
+/// and whether they are served over TLS.
 #[derive(Clone, Debug)]
 pub(crate) struct Place {
     pub host: Ipv4Addr,
@@ -70,11 +70,18 @@ pub(crate) struct Place {
     pub hostname: String,
     pub interfaces: Vec<(String, String)>,
     pub authorization: bool,
+    pub secure: bool,
 }
 
 impl Place {
+    /// Where the APIs are: `http://` or, over TLS, `https://`.
     fn base(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        format!("{}://{}:{}", self.protocol(), self.host, self.port)
+    }
+
+    /// The protocol of the Node API's endpoint (IS-04 v1.3 APIs: Node API, `api`).
+    fn protocol(&self) -> &'static str {
+        if self.secure { "https" } else { "http" }
     }
 }
 
@@ -113,7 +120,7 @@ pub(crate) fn node(ids: &Ids, place: &Place, version: &str, label: &str, referen
         json!({
             "href": format!("{}/", place.base()), "hostname": place.hostname,
             "api": {"versions": ["v1.3"], "endpoints": [
-                {"host": place.host.to_string(), "port": place.port, "protocol": "http", "authorization": place.authorization},
+                {"host": place.host.to_string(), "port": place.port, "protocol": place.protocol(), "authorization": place.authorization},
             ]},
             "caps": {}, "services": [], "clocks": [clock(reference)], "interfaces": interfaces,
         }),
@@ -132,7 +139,7 @@ pub(crate) fn device(ids: &Ids, place: &Place, version: &str, label: &str) -> Va
                 "authorization": place.authorization,
             }, {
                 // IS-12 v1.0.1: the Device's control model, with its status monitor.
-                "href": format!("ws://{}:{}{}/", place.host, place.port, super::ncp::PATH),
+                "href": format!("{}://{}:{}{}/", if place.secure { "wss" } else { "ws" }, place.host, place.port, super::ncp::PATH),
                 "type": st2110_nmos::ncp::CONTROL_TYPE, "authorization": place.authorization,
             }],
         }),
@@ -282,7 +289,23 @@ mod tests {
             hostname: "studio-mac".into(),
             interfaces: vec![("en0".into(), "02-00-c0-a8-0a-15".into())],
             authorization: false,
+            secure: false,
         }
+    }
+
+    #[test]
+    fn gives_https_and_wss_over_tls() {
+        let ids = Ids::from_seed("test");
+        let secure = Place { secure: true, authorization: true, ..place() };
+        let node = node(&ids, &secure, "1:0", "studio-mac", None);
+        assert_eq!(node["href"], "https://192.168.10.21:8080/");
+        assert_eq!(node["api"]["endpoints"][0]["protocol"], "https");
+        assert_eq!(node["api"]["endpoints"][0]["authorization"], true);
+        let device = device(&ids, &secure, "1:0", "test");
+        assert_eq!(device["controls"][0]["href"], "https://192.168.10.21:8080/x-nmos/connection/v1.2/");
+        assert_eq!(device["controls"][1]["href"], "wss://192.168.10.21:8080/x-nmos/ncp/v1.0/");
+        let plain = super::device(&ids, &place(), "1:0", "test");
+        assert_eq!(plain["controls"][1]["href"], "ws://192.168.10.21:8080/x-nmos/ncp/v1.0/");
     }
 
     #[test]

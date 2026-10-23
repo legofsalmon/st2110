@@ -170,8 +170,8 @@ impl std::fmt::Debug for Socket {
 }
 
 /// Connects to a `ws://` or `wss://` URL, sending `headers` with the handshake, and
-/// waiting `timeout` at most for each step. `wss://` checks the server's certificate as
-/// the system does.
+/// waiting `timeout` at most for each step. `wss://` checks the server's certificate against
+/// the certificate authorities [`crate::tls`] trusts.
 pub fn connect(url: &str, headers: &[(&str, &str)], timeout: Duration) -> io::Result<Socket> {
     let target = Target::parse(url)?;
     let address = (target.host.as_str(), target.port)
@@ -190,13 +190,7 @@ pub fn connect(url: &str, headers: &[(&str, &str)], timeout: Duration) -> io::Re
 }
 
 fn tls(host: &str, tcp: TcpStream) -> io::Result<Box<dyn Transport>> {
-    use rustls_platform_verifier::BuilderVerifierExt;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .and_then(BuilderVerifierExt::with_platform_verifier)
-        .map_err(io::Error::other)?
-        .with_no_client_auth();
+    let config = crate::tls::client_config()?;
     let name = rustls::pki_types::ServerName::try_from(host.trim_start_matches('[').trim_end_matches(']').to_string())
         .map_err(|e| invalid(format!("{host}: {e}")))?;
     let connection = rustls::ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
