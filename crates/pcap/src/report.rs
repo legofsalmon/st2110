@@ -138,6 +138,28 @@ pub struct FlowReport {
     pub audio: Option<AudioReport>,
     /// For audio and ancillary data, how it lines up with a video flow.
     pub relative: Option<RelativeReport>,
+    /// ST 2110-41 fast metadata measurements.
+    pub fast_metadata: Option<FastMetadataReport>,
+}
+
+/// The ST 2110-41 network compatibility model (ST 2110-41:2026 §7).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FastMetadataReport {
+    /// R_NOMINAL: the average packet rate, in packets a second.
+    pub r_nominal: f64,
+    /// The time R_NOMINAL was averaged over, in seconds: the flow's first packet to its
+    /// last.
+    pub averaged_s: f64,
+    /// True when that was under the 10 s that ST 2110-41 asks for, so R_NOMINAL, and the
+    /// T_DRAIN and C_MAX that follow from it, are estimates.
+    pub estimate: bool,
+    /// T_DRAIN = 1 ÷ MAX(800, 1.1 × R_NOMINAL), in microseconds.
+    pub drain_us: f64,
+    /// C_MAX = MAX(4, INT(R_NOMINAL ÷ 43 200)).
+    pub cmax: u32,
+    /// The highest CINST.
+    pub peak: u64,
 }
 
 /// RP 2110-25 measurements of an audio or ancillary data flow against a video flow: the

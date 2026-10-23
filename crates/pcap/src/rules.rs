@@ -123,6 +123,8 @@ rules! {
         "A fast metadata stream sends a packet at least every 500 ms, with no Data Item Packages if it has nothing to send.";
     FMX_PAYLOAD = "fmx-payload", Error, "ST 2110-41:2026 §5.4",
         "The Data Item Packages fill each payload exactly, none of them split across packets, and no Data Item Length is 0.";
+    FMX_CINST = "fmx-cinst", Error, "ST 2110-41:2026 §7",
+        "CINST, the network compatibility model's bucket, never exceeds C_MAX = MAX(4, INT(R_NOMINAL ÷ 43 200)), the bucket draining a packet every T_DRAIN = 1 ÷ MAX(800, 1.1 × R_NOMINAL) seconds at instants counted from the SMPTE Epoch. R_NOMINAL is the stream's average packet rate over the whole capture, which ST 2110-41 asks be at least 10 s; the finding says when it was shorter.";
     TTML_PAYLOAD = "ttml-payload", Error, "RFC 8759 §4.1",
         "Timed text payload headers have the reserved bits 0 and a Length equal to the octets of User Data Words that follow.";
     TTML_DOCUMENT = "ttml-document", Error, "RFC 8759 §4.1, §8",

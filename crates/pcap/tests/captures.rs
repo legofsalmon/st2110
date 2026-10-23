@@ -1797,6 +1797,61 @@ fn fast_metadata_markers_gaps_and_packages() {
     );
 }
 
+/// Fast metadata in bursts of `burst` packets 1 µs apart, every `every` nanoseconds for
+/// `seconds`.
+fn fast_metadata_in_bursts(burst: i128, every: i128, seconds: i128) -> Report {
+    let mut scene = Scene::default();
+    let mut seq = 0_u16;
+    for k in 0..seconds * NANOS / every {
+        for j in 0..burst {
+            let mut payload = (0x100_u32 << 10 | 2).to_be_bytes().to_vec();
+            payload.extend([0xAB; 8]);
+            let t = NOON * NANOS + k * every;
+            let packet = rtp(117, false, seq, (t * 48_000 / NANOS) as u32, 0x5555_0005, &payload);
+            seq = seq.wrapping_add(1);
+            scene.udp(t + 100_000 + j * 1000, "192.168.10.22:5012", "239.10.10.5:5012", &packet);
+        }
+    }
+    send_ptp(&mut scene, GM, 2, |_, _| false);
+    scene.analyse(&[fixture("fmx.sdp")])
+}
+
+/// Bursts of 6 packets every 100 ms for 3 s: more than C_MAX of 4 at once.
+fn with_bursty_fast_metadata() -> Report {
+    fast_metadata_in_bursts(6, 100_000_000, 3)
+}
+
+#[test]
+fn fast_metadata_within_the_network_compatibility_model() {
+    // Bursts of 4 every 50 ms for 12 s: 80 packets a second, so the bucket drains at the
+    // floor of 800 a second and C_MAX is 4, which the bursts just reach.
+    let report = fast_metadata_in_bursts(4, 50_000_000, 12);
+    assert_eq!(rules(&report), [] as [&str; 0], "{:#?}", report.findings);
+    let fmx = report.flows[0].fast_metadata.as_ref().unwrap();
+    assert_eq!((fmx.peak, fmx.cmax, fmx.estimate), (4, 4, false));
+    assert!(close(fmx.drain_us, 1250.0), "{fmx:?}");
+    // 959 intervals over 11.950003 s.
+    assert!((fmx.r_nominal - 80.25).abs() < 0.01 && close(fmx.averaged_s, 11.950003), "{fmx:?}");
+    // Other streams have no fast metadata measurements.
+    assert!(with_bursts().flows.iter().all(|f| f.fast_metadata.is_none()));
+}
+
+#[test]
+fn bursts_of_fast_metadata_overfill_the_bucket() {
+    let report = with_bursty_fast_metadata();
+    assert_eq!(rules(&report), ["fmx-cinst"], "{:#?}", report.findings);
+    let f = finding(&report, "fmx-cinst");
+    assert_eq!((f.flow, f.severity, f.count), (Some(1), Severity::Error, 60));
+    assert_eq!(
+        f.message,
+        "CINST reached 6, over C_MAX 4, on 60 packets; T_DRAIN is 1250.0 µs, from an R_NOMINAL of 61.7 packets a \
+         second averaged over the whole capture's 2.9 s, short of the 10 s ST 2110-41 asks for, so it and C_MAX are \
+         estimates"
+    );
+    let fmx = report.flows[0].fast_metadata.as_ref().unwrap();
+    assert_eq!((fmx.peak, fmx.cmax, fmx.estimate), (6, 4, true));
+}
+
 fn with_broken_timed_text() -> Report {
     let mut scene = Scene::default();
     let mut seq = 0_u16;
@@ -1923,6 +1978,7 @@ fn every_rule_has_a_capture_that_raises_it() {
         with_broken_aes3(),
         with_spoilt_aes3_bits(),
         with_broken_fast_metadata(),
+        with_bursty_fast_metadata(),
         with_broken_timed_text(),
         with_jitter_beyond_aes67(),
         with_ptp_profile_faults(),

@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use st2110_pcap::{
-    AudioReport, CinstReport, Clock, FLOW_LIMIT, Finding, FlowReport, Options, PORT_LIMIT, PairReport, PtpDomainReport,
-    RelativeReport, Report, SdpFile, Stats, Timescale, VideoReport, VrxReport,
+    AudioReport, CinstReport, Clock, FLOW_LIMIT, FastMetadataReport, Finding, FlowReport, Options, PORT_LIMIT,
+    PairReport, PtpDomainReport, RelativeReport, Report, SdpFile, Stats, Timescale, VideoReport, VrxReport,
 };
 use st2110_sdp::{Essence, Severity};
 
@@ -227,6 +227,9 @@ fn write_flow(out: &mut impl Write, flow: &FlowReport) -> io::Result<()> {
     if let Some(relative) = &flow.relative {
         write_relative(out, flow.essence, relative)?;
     }
+    if let Some(fmx) = &flow.fast_metadata {
+        writeln!(out, "    {}", describe_fast_metadata(fmx))?;
+    }
     Ok(())
 }
 
@@ -324,6 +327,19 @@ fn describe_cinst(cinst: &CinstReport) -> String {
     let fits = if cinst.fits.is_empty() { "no sender type".to_string() } else { cinst.fits.join(", ") };
     text.push_str(&format!("; fits {fits}"));
     text
+}
+
+/// The ST 2110-41 network compatibility model.
+fn describe_fast_metadata(fmx: &FastMetadataReport) -> String {
+    let average = if fmx.estimate {
+        format!("over only {:.1} s, short of the 10 s ST 2110-41 asks for, so an estimate", fmx.averaged_s)
+    } else {
+        format!("over {:.1} s", fmx.averaged_s)
+    };
+    format!(
+        "CINST peaked at {} of C_MAX {}, T_DRAIN {:.1} µs; R_NOMINAL {:.1} packets a second {average}",
+        fmx.peak, fmx.cmax, fmx.drain_us, fmx.r_nominal
+    )
 }
 
 fn describe_vrx(vrx: &VrxReport) -> String {
@@ -500,6 +516,20 @@ mod tests {
         (cinst.sender_type, cinst.cmax, cinst.signalled_cmax, cinst.cmax_wide) =
             (Some("2110TPW".into()), None, None, None);
         assert_eq!(describe_cinst(&cinst), "CINST peaked at 3, no CMAX for 2110TPW at this packet rate; fits 2110TPN");
+        let mut fmx = FastMetadataReport {
+            r_nominal: 100.0,
+            averaged_s: 2.0,
+            estimate: true,
+            drain_us: 1250.0,
+            cmax: 4,
+            peak: 2,
+        };
+        assert_eq!(
+            describe_fast_metadata(&fmx),
+            "CINST peaked at 2 of C_MAX 4, T_DRAIN 1250.0 µs; R_NOMINAL 100.0 packets a second over only 2.0 s, short of the 10 s ST 2110-41 asks for, so an estimate"
+        );
+        (fmx.averaged_s, fmx.estimate) = (12.0, false);
+        assert!(describe_fast_metadata(&fmx).ends_with("R_NOMINAL 100.0 packets a second over 12.0 s"));
         let stats = Stats { count: 2, min: 20.0, max: 30.0, mean: 25.0 };
         let mut vrx = VrxReport {
             schedule: "gapped".into(),

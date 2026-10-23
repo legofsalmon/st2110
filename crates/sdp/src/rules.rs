@@ -214,6 +214,12 @@ rules! {
         "JPEG XS `b=AS` stays within the bits a pixel its sublevel allows, and within 4 at most, allowing 5% for packet headers.";
     JXSV_PROFILE = "jxsv-profile", Warning, "VSF TR-08:2026 §8.1.1",
         "JPEG XS uses a profile, level, sublevel and depth that TR-08 allows: `High444.12`, `TDC444.12` or, for 4:2:0, `High420.12`; levels `1k-1`, `2k-1`, `4k-2` and `8k-2`; `Sublev2bpp` to `Sublev4bpp`; 8, 10 or 12 bits.";
+    JXSV_SUBLEVEL = "jxsv-sublevel", Warning, "VSF TR-08:2026 §8.1.1",
+        "JPEG XS signals `Sublev3bpp`, not `Sublev4bpp`, when `b=AS` comes to 3 bits a pixel or fewer: TR-08 keeps `Sublev4bpp` for streams above 3 bits a pixel (and capability sets E and F use `Sublev2bpp`).";
+    JXSV_LEVEL_LOWEST = "jxsv-level-lowest", Warning, "VSF TR-08:2026 §8.1.1",
+        "JPEG XS signals the lowest of TR-08's levels that the picture's width, height and frame rate fit, as TR-08 asks. Which levels fit is judged by the published level tables that `jxsv-level` uses.";
+    JXSV_LEVEL = "jxsv-level", Warning, "ISO/IEC 21122-2:2024 Annex A, as published · RFC 9134 §7.1",
+        "JPEG XS `level` and `sublevel` are names the level tables give, and the picture fits its level: width, height, pixels a picture and pixels a second (a frame's pixels times the frame rate, for interlaced video too) within the level's maxima. The maxima are from the published tables (SVT-JPEG-XS, and Wikipedia for the pixel rate), not checked against ISO/IEC 21122-2 itself, so this is a warning.";
 
     // ST 2110-30 PCM audio and ST 2110-31 AES3.
     AUDIO_RATE = "audio-rate", Error, "ST 2110-30:2025 §6.1 · ST 2110-31:2022",

@@ -684,6 +684,24 @@ export interface FlowReport {
   audio: AudioReport | null;
   /** For audio and ancillary data, how it lines up with a video flow. */
   relative: RelativeReport | null;
+  /** ST 2110-41 fast metadata measurements. */
+  fast_metadata: FastMetadataReport | null;
+}
+
+/** The ST 2110-41 network compatibility model (ST 2110-41:2026 §7). */
+export interface FastMetadataReport {
+  /** R_NOMINAL: the average packet rate, in packets a second. */
+  r_nominal: number;
+  /** The seconds R_NOMINAL was averaged over: the flow's first packet to its last. */
+  averaged_s: number;
+  /** True when that was under the 10 s ST 2110-41 asks for, so R_NOMINAL and C_MAX are estimates. */
+  estimate: boolean;
+  /** T_DRAIN = 1 / MAX(800, 1.1 × R_NOMINAL), in microseconds. */
+  drain_us: number;
+  /** C_MAX = MAX(4, INT(R_NOMINAL / 43200)). */
+  cmax: number;
+  /** The highest CINST. */
+  peak: number;
 }
 
 /** RP 2110-25 measurements of an audio or ancillary data flow against a video flow. */

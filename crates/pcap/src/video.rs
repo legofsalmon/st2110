@@ -773,7 +773,7 @@ impl VideoEngine {
                     &rules::CINST,
                     format!(
                         "CINST reached {}, over CMAX {cmax} for {sender}, on {}",
-                        c.peak,
+                        c.bucket.peak(),
                         plural(c.exceeded.count, "packet")
                     ),
                     Some(flow),
@@ -1001,14 +1001,50 @@ impl Cmax {
     }
 }
 
-/// The network compatibility model: a bucket drained one packet every TDRAIN at
-/// instants counted from the SMPTE Epoch (ST 2110-21:2022 §6.6.1).
-struct Cinst {
-    /// TDRAIN is `drain.1 ÷ drain.0` nanoseconds.
+/// The leaky bucket of a network compatibility model: each packet enters it as it
+/// arrives, and it drains one packet, if it holds any, at each instant N × TDRAIN counted
+/// from the SMPTE Epoch (ST 2110-21:2022 §6.6.1, ST 2110-41:2026 §7).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bucket {
+    /// Drains a nanosecond, as a fraction: TDRAIN is `drain.1 ÷ drain.0` nanoseconds.
     drain: (i128, i128),
     last_drain: Option<i128>,
     level: u64,
     peak: u64,
+}
+
+impl Bucket {
+    /// A bucket that drains `drain.0` packets every `drain.1` nanoseconds.
+    pub(crate) fn new(drain: (i128, i128)) -> Self {
+        Self { drain, last_drain: None, level: 0, peak: 0 }
+    }
+
+    /// Puts in a packet that arrived at `t`, and gives CINST just after.
+    pub(crate) fn arrive(&mut self, t: i128) -> u64 {
+        let k = (t * self.drain.0).div_euclid(self.drain.1);
+        if let Some(last) = self.last_drain {
+            self.level = self.level.saturating_sub(u64::try_from(k - last).unwrap_or(0));
+        }
+        self.last_drain = Some(self.last_drain.map_or(k, |last| last.max(k)));
+        self.level += 1;
+        self.peak = self.peak.max(self.level);
+        self.level
+    }
+
+    /// The highest CINST.
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak
+    }
+
+    /// TDRAIN, in microseconds.
+    pub(crate) fn drain_us(&self) -> f64 {
+        self.drain.1 as f64 / self.drain.0 as f64 / 1000.0
+    }
+}
+
+/// The ST 2110-21 network compatibility model (§6.6.1), against each sender type's CMAX.
+struct Cinst {
+    bucket: Bucket,
     cmax: Cmax,
     /// The CMAX that applies: signalled, or the sender type's.
     limit: Option<u32>,
@@ -1023,10 +1059,7 @@ impl Cinst {
         let (num, den) = (i128::from(rate.numerator()), i128::from(rate.denominator()));
         // TDRAIN = TFRAME ÷ (NPACKETS × 1.1) = 10 × den × 10⁹ ÷ (11 × num × NPACKETS) ns.
         Self {
-            drain: (11 * num * i128::from(np), 10 * den * NANOS),
-            last_drain: None,
-            level: 0,
-            peak: 0,
+            bucket: Bucket::new((11 * num * i128::from(np), 10 * den * NANOS)),
             cmax,
             limit,
             judge,
@@ -1036,24 +1069,18 @@ impl Cinst {
     }
 
     fn arrive(&mut self, t: i128) {
-        let k = (t * self.drain.0).div_euclid(self.drain.1);
-        if let Some(last) = self.last_drain {
-            self.level = self.level.saturating_sub(u64::try_from(k - last).unwrap_or(0));
-        }
-        self.last_drain = Some(self.last_drain.map_or(k, |last| last.max(k)));
-        self.level += 1;
-        self.peak = self.peak.max(self.level);
+        let level = self.bucket.arrive(t);
         let second = self.seconds.at(t);
-        *second = (*second).max(self.level);
+        *second = (*second).max(level);
         if let Some(judge) = self.judge
-            && self.level > u64::from(judge)
+            && level > u64::from(judge)
         {
-            self.exceeded.hit_max(t, self.level as f64);
+            self.exceeded.hit_max(t, level as f64);
         }
     }
 
     fn report(&self, sender: Option<SenderType>, signalled: Option<u32>) -> CinstReport {
-        let peak = self.peak;
+        let peak = self.bucket.peak();
         let fits = |cmax: u32| peak <= u64::from(cmax);
         let mut types = Vec::new();
         if fits(self.cmax.narrow) {
@@ -1074,7 +1101,7 @@ impl Cinst {
             cmax_narrow_linear: self.cmax.narrow_linear,
             cmax_wide: self.cmax.wide,
             fits: types,
-            drain_us: self.drain.1 as f64 / self.drain.0 as f64 / 1000.0,
+            drain_us: self.bucket.drain_us(),
         }
     }
 }
@@ -1394,12 +1421,12 @@ mod tests {
         for i in 0..6 {
             c.arrive(t0 + i);
         }
-        assert_eq!((c.peak, c.exceeded.count), (6, 2));
+        assert_eq!((c.bucket.peak(), c.exceeded.count), (6, 2));
         // Two drains later the bucket holds 4, and one more packet makes 5.
         c.arrive(t0 + 2 * 454_546);
-        assert_eq!(c.level, 5);
+        assert_eq!(c.bucket.level, 5);
         c.arrive(t0 + 1_000_000_000);
-        assert_eq!(c.level, 1);
+        assert_eq!(c.bucket.level, 1);
     }
 
     #[test]
@@ -1416,7 +1443,7 @@ mod tests {
                 c.arrive(t + i);
             }
         }
-        assert_eq!((c.peak, c.exceeded.count), (20, 4 * bursts as u64));
+        assert_eq!((c.bucket.peak(), c.exceeded.count), (20, 4 * bursts as u64));
     }
 
     #[test]

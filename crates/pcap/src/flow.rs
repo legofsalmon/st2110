@@ -640,9 +640,11 @@ impl Flow {
             findings.extend(more);
             report
         });
-        if let Some(engine) = self.data.take() {
-            findings.extend(engine.finish(self.index, timeline));
-        }
+        let fast_metadata = self.data.take().and_then(|engine| {
+            let (more, report) = engine.finish(self.index, timeline);
+            findings.extend(more);
+            report
+        });
         let first = self.first.unwrap_or_default();
         let seconds = (self.last - first) as f64 / 1e9;
         let kind = self.kind.as_ref().expect("classified above");
@@ -666,6 +668,7 @@ impl Flow {
             video,
             audio,
             relative: None,
+            fast_metadata,
         };
         (report, findings)
     }

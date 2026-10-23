@@ -58,9 +58,9 @@ mod video;
 pub use analyser::{Analyser, analyse};
 pub use capture::{CaptureError, Format, Frame, Reader};
 pub use report::{
-    AudioReport, AudioWindow, Capture, CinstReport, Clock, Finding, FlowReport, GrandmasterQuality, LockingChange,
-    MessageCount, Outage, PairReport, PairWindow, PtpDomainReport, PtpPortReport, PtpReport, RelativeReport, Report,
-    SyncMetadataReport, TimescaleReport, VideoReport, VideoWindow, VrxReport,
+    AudioReport, AudioWindow, Capture, CinstReport, Clock, FastMetadataReport, Finding, FlowReport, GrandmasterQuality,
+    LockingChange, MessageCount, Outage, PairReport, PairWindow, PtpDomainReport, PtpPortReport, PtpReport,
+    RelativeReport, Report, SyncMetadataReport, TimescaleReport, VideoReport, VideoWindow, VrxReport,
 };
 pub use stats::Stats;
 

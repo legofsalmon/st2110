@@ -159,6 +159,9 @@ fn cases() -> Vec<(&'static str, String)> {
         ("jxsv-tr08", with(JPEG_XS, "packetmode=0", "packetmode=1")),
         ("jxsv-profile", with(JPEG_XS, "level=2k-1", "level=3k-1")),
         ("jxsv-bpp", with(JPEG_XS, "b=AS:116000", "b=AS:400000")),
+        ("jxsv-sublevel", with(JPEG_XS, "Sublev3bpp", "Sublev4bpp")),
+        ("jxsv-level-lowest", with(with(JPEG_XS, "width=1920", "width=1280"), "height=1080", "height=720")),
+        ("jxsv-level", with(JPEG_XS, "width=1920; height=1080", "width=3840; height=2160")),
         // ST 2110-30 and -31.
         ("audio-rate", with(AUDIO, "L24/48000/8", "L24/32000/8")),
         ("audio-ptime-missing", with(AUDIO, "a=ptime:1\n", "")),
@@ -325,6 +328,21 @@ fn valid_variations_raise_nothing() {
         with(VIDEO, "a=group:DUP", "a=group:PHASED"),
         // JPEG XS at a TR-08 profile, level and sublevel, in lower case.
         with(JPEG_XS, "level=2k-1", "level=2K-1"),
+        // TR-08 Appendix A: 720p59.94 at level 1k-1, Sublev3bpp.
+        with(with(with(JPEG_XS, "width=1920", "width=1280"), "height=1080", "height=720"), "level=2k-1", "level=1k-1"),
+        // 1920x1200p60 is over 2k-1's pixel rate, so 4k-2 is the lowest TR-08 level.
+        with(with(JPEG_XS, "height=1080; exactframerate=60000/1001", "height=1200; exactframerate=60"), "2k-1", "4k-2"),
+        // 2160p59.94 at 4k-2 and 2 bits a pixel; the sublevel in lower case.
+        with(
+            with(with(JPEG_XS, "width=1920; height=1080", "width=3840; height=2160"), "2k-1", "4k-2"),
+            "b=AS:116000",
+            "b=AS:1000000",
+        )
+        .replace("Sublev3bpp", "sublev3bpp"),
+        // 1080i59.94 counts a frame's pixels at the frame rate.
+        with(JPEG_XS, "exactframerate=60000/1001", "exactframerate=30000/1001; interlace"),
+        // Sublev4bpp above 3 bits a pixel.
+        with(with(JPEG_XS, "b=AS:116000", "b=AS:400000"), "Sublev3bpp", "Sublev4bpp"),
         // 525-line SD as RP 2110-24 carries it.
         sd("width=720; height=486", Some("10:11")),
         // Level C audio: 16 channels in 125 µs packets.
@@ -416,6 +434,52 @@ fn messages_suggest_the_fix() {
     assert_eq!(
         message(&troff, "multistream-troff"),
         "secondary has the default TROFF and primary has TROFF=500; the parts of a MULTI-2SI picture are read from one offset"
+    );
+}
+
+#[test]
+fn jpeg_xs_levels_by_the_published_tables() {
+    let message = |text: &str, rule: &str| {
+        let report = lint(text);
+        report.diagnostics.iter().find(|d| d.rule == rule).map(|d| d.message.clone()).unwrap()
+    };
+    let uhd = with(JPEG_XS, "width=1920; height=1080", "width=3840; height=2160");
+    assert_eq!(
+        message(&uhd, "jxsv-level"),
+        "level=2k-1 does not fit the picture, by the published level tables: width=3840 is over its 2048 pixels a row; \
+         3840x2160 is 8294400 pixels a picture, over its 4194304; 3840x2160 at 59.94 frames a second is 497.2 million \
+         pixels a second, over its 133.7 million"
+    );
+    assert_eq!(rules::find("jxsv-level").unwrap().severity, Severity::Warning);
+    // Only the pixel rate: 1920x1200p60 is 138.2 million pixels a second.
+    let wuxga = with(JPEG_XS, "height=1080; exactframerate=60000/1001", "height=1200; exactframerate=60");
+    assert!(message(&wuxga, "jxsv-level").ends_with("138.2 million pixels a second, over its 133.7 million"));
+    // Level names in any case, Bayer names and Unrestricted are known; others are not.
+    let unknown = with(JPEG_XS, "level=2k-1", "level=3k-1");
+    assert_eq!(
+        message(&unknown, "jxsv-level"),
+        "level=3k-1 is not a level the JPEG XS tables name, such as 2k-1 or 4k-2"
+    );
+    for level in ["level=2K-1", "level=Bayer4k-1", "level=unrestricted"] {
+        assert!(!ids(&with(JPEG_XS, "level=2k-1", level)).contains("jxsv-level"), "{level}");
+    }
+    let sublevel = with(JPEG_XS, "Sublev3bpp", "Sublev5bpp");
+    assert!(message(&sublevel, "jxsv-level").starts_with("sublevel=Sublev5bpp is not a sublevel"));
+    assert!(!ids(&with(JPEG_XS, "Sublev3bpp", "Sublev12bpp")).contains("jxsv-level"));
+    // TR-08's lowest level: 720p59.94 fits 1k-1.
+    let hd = with(with(JPEG_XS, "width=1920", "width=1280"), "height=1080", "height=720");
+    assert_eq!(
+        message(&hd, "jxsv-level-lowest"),
+        "level=2k-1, but 1280x720 at 59.94 frames a second fits level 1k-1, which is lower: TR-08 asks for the lowest \
+         level that fits"
+    );
+    // A level outside TR-08's is left to jxsv-profile.
+    assert!(!ids(&with(hd, "level=2k-1", "level=4k-1")).contains("jxsv-level-lowest"));
+    let four = with(JPEG_XS, "Sublev3bpp", "Sublev4bpp");
+    assert_eq!(
+        message(&four, "jxsv-sublevel"),
+        "sublevel=Sublev4bpp, but b=AS:116000 is 0.9 bits a pixel: TR-08 signals Sublev3bpp up to 3 (Sublev2bpp in \
+         capability sets E and F), and Sublev4bpp only above 3"
     );
 }
 
