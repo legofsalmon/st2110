@@ -245,6 +245,18 @@ impl Http {
         })
     }
 
+    /// Sends a JSON `PATCH`, with the token as [`Http::get`] sends it.
+    fn patch(&self, url: &str, body: &Value) -> Result<Response, Error> {
+        self.authorized(url, |bearer| {
+            let mut request =
+                self.agent.patch(url).header("Accept", "application/json").header("Content-Type", "application/json");
+            if let Some(bearer) = bearer {
+                request = request.header("Authorization", format!("Bearer {bearer}"));
+            }
+            request.send(body.to_string())
+        })
+    }
+
     /// Sends a request with no body, with the token as [`Http::get`] sends it.
     fn post_empty(&self, url: &str) -> Result<Response, Error> {
         self.authorized(url, |bearer| {
@@ -917,5 +929,109 @@ impl RegistrationClient {
     pub fn delete(&self, kind: Kind, id: &str) -> Result<Reply, Error> {
         let url = format!("{}resource/{}/{id}", self.base, kind.plural());
         self.http.delete(&url).map(Self::reply)
+    }
+}
+
+/// A client of a Node's IS-13 Annotation API (the v1.0 draft: see
+/// [`crate::annotation`]), which reads and changes the label, description and tags of
+/// the Node's resources.
+///
+/// ```no_run
+/// use serde_json::json;
+/// use st2110_nmos::Kind;
+/// use st2110_nmos::client::{AnnotationClient, Options};
+///
+/// let node = AnnotationClient::connect("http://192.168.10.21:8080", &Options::default())?;
+/// let reply = node.annotate(Kind::Node, "", &json!({"label": "Camera 1"}))?;
+/// assert_eq!(reply.status, 200, "{}", reply.error());
+/// # Ok::<_, st2110_nmos::client::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct AnnotationClient {
+    http: Http,
+    base: String,
+}
+
+impl AnnotationClient {
+    /// Finds a Node's Annotation API v1.0. `url` may be the API itself
+    /// (`…/x-nmos/annotation/` or `…/x-nmos/annotation/v1.0/`), or the Node, by its
+    /// address or its Node API, whose `services` then name the API (IS-13
+    /// Interoperability: IS-04, Discovery).
+    pub fn connect(url: &str, options: &Options) -> Result<Self, Error> {
+        let http = Http::new(options);
+        let trimmed = url.trim().trim_end_matches('/');
+        if !is_http(trimmed) {
+            return Err(error(url, "not an http:// or https:// URL"));
+        }
+        let version = crate::annotation::VERSION;
+        if let Some((root, rest)) = trimmed.split_once("/x-nmos/annotation") {
+            return match rest.trim_matches('/') {
+                "" => Ok(Self { http, base: format!("{root}/x-nmos/annotation/{version}/") }),
+                v if v == version => Ok(Self { http, base: format!("{trimmed}/") }),
+                other => {
+                    Err(error(url, format!("{other} is not the Annotation API version this client speaks ({version})")))
+                }
+            };
+        }
+        let node = NodeClient::connect(url, options)?;
+        let this = node.list(Kind::Node)?.pop().unwrap_or_default();
+        match crate::annotation::service_href(&this) {
+            Some(base) => Ok(Self { http, base }),
+            None => Err(error(
+                node.base(),
+                format!("the Node lists no {} service in its services", crate::annotation::SERVICE_TYPE),
+            )),
+        }
+    }
+
+    /// The versioned base URL, ending in `/`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    fn url(&self, kind: Kind, id: &str) -> String {
+        if kind == Kind::Node {
+            format!("{}node/self", self.base)
+        } else {
+            format!("{}node/{}/{id}", self.base, kind.plural())
+        }
+    }
+
+    /// The ids of the resources of one type the API annotates: for [`Kind::Node`], none.
+    pub fn list(&self, kind: Kind) -> Result<Vec<String>, Error> {
+        if kind == Kind::Node {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}node/{}/", self.base, kind.plural());
+        let ids: Vec<String> = self.http.json(&url, "a JSON array of ids")?;
+        Ok(ids.into_iter().map(|id| id.trim_end_matches('/').to_string()).collect())
+    }
+
+    /// The type and whole id of the resource whose id is `id`, or starts with it:
+    /// `None` when none does, and an error when more than one does.
+    pub fn find(&self, id: &str) -> Result<Option<(Kind, String)>, Error> {
+        let mut found = Vec::new();
+        for kind in Kind::ALL.into_iter().filter(|k| *k != Kind::Node) {
+            found.extend(self.list(kind)?.into_iter().filter(|i| i.starts_with(id)).map(|i| (kind, i)));
+        }
+        match found.len() {
+            0 | 1 => Ok(found.pop()),
+            n => Err(error(&self.base, format!("{n} resources have ids that start with {id}"))),
+        }
+    }
+
+    /// A resource's annotations, with its `id` and `version`: `id` is ignored for the
+    /// Node itself.
+    pub fn get(&self, kind: Kind, id: &str) -> Result<Reply, Error> {
+        let response = self.http.get(&self.url(kind, id), "application/json", BODY_LIMIT)?;
+        Ok(RegistrationClient::reply(response))
+    }
+
+    /// Changes a resource's annotations: `patch` holds `label`, `description` and
+    /// `tags`, each a value, or null to reset it. Gives the resource as it is after,
+    /// with 200, or the API's error: 400 for a request it cannot read, 500 for one it
+    /// will not do (a read-only tag, say), whose `error` the draft asks a client to show.
+    pub fn annotate(&self, kind: Kind, id: &str, patch: &Value) -> Result<Reply, Error> {
+        self.http.patch(&self.url(kind, id), patch).map(RegistrationClient::reply)
     }
 }

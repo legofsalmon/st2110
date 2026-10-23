@@ -110,6 +110,20 @@ fn cases() -> Vec<(&'static str, Snapshot)> {
         ("transport-address", with(|v| v["senders"][1]["transport"] = json!("urn:x-nmos:transport:rtp.ucast"))),
         ("flow-sdp", with(|v| v["flows"][1]["bit_depth"] = json!(16))),
         ("sender-sdp", with(|v| v["senders"][0]["st2110_21_sender_type"] = json!("2110TPW"))),
+        (
+            "mxl-transport",
+            with(|v| {
+                // An MXL Receiver that names no media type.
+                let mut mxl = v["receivers"][1].clone();
+                mxl["id"] = json!("7ecf0009-0000-4000-8000-000000000009");
+                mxl["label"] = json!("MON 1 MXL");
+                mxl["transport"] = json!("urn:x-nmos:transport:mxl");
+                mxl["interface_bindings"] = json!([]);
+                mxl["subscription"] = json!({"active": false, "sender_id": null});
+                mxl["caps"] = json!({"media_types": []});
+                v["receivers"].as_array_mut().unwrap().push(mxl);
+            }),
+        ),
         ("group-hint", with(|v| v["senders"][0]["tags"] = json!({GROUPHINT: ["CAM 1:Video:system"]}))),
         ("asset-tags", with(|v| v["nodes"][0]["tags"] = json!({MANUFACTURER: ["Acme"]}))),
         (

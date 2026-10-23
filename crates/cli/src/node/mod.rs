@@ -40,8 +40,15 @@
 //!
 //! The Device also has an IS-12 control endpoint ([`ncp`]) with a BCP-008 status
 //! monitor of the Sender or Receiver ([`monitor`]), which `st2110 send` and `st2110
-//! receive` feed with what the stream does.
+//! receive` feed with what the stream does, and the same model over HTTP by IS-14
+//! ([`configuration`]), with a backup of its properties and their restore.
+//!
+//! The Node serves IS-13's Annotation API too ([`annotation`], a draft upstream): a
+//! controller relabels, describes and tags the Node and its resources, which are
+//! registered again with each change, and the changes are kept for the next run.
 
+mod annotation;
+mod configuration;
 pub(crate) mod connection;
 pub(crate) mod mapping;
 pub(crate) mod monitor;
@@ -51,7 +58,7 @@ mod resources;
 mod sending;
 mod tls;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -137,6 +144,11 @@ pub(crate) struct NodeArgs {
     /// The private key of --tls-cert, PEM (PKCS #8, PKCS #1 or SEC1).
     #[arg(long, value_name = "FILE", requires = "tls_cert", help_heading = "NMOS")]
     pub tls_key: Option<PathBuf>,
+    /// Where to keep the labels, descriptions and tags controllers give the Node's
+    /// resources through its IS-13 Annotation API, for the next run with the same ids:
+    /// node-annotations.json beside the router's state when omitted.
+    #[arg(long, value_name = "FILE", requires = "nmos", help_heading = "NMOS")]
+    pub annotations: Option<PathBuf>,
     #[command(flatten, next_help_heading = "NMOS")]
     pub auth: crate::auth::Auth,
 }
@@ -220,8 +232,10 @@ struct State {
     none: BTreeMap<String, Endpoint>,
     role: Box<dyn Role>,
     tai_utc: i32,
-    /// Whether the Sender or Receiver changed since it was last registered.
-    changed: bool,
+    /// The resources, by index, that changed since they were last registered.
+    changed: BTreeSet<usize>,
+    /// What IS-13 resets the resources' annotations to, and where it keeps changes.
+    annotations: annotation::Kept,
     stopping: bool,
     /// The IS-12 Device model, with the monitor.
     ncp: ncp::Model,
@@ -282,7 +296,7 @@ impl Control for State {
         let resource = self.endpoint_resource();
         resource["subscription"] = subscription;
         resource["version"] = json!(tai(at));
-        self.changed = true;
+        self.changed.insert(self.resources.len() - 1);
         self.counters.bump(match side {
             Side::Sender => Kind::Sender,
             Side::Receiver => Kind::Receiver,
@@ -478,14 +492,20 @@ impl Node {
             ncp::Identity { side, label: &label, device_id: &ids.device, endpoint_id: &ids.endpoint, hostname: &name };
         let active = endpoint.active["master_enable"] == true;
         let model = ncp::Model::new(&identity, &sync, active, Instant::now());
+        let kept = args
+            .annotations
+            .clone()
+            .or_else(|| crate::router::default_state().map(|state| state.with_file_name("node-annotations.json")));
+        let annotations = annotation::Kept::load(&mut resources, kept);
         let state = State {
             resources,
+            annotations,
             side,
             endpoints: BTreeMap::from([(ids.endpoint.clone(), endpoint)]),
             none: BTreeMap::new(),
             role,
             tai_utc,
-            changed: false,
+            changed: BTreeSet::new(),
             stopping: false,
             ncp: model,
             addresses: addresses.to_vec(),
@@ -585,7 +605,7 @@ fn tick(shared: &Shared) {
                 return;
             }
             connection::settle(&mut *state);
-            if state.changed {
+            if !state.changed.is_empty() {
                 shared.wake.notify_all();
             }
             let now = Instant::now();
@@ -708,16 +728,27 @@ fn answer(shared: &Shared, request: &Request) -> Response {
     let read = |list: Value| if method == "GET" { (200, list) } else { error(405, "Method Not Allowed", "") };
     let (status, body) = match path {
         "" => read(json!(["x-nmos/"])),
-        "/x-nmos" => read(json!(["node/", "connection/", "ncp/"])),
+        "/x-nmos" => read(json!(["node/", "connection/", "ncp/", "annotation/", "configuration/"])),
         "/x-nmos/ncp" => read(json!(["v1.0/"])),
         "/x-nmos/node" => read(json!(["v1.3/"])),
         "/x-nmos/connection" => read(json!([format!("{CONNECTION_VERSION}/")])),
-        _ => match (under(path, "/x-nmos/node/v1.3"), under(path, &format!("/x-nmos/connection/{CONNECTION_VERSION}")))
-        {
-            (Some(rest), _) => node_api(&state, method, rest),
-            (_, Some(rest)) => return connection::route(&mut *state, method, rest, &body),
-            _ => error(404, "Not Found", "this Node serves IS-04 v1.3 and IS-05 v1.2"),
-        },
+        "/x-nmos/annotation" => read(json!([format!("{}/", st2110_nmos::annotation::VERSION)])),
+        "/x-nmos/configuration" => read(json!([format!("{}/", configuration::VERSION)])),
+        _ => {
+            if let Some(rest) = under(path, &format!("/x-nmos/configuration/{}", configuration::VERSION)) {
+                return configuration::route(&mut state.ncp, request, rest, &body);
+            }
+            match (
+                under(path, "/x-nmos/node/v1.3"),
+                under(path, &format!("/x-nmos/connection/{CONNECTION_VERSION}")),
+                under(path, &format!("/x-nmos/annotation/{}", st2110_nmos::annotation::VERSION)),
+            ) {
+                (Some(rest), _, _) => node_api(&state, method, rest),
+                (_, Some(rest), _) => return connection::route(&mut *state, method, rest, &body),
+                (_, _, Some(rest)) => annotation::route(&mut state, method, rest, &body),
+                _ => error(404, "Not Found", "this Node serves IS-04 v1.3, IS-05 v1.2, IS-13 v1.0 and IS-14 v1.0"),
+            }
+        }
     };
     Response::json(status, &body)
 }
@@ -843,7 +874,7 @@ impl Registrar {
             let (stopping, changed) = {
                 let mut state = self.shared.lock();
                 loop {
-                    if state.stopping || (state.changed && registry.is_some()) {
+                    if state.stopping || (!state.changed.is_empty() && registry.is_some()) {
                         break;
                     }
                     let now = Instant::now();
@@ -852,7 +883,14 @@ impl Registrar {
                     }
                     state = self.shared.wake.wait_timeout(state, due - now).map_or_else(|e| e.into_inner().0, |r| r.0);
                 }
-                let changed = registry.is_some() && std::mem::take(&mut state.changed);
+                let changed: Vec<(Kind, Value)> = if registry.is_some() {
+                    std::mem::take(&mut state.changed)
+                        .into_iter()
+                        .filter_map(|i| state.resources.get(i).cloned())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 (state.stopping, changed)
             };
             if stopping {
@@ -877,15 +915,17 @@ impl Registrar {
                 }
                 continue;
             };
-            let lost = if changed {
-                let endpoint = self.shared.lock().resources.last().cloned();
-                match endpoint.map(|(kind, resource)| registered.client.register(kind, &resource)) {
-                    Some(Ok(reply)) if matches!(reply.status, 200 | 201) => None,
-                    Some(Ok(reply)) if reply.status == 404 => self.again(&registered.client),
-                    Some(Ok(reply)) => Some(reply.error()),
-                    Some(Err(e)) => Some(e.to_string()),
-                    None => None,
-                }
+            let lost = if !changed.is_empty() {
+                // In the order they are registered, the Node first.
+                changed
+                    .iter()
+                    .find_map(|(kind, resource)| match registered.client.register(*kind, resource) {
+                        Ok(reply) if matches!(reply.status, 200 | 201) => None,
+                        Ok(reply) if reply.status == 404 => Some(self.again(&registered.client)),
+                        Ok(reply) => Some(Some(reply.error())),
+                        Err(e) => Some(Some(e.to_string())),
+                    })
+                    .flatten()
             } else if Instant::now() >= due {
                 due += HEARTBEAT;
                 let node = self.shared.lock().resources[0].1["id"].as_str().unwrap_or_default().to_string();
@@ -1321,6 +1361,105 @@ mod tests {
         assert_eq!((heard.oid, heard.value), (4, json!(1)));
         ncp.close();
         assert_eq!(node.finish(), None, "never registered");
+    }
+
+    /// A registry on this machine that takes every registration and keeps what it was
+    /// given: gives its URL and what it kept.
+    fn registry() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}/x-nmos/registration/v1.3/", listener.local_addr().unwrap());
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let keeping = kept.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let Ok(Some(request)) = http::read(&stream) else { continue };
+                let path = request.path.trim_end_matches('/');
+                let response = match (request.method.as_str(), path) {
+                    ("GET", "/x-nmos/registration") => Response::json(200, &json!(["v1.3/"])),
+                    ("GET", _) => Response::json(200, &json!(["resource/", "health/"])),
+                    ("POST", "/x-nmos/registration/v1.3/resource") => {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+                        keeping.lock().unwrap().push(body.clone());
+                        Response::json(201, &body["data"])
+                    }
+                    ("DELETE", _) => {
+                        Response { status: 204, content_type: "text/plain", headers: Vec::new(), body: Vec::new() }
+                    }
+                    _ => Response::json(200, &json!({"health": "1"})),
+                };
+                let _ = http::write(&stream, &response);
+            }
+        });
+        (url, kept)
+    }
+
+    /// IS-13: a change to a resource's annotations gives it a later version, registers
+    /// it again and is kept for the next run; a reset goes back to what the Node gave,
+    /// and a read-only tag stays as it is. IS-14 reads the same Device's model.
+    #[test]
+    fn annotates_its_resources_and_registers_them_again() {
+        use st2110_nmos::client::{AnnotationClient, Options};
+        let dir = std::env::temp_dir().join(format!("st2110-node-annotations-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (url, kept) = registry();
+        let mut args = NodeArgs { nmos: Some(url), ..NodeArgs::default() };
+        args.auth.look.mdns = Some(test_group());
+        args.annotations = Some(dir.join("annotations.json"));
+        let (mut node, _tuning) = receiver_node(&args);
+        let registered = |kind: &str, at_least: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let found: Vec<Value> =
+                    kept.lock().unwrap().iter().filter(|r| r["type"] == kind).map(|r| r["data"].clone()).collect();
+                if found.len() >= at_least {
+                    return found.last().cloned().unwrap();
+                }
+                assert!(Instant::now() < deadline, "{kind} registered fewer than {at_least} times");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let device = registered("device", 1);
+        let client = AnnotationClient::connect(&node.api, &Options { timeout: TIMEOUT, ..Options::default() }).unwrap();
+        assert!(client.base().ends_with("/x-nmos/annotation/v1.0/"), "{}", client.base());
+        let id = device["id"].as_str().unwrap();
+        assert_eq!(client.list(Kind::Device).unwrap(), [id]);
+        assert_eq!(client.find(&id[..8]).unwrap(), Some((Kind::Device, id.to_string())));
+        let patch = json!({"label": "Booth monitor", "tags": {"urn:x-nmos:tag:user:room": ["B2"]}});
+        let reply = client.annotate(Kind::Device, id, &patch).unwrap();
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(reply.body["label"], "Booth monitor");
+        let again = registered("device", 2);
+        assert_eq!(again["label"], "Booth monitor");
+        assert_eq!(again["tags"]["urn:x-nmos:tag:user:room"], json!(["B2"]));
+        assert_ne!(again["version"], device["version"]);
+        assert!(get(&format!("{}devices/{id}", node.api)).unwrap().contains("Booth monitor"));
+        let saved = std::fs::read_to_string(dir.join("annotations.json")).unwrap();
+        assert!(saved.contains("Booth monitor"), "{saved}");
+
+        // Refused: a read-only tag, and what is not an annotation.
+        let refused =
+            client.annotate(Kind::Device, id, &json!({"tags": {"urn:x-nmos:tag:asset:serial-number/v1.0": ["1"]}}));
+        assert_eq!(refused.unwrap().status, 500);
+        assert_eq!(client.annotate(Kind::Device, id, &json!({"id": "x"})).unwrap().status, 400);
+        assert_eq!(client.annotate(Kind::Sender, "nobody", &json!({})).unwrap().status, 404);
+
+        // The Node itself, then a reset.
+        assert_eq!(client.annotate(Kind::Node, "", &json!({"description": "rack 4"})).unwrap().status, 200);
+        assert_eq!(registered("node", 2)["description"], "rack 4");
+        let reset = client.annotate(Kind::Device, id, &json!({"label": null, "tags": null})).unwrap();
+        assert_eq!((reset.body["label"].clone(), reset.body["tags"].clone()), (device["label"].clone(), json!({})));
+
+        // IS-14 on the same port, as the Device lists it.
+        let controls = &registered("device", 3)["controls"];
+        let configuration = controls[2]["href"].as_str().unwrap().to_string();
+        let paths = get(&format!("{configuration}rolePaths/")).unwrap();
+        assert!(paths.starts_with("HTTP/1.1 200") && paths.contains("root.receiver-monitor/"), "{paths}");
+        let backup = get(&format!("{configuration}rolePaths/root/bulkProperties?includeDescriptors=false")).unwrap();
+        assert!(backup.contains("validationFingerprint"), "{backup}");
+        let listed = get(&node.api.replace("node/v1.3/", "")).unwrap();
+        assert!(listed.contains("annotation/") && listed.contains("configuration/"), "{listed}");
+        assert!(node.finish().is_some(), "registered");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An Authorization Server on this machine that publishes `key`: gives its issuer.
