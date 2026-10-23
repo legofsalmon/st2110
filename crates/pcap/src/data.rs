@@ -4,10 +4,10 @@
 
 use st2110_sdp::{Essence, Rational, Rule};
 
-use crate::report::Finding;
+use crate::report::{FastMetadataReport, Finding};
 use crate::rtp::{self, AncField, AncPacket, Header};
 use crate::stats::{NANOS, Tally};
-use crate::video::{round_div, unwrap};
+use crate::video::{Bucket, round_div, unwrap};
 use crate::{Timeline, plural, rules};
 
 /// The RTP clock rate of ancillary data, in Hz (ST 2110-40:2023 §5.3).
@@ -15,6 +15,12 @@ const ANC_CLOCK: i128 = 90_000;
 
 /// The longest a fast metadata stream may go without a packet (ST 2110-41:2026 §5.1).
 const FMX_INTERVAL: i128 = 500_000_000;
+
+/// The shortest time ST 2110-41:2026 §7 asks R_NOMINAL be averaged over.
+const NCM_AVERAGE: i128 = 10 * NANOS;
+
+/// Arrivals held until R_NOMINAL is known. A stream with more takes R_NOMINAL from these.
+const NCM_HOLD: usize = 4_000_000;
 
 /// The fewest total lines of any format in ST 2059-1:2021 §7, which makes the longest
 /// LLTM T_D of ST 2110-40:2023 §6.4 at a frame rate.
@@ -104,12 +110,13 @@ impl DataEngine {
         }
     }
 
-    pub(crate) fn finish(self, flow: usize, timeline: &Timeline) -> Vec<Finding> {
+    /// The findings, and the fast metadata measurements for an ST 2110-41 stream.
+    pub(crate) fn finish(self, flow: usize, timeline: &Timeline) -> (Vec<Finding>, Option<FastMetadataReport>) {
         match self {
-            Self::Anc(engine) => engine.finish(flow, timeline),
-            Self::Am824(engine) => engine.finish(flow, timeline),
+            Self::Anc(engine) => (engine.finish(flow, timeline), None),
+            Self::Am824(engine) => (engine.finish(flow, timeline), None),
             Self::Fmx(engine) => engine.finish(flow, timeline),
-            Self::Ttml(engine) => engine.finish(flow, timeline),
+            Self::Ttml(engine) => (engine.finish(flow, timeline), None),
         }
     }
 }
@@ -587,8 +594,8 @@ impl Am824Engine {
     }
 }
 
-/// ST 2110-41 fast metadata: the marker bit, the longest wait for a packet, and the
-/// Data Item Packages.
+/// ST 2110-41 fast metadata: the marker bit, the longest wait for a packet, the Data
+/// Item Packages and the network compatibility model.
 #[derive(Default)]
 pub(crate) struct FmxEngine {
     /// The last packet's arrival and sequence number.
@@ -596,6 +603,118 @@ pub(crate) struct FmxEngine {
     marker: Tally,
     silent: Tally,
     payload: Problems,
+    ncm: Ncm,
+}
+
+/// The ST 2110-41:2026 §7 network compatibility model: the ST 2110-21 bucket, drained
+/// at a rate and judged against a C_MAX that both follow from R_NOMINAL, the stream's
+/// long-term average packet rate. That is known only at the end, so arrivals are held
+/// until then.
+#[derive(Default)]
+struct Ncm {
+    /// The first arrival, which held arrivals count from.
+    first: Option<i128>,
+    last: i128,
+    packets: u64,
+    held: Vec<i64>,
+    run: Option<NcmRun>,
+}
+
+/// The model, once R_NOMINAL is known.
+struct NcmRun {
+    bucket: Bucket,
+    /// R_NOMINAL as packets over nanoseconds.
+    rate: (u64, i128),
+    cmax: u32,
+    exceeded: Tally,
+}
+
+impl Ncm {
+    fn push(&mut self, t: i128) {
+        self.packets += 1;
+        let first = *self.first.get_or_insert(t);
+        self.last = self.last.max(t);
+        if let Some(run) = &mut self.run {
+            run.arrive(t);
+            return;
+        }
+        self.held.push(i64::try_from(t - first).unwrap_or(i64::MAX));
+        if self.held.len() >= NCM_HOLD {
+            self.start();
+        }
+    }
+
+    /// Works out R_NOMINAL from the packets so far and runs the held arrivals through the
+    /// bucket. It needs two packets, some time apart.
+    fn start(&mut self) {
+        let Some(first) = self.first else { return };
+        let span = self.last - first;
+        if self.packets < 2 || span <= 0 {
+            return;
+        }
+        let packets = self.packets - 1;
+        let n = i128::from(packets);
+        // 1 ÷ T_DRAIN = MAX(800, 1.1 × R_NOMINAL) drains a second, as drains a nanosecond.
+        let drain = if 11 * n * NANOS > 8000 * span { (11 * n, 10 * span) } else { (800, NANOS) };
+        let cmax = u32::try_from(n * NANOS / (43_200 * span)).unwrap_or(u32::MAX).max(4);
+        let mut run = NcmRun { bucket: Bucket::new(drain), rate: (packets, span), cmax, exceeded: Tally::default() };
+        for offset in std::mem::take(&mut self.held) {
+            run.arrive(first + i128::from(offset));
+        }
+        self.run = Some(run);
+    }
+
+    fn finish(mut self, flow: usize, timeline: &Timeline) -> Option<(FastMetadataReport, Option<Finding>)> {
+        if self.run.is_none() {
+            self.start();
+        }
+        let run = self.run?;
+        let (packets, span) = run.rate;
+        let report = FastMetadataReport {
+            r_nominal: packets as f64 * 1e9 / span as f64,
+            averaged_s: span as f64 / 1e9,
+            estimate: span < NCM_AVERAGE,
+            drain_us: run.bucket.drain_us(),
+            cmax: run.cmax,
+            peak: run.bucket.peak(),
+        };
+        let finding = (run.exceeded.count > 0).then(|| {
+            let average = if report.estimate {
+                format!(
+                    "averaged over the whole capture's {:.1} s, short of the 10 s ST 2110-41 asks for, so it and C_MAX are estimates",
+                    report.averaged_s
+                )
+            } else {
+                format!("averaged over {:.1} s", report.averaged_s)
+            };
+            let message = format!(
+                "CINST reached {}, over C_MAX {}, on {}; T_DRAIN is {:.1} µs, from an R_NOMINAL of {:.1} packets a second {average}",
+                report.peak,
+                report.cmax,
+                plural(run.exceeded.count, "packet"),
+                report.drain_us,
+                report.r_nominal
+            );
+            Finding::new(
+                &rules::FMX_CINST,
+                message,
+                Some(flow),
+                None,
+                timeline.at(run.exceeded.first),
+                run.exceeded.count,
+            )
+        });
+        Some((report, finding))
+    }
+}
+
+impl NcmRun {
+    fn arrive(&mut self, t: i128) {
+        let level = self.bucket.arrive(t);
+        if level > u64::from(self.cmax) {
+            self.exceeded.hit_max(t, level as f64);
+        }
+    }
 }
 
 impl FmxEngine {
@@ -612,9 +731,10 @@ impl FmxEngine {
         if let Some(problem) = fmx_problem(p.payload) {
             self.payload.hit(p.t, || problem);
         }
+        self.ncm.push(p.t);
     }
 
-    fn finish(self, flow: usize, timeline: &Timeline) -> Vec<Finding> {
+    fn finish(self, flow: usize, timeline: &Timeline) -> (Vec<Finding>, Option<FastMetadataReport>) {
         let mut findings = Vec::new();
         let mut add = |rule: &'static Rule, tally: &Tally, message: String| {
             if tally.count > 0 {
@@ -636,7 +756,9 @@ impl FmxEngine {
             ),
         );
         findings.extend(self.payload.finding(&rules::FMX_PAYLOAD, flow, timeline, "had malformed payloads"));
-        findings
+        let (report, finding) = self.ncm.finish(flow, timeline).unzip();
+        findings.extend(finding.flatten());
+        (findings, report)
     }
 }
 
@@ -787,6 +909,37 @@ impl TtmlEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fast_metadata_bucket_follows_r_nominal() {
+        let timeline = Timeline { start: 0, shift: 0 };
+        // 300 000 packets a second, evenly: C_MAX is INT(300 000 ÷ 43 200) = 6 and the
+        // bucket drains at 330 000 a second, so it never holds more than 1.
+        let mut ncm = Ncm::default();
+        for k in 0..30_000 {
+            ncm.push(1_000 * NANOS + k * 10_000 / 3);
+        }
+        let (report, finding) = ncm.finish(1, &timeline).unwrap();
+        assert!(finding.is_none());
+        assert_eq!((report.cmax, report.peak, report.estimate), (6, 1, true));
+        assert!((report.r_nominal - 300_000.0).abs() < 1.0 && (report.drain_us - 1e6 / 330_000.0).abs() < 1e-3);
+        // At 100 packets a second it drains at the floor of 800 a second: seven packets
+        // within one T_DRAIN of 1.25 ms overfill a C_MAX of 4, held until the end.
+        let mut ncm = Ncm::default();
+        for k in 0..1_100 {
+            let burst = if k == 500 { 7 } else { 1 };
+            for j in 0..burst {
+                ncm.push(1_000 * NANOS + k * 10_000_000 + j * 100_000);
+            }
+        }
+        let (report, finding) = ncm.finish(1, &timeline).unwrap();
+        assert_eq!((report.cmax, report.peak, report.estimate, report.drain_us), (4, 7, false, 1250.0));
+        assert_eq!(finding.unwrap().count, 3);
+        // One packet gives no rate.
+        let mut ncm = Ncm::default();
+        ncm.push(0);
+        assert!(ncm.finish(1, &timeline).is_none());
+    }
 
     #[test]
     fn reads_data_item_packages() {
