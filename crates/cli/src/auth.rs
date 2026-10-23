@@ -59,6 +59,11 @@ pub(crate) struct Auth {
     /// The scopes to ask the Authorization Server for.
     #[arg(long, value_name = "SCOPES", default_value = SCOPES)]
     pub scope: String,
+    /// Trust only the certificate authorities in FILE (PEM) for https:// and wss://,
+    /// in place of the system's, as curl's --cacert does: for a facility's own CA, such
+    /// as the one that signed a Node's --tls-cert.
+    #[arg(long, value_name = "FILE")]
+    pub ca: Option<PathBuf>,
     #[command(flatten)]
     pub look: LookArgs,
 }
@@ -72,6 +77,14 @@ pub(crate) enum Proof<'a> {
 }
 
 impl Auth {
+    /// Trusts only the certificate authorities in --ca, when it is given, for every
+    /// request this run makes over TLS.
+    pub(crate) fn trust(&self) -> Result<(), String> {
+        let Some(path) = &self.ca else { return Ok(()) };
+        let pem = std::fs::read(path).map_err(|e| format!("--ca {}: {e}", path.display()))?;
+        st2110_nmos::tls::trust_only(&pem).map(drop).map_err(|e| format!("--ca {}: {e}", path.display()))
+    }
+
     /// The token these options name, if any.
     pub(crate) fn token(&self, timeout: Duration, env_proxy: bool) -> Result<Option<Token>, String> {
         self.token_with(timeout, env_proxy, &Proof::Secret)

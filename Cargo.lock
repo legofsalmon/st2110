@@ -3256,6 +3256,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "minifb",
+ "rustls",
  "serde",
  "serde_json",
  "st2110-connect",

@@ -430,6 +430,11 @@ impl Verifier {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::json;
 
     use super::*;
@@ -543,6 +548,90 @@ mod tests {
             header,
             "Bearer realm=\"st2110\", error=\"invalid_token\", error_description=\"the 'token' ' ran out\", scope=\"connection\""
         );
+    }
+
+    /// An Authorization Server on this machine that publishes `jwks`, whatever it holds
+    /// at the time: gives its issuer, and how many times its metadata and its keys were
+    /// read.
+    fn authorization_server(jwks: Arc<Mutex<Value>>) -> (String, Arc<[AtomicUsize; 2]>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}/", listener.local_addr().unwrap());
+        let reads: Arc<[AtomicUsize; 2]> = Arc::default();
+        let (counted, metadata) = (reads.clone(), json!({"issuer": issuer, "jwks_uri": format!("{issuer}jwks")}));
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                let path = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or_default().to_string();
+                let body = if path.ends_with("/jwks") {
+                    counted[1].fetch_add(1, Ordering::SeqCst);
+                    jwks.lock().unwrap().to_string()
+                } else {
+                    counted[0].fetch_add(1, Ordering::SeqCst);
+                    metadata.to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (issuer, reads)
+    }
+
+    /// The Authorization Server moves to a new key: a token that names it has the keys
+    /// read again, but not more often than every [`READ_AGAIN`], however many tokens name
+    /// keys it does not have.
+    #[test]
+    fn reads_the_keys_again_for_a_new_key_at_most_every_five_seconds() {
+        let (old, new, unknown) =
+            (SigningKey::generate().unwrap(), SigningKey::generate().unwrap(), SigningKey::generate().unwrap());
+        let jwks = Arc::new(Mutex::new(old.jwks()));
+        let (issuer, reads) = authorization_server(jwks.clone());
+        let read = |which: usize| reads[which].load(Ordering::SeqCst);
+        let token = |key: &SigningKey| {
+            key.sign(
+                &json!({"iss": issuer, "sub": "x", "aud": "*", "exp": unix_now() + 60, "x-nmos-node": {"read": ["*"]}}),
+            )
+            .unwrap()
+        };
+        let verifier = Verifier::new(&issuer, names(), Duration::from_secs(5), false).unwrap();
+        verifier.read_keys().unwrap();
+        assert_eq!((read(0), read(1)), (1, 1));
+        assert!(verifier.check(&token(&old)).unwrap().permits("node", false, "self"));
+        assert_eq!(read(1), 1, "the key it has needs no reading");
+
+        // The server adds a key, and signs with it: the keys were read just now, so a
+        // token that names the new one is refused rather than have the server asked.
+        let both = json!({"keys": [old.jwks()["keys"][0], new.jwks()["keys"][0]]});
+        *jwks.lock().unwrap() = both;
+        let refused = verifier.check(&token(&new)).unwrap_err();
+        assert_eq!((refused.status, refused.error), (401, "invalid_token"), "{refused}");
+        assert_eq!(read(1), 1, "not read again within {READ_AGAIN:?}");
+
+        // Once that long has passed, the token has them read again, and is taken.
+        let wind_back = |verifier: &Verifier| {
+            let mut keys = verifier.keys.lock().unwrap();
+            keys.read = keys.read.and_then(|at| at.checked_sub(READ_AGAIN));
+        };
+        wind_back(&verifier);
+        assert!(verifier.check(&token(&new)).is_ok());
+        assert_eq!((read(0), read(1)), (1, 2), "the keys read again, the metadata kept");
+        // A key no one has, named just after, is refused without asking again…
+        assert!(verifier.check(&token(&unknown)).is_err());
+        assert!(verifier.check(&token(&unknown)).is_err());
+        assert_eq!(read(1), 2);
+        // …and the old key and the new still work.
+        assert!(verifier.check(&token(&old)).is_ok() && verifier.check(&token(&new)).is_ok());
+        // A key no one has, named after that long, is asked about once more, and refused.
+        wind_back(&verifier);
+        let refused = verifier.check(&token(&unknown)).unwrap_err();
+        assert!(refused.description.contains("key"), "{refused}");
+        assert_eq!(read(1), 3);
     }
 
     #[test]

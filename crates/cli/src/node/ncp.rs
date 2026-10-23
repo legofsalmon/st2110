@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,7 +30,8 @@ use st2110_nmos::ws::{self, Frame};
 
 use super::connection::Side;
 use super::monitor::{MOST_DELAY, Monitor, Sync};
-use crate::http::{self, Request, Response};
+use super::tls::Conn;
+use crate::http::{self, Request, Response, Stream};
 
 /// Where the endpoint is, on the Node's port.
 pub(crate) const PATH: &str = "/x-nmos/ncp/v1.0";
@@ -434,14 +434,14 @@ impl Model {
 /// A controller connected to the endpoint.
 pub(crate) struct Session {
     id: u64,
-    stream: Mutex<TcpStream>,
+    stream: Mutex<Conn>,
     subscribed: Mutex<BTreeSet<u64>>,
 }
 
 impl Session {
     fn send(&self, frame: &Frame) -> io::Result<()> {
-        let mut stream = self.stream.lock().map_err(|_| io::Error::other("the connection failed"))?;
-        ws::write_frame(&mut *stream, frame, None)
+        let stream = self.stream.lock().map_err(|_| io::Error::other("the connection failed"))?;
+        ws::write_frame(&mut &*stream, frame, None)
     }
 }
 
@@ -453,7 +453,7 @@ pub(crate) struct Sessions {
 }
 
 impl Sessions {
-    fn add(&self, stream: &TcpStream) -> Option<Arc<Session>> {
+    fn add(&self, stream: &Conn) -> Option<Arc<Session>> {
         let mut list = self.list.lock().ok()?;
         if list.len() >= MOST_SESSIONS {
             return None;
@@ -508,7 +508,7 @@ impl Sessions {
 /// goes. Where the Node asks for IS-10 tokens, `claims` are those of the controller's,
 /// which say whether it may change anything, and the connection is closed when the
 /// token runs out, for the controller to connect again with a fresh one.
-pub(crate) fn serve(shared: &super::Shared, stream: &TcpStream, request: &Request, claims: Option<&Claims>) {
+pub(crate) fn serve(shared: &super::Shared, stream: &Conn, request: &Request, claims: Option<&Claims>) {
     let write = claims.is_none_or(|c| c.permits("ncp", true, ""));
     let until = claims.and_then(Claims::expires).map(|exp| exp + access::LEEWAY.as_secs());
     if let Err((status, why)) = http::accept(stream, request) {
@@ -576,7 +576,7 @@ pub(crate) fn serve(shared: &super::Shared, stream: &TcpStream, request: &Reques
         }
     }
     shared.sessions.remove(session.id);
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    stream.shutdown();
 }
 
 #[cfg(test)]

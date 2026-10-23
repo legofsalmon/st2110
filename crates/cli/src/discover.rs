@@ -63,6 +63,12 @@ pub(crate) struct DiscoverArgs {
     auth: crate::auth::Auth,
 }
 
+impl DiscoverArgs {
+    pub(crate) fn auth(&self) -> &crate::auth::Auth {
+        &self.auth
+    }
+}
+
 /// A DNS server's address, on port 53 unless it says otherwise.
 pub(crate) fn dns_server(text: &str) -> Result<SocketAddr, String> {
     text.parse::<SocketAddr>()

@@ -40,7 +40,6 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::{Value, json};
 use ureq::Agent;
-use ureq::tls::{RootCerts, TlsConfig};
 
 /// The scopes `st2110 router`, `st2110 connect` and the other controllers ask for, one
 /// for each API, as IS-10 has it: reading the registry (IS-04 Query API) and a Node peer
@@ -636,7 +635,7 @@ fn subject(token: &str) -> Option<String> {
 }
 
 /// The agent every request to an Authorization Server is made with: no redirects, the
-/// platform's certificates, and `timeout` for each request.
+/// certificate authorities [`crate::tls`] trusts, and `timeout` for each request.
 pub(crate) fn agent(timeout: Duration, env_proxy: bool) -> Agent {
     let proxy = if env_proxy { ureq::Proxy::try_from_env() } else { None };
     Agent::config_builder()
@@ -644,7 +643,7 @@ pub(crate) fn agent(timeout: Duration, env_proxy: bool) -> Agent {
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(proxy)
-        .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+        .tls_config(crate::tls::tls_config())
         .user_agent(concat!("st2110-nmos/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
