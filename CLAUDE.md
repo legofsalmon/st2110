@@ -28,6 +28,11 @@ against), `navigation.md`, `states.md`, `components.md` and `motion.md`.
 - **What stays this app's own:** storage and wire names, layout and flow,
   content, and meanings only this app has.
 
-st2110 has not moved onto the tokens yet (it is next in the adoption plan).
-The reasoning applies now: new UI follows the grammar and the behaviour rules,
-so the move is smaller when it comes.
+st2110 is on the system in both of its faces. The router page
+(`crates/cli/src/router/page.html`) inlines the tokens, `base.css` and
+`components.css` and is `data-theme="auto"` at the regular density; the
+viewer vendors `tokens.rs` and draws egui's widgets in the shared states in
+`look.rs`, in both themes. `python3 scripts/design-system.py --sync` refills
+the copies from `../design-system`, and `--check` runs in CI. Its own
+meanings stay local: the tally (ROUTED, a local `--tally` on the bad family)
+and the scrim behind the viewer's warning over video.
