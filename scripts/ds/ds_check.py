@@ -1,4 +1,4 @@
-# @letissier/design-system 0.11.0 · ds_check.py · sha256-91b9f16f492c9c34 · vendored by scripts/sync.mjs; change the design-system repo, not this copy
+# @letissier/design-system 0.12.0 · ds_check.py · sha256-91b9f16f492c9c34 · vendored by scripts/sync.mjs; change the design-system repo, not this copy
 """The design system's checker for an app without Node: the same checks as
 scripts/ds-check.mjs, vendored into the app by scripts/sync.mjs and run from
 its CI. Uses nothing but Python 3.8 or later, and no checkout of the design
