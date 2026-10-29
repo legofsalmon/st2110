@@ -32,7 +32,8 @@ st2110 is on the system in both of its faces. The router page
 (`crates/cli/src/router/page.html`) inlines the tokens, `base.css` and
 `components.css` and is `data-theme="auto"` at the regular density; the
 viewer vendors `tokens.rs` and draws egui's widgets in the shared states in
-`look.rs`, in both themes. `python3 scripts/design-system.py --sync` refills
-the copies from `../design-system`, and `--check` runs in CI. Its own
+`look.rs`, in both themes. The design system's checker, vendored in
+`scripts/ds/`, runs in CI (a hand edit fails, behind warns); add `--sync` to its
+CI command to refill the copies from `../design-system`. Its own
 meanings stay local: the tally (ROUTED, a local `--tally` on the bad family)
 and the scrim behind the viewer's warning over video.
