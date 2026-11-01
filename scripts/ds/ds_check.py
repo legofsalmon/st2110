@@ -1,4 +1,4 @@
-# @letissier/design-system 0.12.0 · ds_check.py · sha256-91b9f16f492c9c34 · vendored by scripts/sync.mjs; change the design-system repo, not this copy
+# @letissier/design-system 0.15.0 · ds_check.py · sha256-954e05eadc617754 · vendored by scripts/sync.mjs; change the design-system repo, not this copy
 """The design system's checker for an app without Node: the same checks as
 scripts/ds-check.mjs, vendored into the app by scripts/sync.mjs and run from
 its CI. Uses nothing but Python 3.8 or later, and no checkout of the design
@@ -32,10 +32,10 @@ import urllib.request
 
 MANIFEST_URL = "https://design-system-colly.vercel.app/manifest.json"
 NAMES = ["tokens.css", "base.css", "components.css", "tokens.js", "tokens.d.ts", "tokens.rs",
-         "icons.js", "icons.d.ts", "ds-check.mjs", "ds_check.py"]
+         "icons.js", "icons.d.ts", "behaviours.js", "behaviours.d.ts", "fonts.css", "ds-check.mjs", "ds_check.py"]
 STAMP = re.compile(r"^(?:/\*|//|#) @letissier/design-system (\S+) · (\S+) · (sha256-[0-9a-f]{16}) · ")
-BLOCK = re.compile(r"/\* ds:(tokens|base|components):start([^*]*)\*/\r?\n?([\s\S]*?)/\* ds:\1:end \*/")
-SHEET = {"tokens": "tokens.css", "base": "base.css", "components": "components.css"}
+BLOCK = re.compile(r"/\* ds:(tokens|base|components|behaviours):start([^*]*)\*/\r?\n?([\s\S]*?)/\* ds:\1:end \*/")
+SHEET = {"tokens": "tokens.css", "base": "base.css", "components": "components.css", "behaviours": "behaviours.js"}
 READ_EXT = re.compile(r"\.(css|scss|html|js|mjs|jsx|ts|tsx|svelte|vue)$")
 SKIP_DIR = {"node_modules", ".git", "dist", "build", "target", ".next", "out", "coverage"}
 
@@ -116,6 +116,9 @@ def undefined_reads(found, reads):
     if not sheets:
         return ["--reads needs a vendored tokens.css or ds:tokens block to compare with"] if reads else []
     defined = {n for c in sheets for n in re.findall(r"(--ds-[a-z0-9-]+)\s*:", c["payload"])}
+    # the classes the vendored stylesheets draw; checked only where one is vendored
+    drawn = [c for c in found if c["name"] in ("components.css", "base.css")]
+    classes = {n for c in drawn for n in re.findall(r"\.(ds-[a-z0-9_-]+)", c["payload"])}
     problems = []
 
     def visit(path):
@@ -135,6 +138,12 @@ def undefined_reads(found, reads):
         own = set(re.findall(r"(--ds-[a-z0-9-]+)\s*:", text))
         for n in sorted(set(re.findall(r"var\(\s*(--ds-[a-z0-9-]+)", text)) - defined - own):
             problems.append(f"{path}: reads {n}, which the design system does not define")
+        if not drawn:
+            return
+        own_classes = set(re.findall(r"\.(ds-[a-z0-9_-]+)", text))
+        used = {c for m in re.findall(r"class(?:Name)?\s*=\s*[\"'`{]([^\"'`}]*)", text) for c in m.split()}
+        for c in sorted(c for c in used if re.fullmatch(r"ds-[a-z0-9_-]+", c) and c not in classes and c not in own_classes):
+            problems.append(f"{path}: uses class {c}, which the vendored stylesheets do not draw")
 
     for r in reads:
         if os.path.exists(r):
@@ -181,7 +190,7 @@ def sync(paths, cwd):
         if os.path.isdir(path):
             files = [f for f in os.listdir(path) if f in NAMES]
             subprocess.run(["node", script, "--to", path, "--files", ",".join(files)], check=True)
-        elif re.search(r"ds:(tokens|base|components):start", read(path)):
+        elif re.search(r"ds:(tokens|base|components|behaviours):start", read(path)):
             subprocess.run(["node", script, "--inline", path], check=True)
         else:
             subprocess.run(["node", script, "--to", os.path.dirname(path) or ".", "--files", os.path.basename(path)], check=True)
